@@ -886,6 +886,61 @@ test("host-local capability expectation mismatch recovery accepts an arbitrary s
   } finally {manager?.close();f.close();}
 });
 
+test("host-local failed activation recovery closes a consumed wrong-generation restart without replay",async()=>{
+  const f=fixture();
+  const context={clientId:"shared-oauth",sessionId:"failed-activation-controller"};
+  let manager:DurableOperationManager|undefined;
+  try {
+    const pairing=f.store.requestPairing(context);
+    const cutover={stateRoot:f.root,attemptKey:"failed-activation",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+120000).toISOString(),
+      restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact target build"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+180000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const preparedLease=f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-failed-activation"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-failed-activation"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
+    let scheduled=0;
+    const actuator={actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",schedule:()=>{scheduled+=1;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"};}};
+    await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"exact target build"}),actuator,context);
+    assert.equal(scheduled,1);
+    assert.equal(f.store.ownership.get(preparedLease.leaseId)?.operationHandle,start.operationId);
+
+    const observed=withFixtureRelease({serverInstanceId:"replacement",sourceCommit:"f".repeat(40),buildId:"wrong-build",capabilityManifestSha256:"e".repeat(64)},activation);
+    const recovered=f.store.recoverFailedActivationLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
+    assert.equal(recovered.replayed,false);
+    assert.equal(recovered.cutover.phase,"closed");
+    assert.equal(recovered.cutover.reconciliationReceipt?.terminalReason,"FAILED_ACTIVATION");
+    assert.equal(recovered.cutover.failedActivation?.restartConsumed,true);
+    assert.equal(recovered.cutover.failedActivation?.retryAllowed,false);
+    assert.equal(recovered.cutover.failedActivation?.successorRequired,true);
+    assert.deepEqual(recovered.cutover.failedActivation?.approvedTarget,cutover.expectedIdentity);
+    assert.deepEqual(recovered.cutover.failedActivation?.observedIdentity,observed);
+    assert.equal(recovered.lease.terminalState,"released");
+    assert.equal(recovered.lease.operationState,"finished");
+    assert.equal(recovered.lease.operationHandle,undefined);
+    assert.equal(recovered.operation.status,"failed");
+    assert.equal(recovered.operation.errorCode,"FAILED_ACTIVATION");
+    assert.equal(recovered.operation.retrySafe,false);
+    assert.equal(recovered.operation.receipt?.lifecycleTerminal,true);
+    assert.equal(recovered.operation.receipt?.recoveryKind,"failed_activation");
+
+    const replay=f.store.recoverFailedActivationLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
+    assert.equal(replay.replayed,true);
+    assert.equal(scheduled,1);
+    assert.deepEqual(replay.cutover,recovered.cutover);
+    assert.deepEqual(replay.reconciliation,recovered.reconciliation);
+  } finally {manager?.close();f.close();}
+});
+
 
 
 for (const authorityRace of ["reauthorize", "revoke"] as const) test(`capability mismatch recovery fails closed when carrier ${authorityRace} races before reconciliation`, async () => {

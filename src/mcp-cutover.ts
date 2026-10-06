@@ -17,6 +17,7 @@ import type {
 import { CutoverStateError, CutoverStateStore, effectiveExpectedIdentity } from "./cutover-state.js";
 import type { NextFunction, Request, Response } from "express";
 import type { OrchestrationOutcome } from "./cutover-orchestration.js";
+import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 
 /** Legacy entrypoints cannot mutate a generation owned by the coordination consumer. */
 export function assertLegacyCutoverUnbound(record: DurableCutoverRecord | undefined): void {
@@ -117,6 +118,80 @@ export function isCutoverSafeTool(toolName: string): boolean {
   return CUTOVER_SAFE_TOOLS.has(toolName);
 }
 
+export type CutoverEffectDomain =
+  | "CUTOVER_CONTROL_OR_OBSERVATION"
+  | "DEPLOYMENT_CONFLICT"
+  | "INDEPENDENT";
+
+export interface CutoverEffectTarget {
+  /** Exact physical paths the requested effect may mutate. */
+  mutationPaths?: readonly string[];
+  /** Workspace-wide effect root when exact mutation paths cannot be known. */
+  workspaceRoot?: string;
+  /** True only when the tool may mutate arbitrary content within workspaceRoot. */
+  broadWorkspaceMutation?: boolean;
+  /** Exact deployment/state roots whose evidence must survive reconciliation. */
+  protectedPaths?: readonly string[];
+}
+
+/**
+ * Effects that can invalidate the exact deployment/release evidence needed to
+ * reconcile an unresolved DevSpace activation. Everything else keeps its own
+ * normal authority, lease, workspace, Git, agent, or host-operation checks.
+ */
+export const CUTOVER_DEPLOYMENT_CONFLICT_TOOLS: ReadonlySet<string> = new Set([
+  // Retention may delete release/evidence artifacts while deployment truth is unresolved.
+  "storage_gc",
+  // These direct shell/process-control surfaces have host-wide effect scope. A
+  // tool-name-only fence cannot prove they will stay away from launchd, the
+  // canonical release pointer, or retained deployment evidence.
+  "bash",
+  "exec_command",
+  "write_stdin",
+]);
+
+const DEPLOYMENT_CONFLICT_PREFIXES = [
+  "activation_",
+  "deployment_",
+  "host_activation_",
+  "release_",
+  "service_restart_",
+] as const;
+
+export function classifyCutoverEffect(
+  toolName: string,
+  target: CutoverEffectTarget = {},
+): CutoverEffectDomain {
+  if (CUTOVER_SAFE_TOOLS.has(toolName)) return "CUTOVER_CONTROL_OR_OBSERVATION";
+  if (CUTOVER_DEPLOYMENT_CONFLICT_TOOLS.has(toolName)) return "DEPLOYMENT_CONFLICT";
+  // Unknown future cutover/deployment primitives fail closed by namespace. A
+  // future unrelated tool does not inherit global deployment authority merely
+  // because it mutates something elsewhere.
+  if (toolName.startsWith("cutover_") || DEPLOYMENT_CONFLICT_PREFIXES.some((prefix) => toolName.startsWith(prefix))) {
+    return "DEPLOYMENT_CONFLICT";
+  }
+  if (cutoverTargetOverlapsProtectedEvidence(target)) return "DEPLOYMENT_CONFLICT";
+  return "INDEPENDENT";
+}
+
+function cutoverTargetOverlapsProtectedEvidence(target: CutoverEffectTarget): boolean {
+  const protectedPaths = (target.protectedPaths ?? []).map((path) => canonicalizePath(path));
+  if (protectedPaths.length === 0) return false;
+
+  const overlaps = (path: string): boolean => {
+    const candidate = canonicalizePath(path);
+    return protectedPaths.some((protectedPath) =>
+      isPathInsideRoot(candidate, protectedPath) ||
+      isPathInsideRoot(protectedPath, candidate),
+    );
+  };
+
+  if ((target.mutationPaths ?? []).some(overlaps)) return true;
+  return target.broadWorkspaceMutation === true &&
+    typeof target.workspaceRoot === "string" &&
+    overlaps(target.workspaceRoot);
+}
+
 export const CONSEQUENTIAL_MCP_TOOLS = new Set([
   "chat_swarm_create",
   "chat_swarm_join",
@@ -156,7 +231,7 @@ export class CutoverBlockedError extends Error {
   constructor(readonly cutoverId: string, readonly mode: Exclude<CutoverMode, "normal">) {
     super(
       `[CUTOVER_RECONCILIATION_REQUIRED] Cutover ${cutoverId} is ${mode}; ` +
-      "new consequential mutation is blocked until exact reconciliation closes it.",
+      "the requested deployment-conflicting effect is blocked until exact reconciliation closes it.",
     );
     this.name = "CutoverBlockedError";
   }
@@ -258,10 +333,10 @@ export class McpCutoverController {
     return true;
   }
 
-  assertToolAllowed(toolName: string): void {
+  assertToolAllowed(toolName: string, target: CutoverEffectTarget = {}): void {
     const mode = this.mode();
     if (mode === "normal") return;
-    if (CUTOVER_SAFE_TOOLS.has(toolName)) return;
+    if (classifyCutoverEffect(toolName, target) !== "DEPLOYMENT_CONFLICT") return;
     throw new CutoverBlockedError(this.store.get()!.cutoverId, mode);
   }
 

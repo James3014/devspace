@@ -134,9 +134,16 @@ test("CLI completion-only startup preserves pairing and rejects altered or mixed
         assert.equal((await reconnect.callTool({name:"coordination_resume",arguments:{credential:"x".repeat(43)}})).isError,true);
         data(await reconnect.callTool({name:"coordination_resume",arguments:{credential:pendingCutover.credential}}));
         assert.equal(data(await reconnect.callTool({name:"coordination_lease_read",arguments:{leaseId:prepared.lease.leaseId}})).operationHandle,started.operationId);
-        for(const request of [{name:"coordination_pair",arguments:{}},{name:"coordination_prepare_cutover",arguments:args},{name:"coordination_delegate",arguments:{pendingId:pendingCutover.pendingId,contract:approved}}]) {
-          await assert.rejects(reconnect.callTool(request),/CUTOVER_RECONCILIATION_REQUIRED/);
-        }
+        const extraPair=data(await reconnect.callTool({name:"coordination_pair",arguments:{}}));
+        assert.match(extraPair.pendingId,/^pair_/);
+        const prepareReplay=data(await reconnect.callTool({name:"coordination_prepare_cutover",arguments:args}));
+        assert.equal(prepareReplay.subject.operationId,prepared.subject.operationId);
+        assert.equal(prepareReplay.lease.operationHandle,started.operationId);
+        const workerContract={repository:approved.repository,goal:approved.goal,role:"worker",scope:[config.stateDir],baseRevision:identity.sourceCommit,operations:["dependency_sync"],expiresAt:expiry};
+        const delegatedDuringCutover=await reconnect.callTool({name:"coordination_delegate",arguments:{pendingId:extraPair.pendingId,contract:workerContract}});
+        assert.equal(delegatedDuringCutover.isError,true);
+        assert.match(JSON.stringify(delegatedDuringCutover),/Cutover authority cannot be delegated/);
+        assert.doesNotMatch(JSON.stringify(delegatedDuringCutover),/CUTOVER_RECONCILIATION_REQUIRED/);
       } finally {await reconnect.close().catch(()=>{});}
 
       const reconcileFresh = new Client({name:"drained-reconcile-fresh-session",version:"1"});
