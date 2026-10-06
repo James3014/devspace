@@ -155,6 +155,20 @@ export class CutoverOrchestrator {
         scheduledFor: restart.restartScheduledForServerInstanceId ?? "unknown",
       };
     }
+    if (!record.activationBinding) {
+      return {
+        outcome: "blocked",
+        code: "CUTOVER_RECONCILIATION_REQUIRED",
+        status: "BLOCKED",
+        blocker: "RECONCILIATION_REQUIRED",
+        cutover_phase: "drained",
+        reconciliation_required: true,
+        server_generation_relation: comparison,
+        caller_continuity: options?.callerContinuity,
+        client_projection_relation: options?.clientProjectionRelation,
+        reason: `Cutover ${record.cutoverId} has no exact activation binding; refusing to schedule a restart effect.`,
+      };
+    }
     if (!restart.buildReady) {
       return {
         outcome: "blocked",
@@ -325,7 +339,8 @@ export class CutoverOrchestrator {
     if (
       !comparison.sourceMatches ||
       !comparison.buildMatches ||
-      !comparison.capabilityManifestMatches
+      !comparison.capabilityManifestMatches ||
+      !comparison.releaseMatches
     ) {
       return {
         outcome: "blocked",
