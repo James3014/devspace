@@ -145,15 +145,15 @@ function pushFailureWithEvidence(input: {
     "GIT_EXECUTION_ERROR",
     `${base} Remote reconciliation observed ${input.remote}/${input.branch} at ${input.observation.sha || "absent"}.`,
     {
-      state: confirmed ? "CONFIRMED_REMOTE_PUSH" : "CONFIRMED_NO_EFFECT",
+      state: confirmed ? "CONFIRMED_REMOTE_PUSH" : "EFFECT_UNKNOWN",
       retryAllowed: false,
-      reconciliationRequired: confirmed,
+      reconciliationRequired: true,
       expectedPushedSha: input.expectedHead,
       remote: input.remote,
       branch: input.branch,
       guidance: confirmed
         ? "The expected remote push is confirmed. Reconcile the exact attempt; do not retry."
-        : "The expected SHA is not present at the remote ref. Reconcile before any retry.",
+        : "The expected SHA is not currently visible at the remote ref. Delayed settlement remains possible; reconcile the exact attempt and do not retry.",
     },
   );
 }

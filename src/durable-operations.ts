@@ -17,12 +17,14 @@ import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { EXECUTION_PROTOCOL_VERSION, type ExecutionAuthorityMode } from "./execution-protocol.js";
+import { GitCandidateError, pushCandidate, type GitCandidateCommandRunner } from "./git-candidate.js";
 
 const spawn = nativeSpawn;
 const crossSpawn = createRequire(import.meta.url)("cross-spawn") as typeof import("node:child_process").spawn;
 
 export type DurableOperationKind =
   | "workspace_clone"
+  | "git_push"
   | "dependency_sync"
   | "nexus_gateway_recover"
   | "nexus_gateway_recovery_preflight"
@@ -364,6 +366,18 @@ export interface WorkspaceCloneInput {
   authorityMode?: ExecutionAuthorityMode;
 }
 
+export interface GitPushInput {
+  attemptKey: string;
+  workspaceId: string;
+  workspaceRoot: string;
+  expectedHead: string;
+  remote: string;
+  branch: string;
+  authorityMode?: ExecutionAuthorityMode;
+  /** Test-only command injection; MCP callers cannot supply this. */
+  gitRunner?: GitCandidateCommandRunner;
+}
+
 export interface DependencySyncInput {
   attemptKey: string;
   workspaceId: string;
@@ -482,6 +496,181 @@ export class DurableOperationManager {
         ref: input.ref,
         head,
         openable: existsSync(resolve(destination, ".git")),
+      },
+    });
+  }
+
+  async gitPush(input: GitPushInput): Promise<DurableOperationRecord> {
+    assertAttemptKey(input.attemptKey);
+    const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
+    if (authorityMode !== "OWNER_DIRECT") {
+      throw new DurableOperationError(
+        "RECONCILIATION_REQUIRED",
+        "NEXUS_GOVERNED Git publication is not self-authorizing; caller admission and Core authority remain external.",
+      );
+    }
+    const workspaceRoot = canonicalizePath(input.workspaceRoot);
+    const allowed =
+      this.config.allowedRoots.some((root) => isPathInsideRoot(workspaceRoot, canonicalizePath(root))) ||
+      isPathInsideRoot(workspaceRoot, canonicalizePath(this.config.worktreeRoot));
+    if (!allowed) {
+      throw new DurableOperationError(
+        "DESTINATION_OUTSIDE_ALLOWED_ROOT",
+        `Workspace is outside configured roots: ${workspaceRoot}`,
+      );
+    }
+    const request = {
+      version: EXECUTION_PROTOCOL_VERSION,
+      workspaceId: input.workspaceId,
+      workspaceRoot,
+      expectedHead: input.expectedHead.toLowerCase(),
+      remote: input.remote,
+      branch: input.branch,
+    };
+    const requestHash = hashJson(request);
+    const operationId = stableOperationId("git_push", workspaceRoot, input.attemptKey);
+    const existing = this.store.getByAttempt(workspaceRoot, input.attemptKey);
+    if (existing) {
+      if (existing.requestHash !== requestHash || existing.kind !== "git_push") {
+        throw new DurableOperationError(
+          "OPERATION_REPLAY_CONFLICT",
+          `attemptKey '${input.attemptKey}' is already bound to a materially different ${existing.kind} request.`,
+          existing,
+        );
+      }
+      return replayResult(existing);
+    }
+    const { record, created } = this.store.createOrReplay({
+      operationId,
+      attemptKey: input.attemptKey,
+      requestHash,
+      kind: "git_push",
+      authorityMode,
+      scopeRoot: workspaceRoot,
+      workspaceId: input.workspaceId,
+      request,
+    });
+    if (!created) return replayResult(record);
+
+    try {
+      const pushed = await pushCandidate({
+        workspaceRoot,
+        expectedHead: request.expectedHead,
+        remote: input.remote,
+        branch: input.branch,
+        ...(input.gitRunner ? { gitRunner: input.gitRunner } : {}),
+      });
+      return this.store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt: {
+          remote: pushed.remote,
+          branch: pushed.branch,
+          pushedSha: pushed.pushedSha,
+          effectState: "CONFIRMED_REMOTE_PUSH",
+        },
+      });
+    } catch (error) {
+      if (error instanceof GitCandidateError) {
+        const effect = error.effect;
+        if (effect?.state === "CONFIRMED_REMOTE_PUSH") {
+          return this.store.finish(operationId, {
+            status: "succeeded",
+            retrySafe: false,
+            receipt: {
+              remote: effect.remote,
+              branch: effect.branch,
+              pushedSha: effect.expectedPushedSha,
+              effectState: effect.state,
+              reconciledFromError: true,
+            },
+          });
+        }
+        if (!effect) {
+          return this.store.finish(operationId, {
+            status: "failed",
+            retrySafe: true,
+            errorCode: error.code,
+            errorMessage: redactSecrets(error.message),
+            receipt: {
+              remote: input.remote,
+              branch: input.branch,
+              expectedPushedSha: request.expectedHead,
+              effectState: "CONFIRMED_NO_EFFECT",
+            },
+          });
+        }
+        return this.store.finish(operationId, {
+          status: "outcome_unknown",
+          retrySafe: false,
+          errorCode: "RECONCILIATION_REQUIRED",
+          errorMessage: redactSecrets(error.message),
+          receipt: {
+            remote: effect.remote ?? input.remote,
+            branch: effect.branch ?? input.branch,
+            expectedPushedSha: effect.expectedPushedSha ?? request.expectedHead,
+            effectState: effect.state,
+          },
+        });
+      }
+      return this.store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "RECONCILIATION_REQUIRED",
+        errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
+        receipt: {
+          remote: input.remote,
+          branch: input.branch,
+          expectedPushedSha: request.expectedHead,
+          effectState: "EFFECT_UNKNOWN",
+        },
+      });
+    }
+  }
+
+  async reconcileGitPush(operationId: string): Promise<DurableOperationRecord> {
+    const record = this.store.getByOperationId(operationId);
+    if (!record || record.kind !== "git_push") {
+      throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown Git push operation: ${operationId}`, record);
+    }
+    if (record.status === "succeeded" || record.status === "failed") return record;
+    const expectedHead = String(record.request.expectedHead ?? "");
+    const remote = String(record.request.remote ?? "");
+    const branch = String(record.request.branch ?? "");
+    if (!/^[0-9a-f]{40}$/.test(expectedHead) || !remote || !branch) {
+      throw new DurableOperationError("RECONCILIATION_REQUIRED", "Git push durable request is malformed.", record);
+    }
+    const observed = await readGitRemoteRef(record.scopeRoot, remote, branch);
+    if (observed.available && observed.sha === expectedHead) {
+      return this.store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt: {
+          ...(record.receipt ?? {}),
+          remote,
+          branch,
+          pushedSha: expectedHead,
+          observedSha: observed.sha,
+          effectState: "CONFIRMED_REMOTE_PUSH",
+          reconciled: true,
+        },
+      });
+    }
+    return this.store.finish(operationId, {
+      status: "outcome_unknown",
+      retrySafe: false,
+      errorCode: "RECONCILIATION_REQUIRED",
+      errorMessage: observed.available
+        ? `Remote ref ${remote}/${branch} is currently ${observed.sha || "absent"}; delayed settlement remains possible.`
+        : `Remote ref reconciliation failed: ${redactSecrets(observed.errorMessage)}`,
+      receipt: {
+        ...(record.receipt ?? {}),
+        remote,
+        branch,
+        expectedPushedSha: expectedHead,
+        observedSha: observed.available ? observed.sha : undefined,
+        effectState: "EFFECT_UNKNOWN",
+        reconciled: true,
       },
     });
   }
@@ -905,6 +1094,7 @@ export class DurableOperationManager {
     const record = this.store.getByOperationId(operationId);
     if (!record) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
     if (record.kind === "cutover_start") return this.reconcileCutoverStart(operationId,consumerContext);
+    if (record.kind === "git_push") return await this.reconcileGitPush(operationId);
     if (record.kind === "dependency_sync") {
       if (record.authorityMode === "OWNER_DIRECT" && record.request.ownerDirectIsolated === true) {
         return this.reconcileOwnerDirectDependencySync(operationId);
@@ -1134,6 +1324,35 @@ async function readGitRemote(root: string): Promise<string | undefined> {
     return result.exitCode === 0 ? result.stdout.trim() || undefined : undefined;
   } catch {
     return undefined;
+  }
+}
+
+async function readGitRemoteRef(
+  root: string,
+  remote: string,
+  branch: string,
+): Promise<{ available: true; sha: string } | { available: false; errorMessage: string }> {
+  try {
+    const result = await spawnCommand(
+      "git",
+      ["ls-remote", "--heads", remote, `refs/heads/${branch}`],
+      root,
+    );
+    if (result.exitCode !== 0) {
+      return {
+        available: false,
+        errorMessage: result.stderr || `git ls-remote exited ${result.exitCode}`,
+      };
+    }
+    return {
+      available: true,
+      sha: result.stdout.trim().split(/\s+/)[0] ?? "",
+    };
+  } catch (error) {
+    return {
+      available: false,
+      errorMessage: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 

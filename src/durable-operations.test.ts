@@ -193,6 +193,139 @@ test("workspace_clone clones a local repository inside allowed roots and exact r
   }
 });
 
+test("git_push preserves one durable attempt across lost acknowledgement and delayed remote settlement", async () => {
+  const f = await fixture();
+  try {
+    const remote = join(f.root, "push-remote.git");
+    const project = join(f.root, "push-project");
+    await mkdir(remote);
+    await mkdir(project);
+    await git(remote, "init", "--bare", "--initial-branch=main");
+    await git(project, "init", "--initial-branch=main");
+    await git(project, "config", "user.email", "devspace@example.com");
+    await git(project, "config", "user.name", "DevSpace Test");
+    await writeFile(join(project, "candidate.txt"), "candidate\n");
+    await git(project, "add", "candidate.txt");
+    await git(project, "commit", "-m", "candidate");
+    await git(project, "remote", "add", "origin", remote);
+    const head = await git(project, "rev-parse", "HEAD");
+
+    let pushCalls = 0;
+    let firstReadback = true;
+    const gitRunner = async (args: string[], cwd: string) => {
+      if (args[0] === "push") {
+        pushCalls += 1;
+        await execFileAsync("git", args, { cwd });
+        throw new Error("injected lost acknowledgement after remote accepted push");
+      }
+      if (args[0] === "ls-remote" && firstReadback) {
+        firstReadback = false;
+        return { stdout: "", stderr: "" };
+      }
+      const result = await execFileAsync("git", args, { cwd });
+      return { stdout: result.stdout.trim(), stderr: result.stderr.trim() };
+    };
+
+    const manager = new DurableOperationManager(f.config);
+    try {
+      const uncertain = await manager.gitPush({
+        attemptKey: "git-push-lost-ack-1",
+        workspaceId: "ws_git_push",
+        workspaceRoot: project,
+        expectedHead: head,
+        remote: "origin",
+        branch: "candidate",
+        gitRunner,
+      });
+      assert.equal(uncertain.kind, "git_push");
+      assert.equal(uncertain.status, "outcome_unknown");
+      assert.equal(uncertain.retrySafe, false);
+      assert.equal(uncertain.receipt?.effectState, "EFFECT_UNKNOWN");
+      assert.equal(pushCalls, 1);
+      assert.equal(await git(remote, "rev-parse", "refs/heads/candidate"), head);
+
+      await assert.rejects(
+        manager.gitPush({
+          attemptKey: "git-push-lost-ack-1",
+          workspaceId: "ws_git_push",
+          workspaceRoot: project,
+          expectedHead: head,
+          remote: "origin",
+          branch: "candidate",
+          gitRunner,
+        }),
+        (error: unknown) =>
+          error instanceof DurableOperationError &&
+          error.code === "OPERATION_OUTCOME_UNKNOWN" &&
+          error.operation?.operationId === uncertain.operationId,
+      );
+      assert.equal(pushCalls, 1, "same-attempt replay must not issue a second push");
+
+      const reconciled = await manager.reconcile(uncertain.operationId);
+      assert.equal(reconciled.operationId, uncertain.operationId);
+      assert.equal(reconciled.status, "succeeded");
+      assert.equal(reconciled.retrySafe, false);
+      assert.equal(reconciled.receipt?.effectState, "CONFIRMED_REMOTE_PUSH");
+      assert.equal(reconciled.receipt?.pushedSha, head);
+      assert.equal(pushCalls, 1, "reconciliation must inspect remote truth without re-pushing");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("git_push treats pre-effect validation failure as retry-safe only for a new attempt identity", async () => {
+  const f = await fixture();
+  try {
+    const remote = join(f.root, "push-validation-remote.git");
+    const project = join(f.root, "push-validation-project");
+    await mkdir(remote);
+    await mkdir(project);
+    await git(remote, "init", "--bare", "--initial-branch=main");
+    await git(project, "init", "--initial-branch=main");
+    await git(project, "config", "user.email", "devspace@example.com");
+    await git(project, "config", "user.name", "DevSpace Test");
+    await writeFile(join(project, "candidate.txt"), "candidate\n");
+    await git(project, "add", "candidate.txt");
+    await git(project, "commit", "-m", "candidate");
+    await git(project, "remote", "add", "origin", remote);
+    const head = await git(project, "rev-parse", "HEAD");
+
+    const manager = new DurableOperationManager(f.config);
+    try {
+      const rejected = await manager.gitPush({
+        attemptKey: "git-push-pre-effect-1",
+        workspaceId: "ws_git_push_validation",
+        workspaceRoot: project,
+        expectedHead: head,
+        remote: "origin",
+        branch: "main",
+      });
+      assert.equal(rejected.status, "failed");
+      assert.equal(rejected.retrySafe, true);
+      assert.equal(rejected.receipt?.effectState, "CONFIRMED_NO_EFFECT");
+      assert.equal(await git(project, "ls-remote", "--heads", "origin", "refs/heads/main"), "");
+
+      const succeeded = await manager.gitPush({
+        attemptKey: "git-push-pre-effect-2",
+        workspaceId: "ws_git_push_validation",
+        workspaceRoot: project,
+        expectedHead: head,
+        remote: "origin",
+        branch: "candidate",
+      });
+      assert.equal(succeeded.status, "succeeded");
+      assert.equal(succeeded.receipt?.pushedSha, head);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("chat swarm migration executor is readback-bound, idempotent, and refuses unknown replay", async () => {
   const f = await fixture();
   const destinationRoot = await mkdtemp(join(tmpdir(), "devspace-migration-destination-"));
