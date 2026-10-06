@@ -3220,7 +3220,7 @@ function createDirectDispatchAgentStartInputSchema() {
       "Required for write-capable workers. Canonical writable path scope relative to the workspace root.",
     ),
     resumableWork: resumableWorkSchema().optional().describe(
-      "Lightweight writer-admission pointer. Required for write-capable workers when the repository is enrolled by .nexus-core/config.toml.",
+      "Lightweight writer-admission pointer. Required for write-capable workers when repository enrollment requires resumable-work admission.",
     ),
     maxFiles: z.number().int().min(1).optional().describe(
       "Optional maximum number of files the worker may change.",
