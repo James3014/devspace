@@ -158,9 +158,26 @@ export class CarrierBindingStore {
         if(!file || file.cutoverId!==action.cutoverId || file.coordinationBinding?.operationHandle!==subject.operationId ||
           file.coordinationBinding.requestHash!==subject.requestHash || file.coordinationBinding.ownerThread!==binding.row.id) return false;
         if(action.action==="finish") {
-          const {serverInstanceId,...identity}=action.currentIdentity;
-          return !!serverInstanceId && serverInstanceId!==approved.currentIdentity.serverInstanceId &&
-            isDeepStrictEqual(identity,approved.expectedIdentity) && isDeepStrictEqual(action,{action:"finish",cutoverId:file.cutoverId,currentIdentity:action.currentIdentity,preferredPair:approved.finish});
+          const {
+            serverInstanceId,
+            releaseSha256,
+            releasePath,
+            activationCutoverId,
+            ...identity
+          }=action.currentIdentity;
+          const activation=file.activationBinding;
+          const releaseIdentityMatches=activation
+            ? releaseSha256===activation.releaseSha256 &&
+              releasePath===activation.releasePath &&
+              activationCutoverId===file.cutoverId
+            : releaseSha256===undefined &&
+              releasePath===undefined &&
+              activationCutoverId===undefined;
+          return !!serverInstanceId &&
+            serverInstanceId!==approved.currentIdentity.serverInstanceId &&
+            isDeepStrictEqual(identity,approved.expectedIdentity) &&
+            releaseIdentityMatches &&
+            isDeepStrictEqual(action,{action:"finish",cutoverId:file.cutoverId,currentIdentity:action.currentIdentity,preferredPair:approved.finish});
         }
         if(Date.parse(approved.expiresAt)<=this.now()) return false;
         if(action.action==="drain") return isDeepStrictEqual(action,{action:"drain",cutoverId:file.cutoverId,currentIdentity:approved.currentIdentity});

@@ -9,9 +9,17 @@ import {
 } from "./cutover-build-ready.js";
 import {
   createBoundLaunchdRestartActuator,
+  inspectBoundStableLaunchdService,
   type BoundLaunchdRestartOptions,
+  type InspectStableLaunchdServiceOptions,
   type SelfRestartActuator,
+  type StableLaunchdServiceBinding,
 } from "./cutover-restart.js";
+import {
+  bindCutoverActivation,
+  verifyActivationBinding,
+  type BindCutoverActivationInput,
+} from "./cutover-activation.js";
 import {
   CutoverStateError,
   CutoverStateStore,
@@ -33,6 +41,14 @@ export interface LocalBoundCutoverRestartDependencies {
     expected: ExpectedCutoverIdentity,
   ) => Promise<{ buildReady: boolean; detail: string }> | { buildReady: boolean; detail: string };
   createActuator?: (options: BoundLaunchdRestartOptions) => SelfRestartActuator | undefined;
+  inspectStableService?: (
+    options: InspectStableLaunchdServiceOptions,
+  ) => StableLaunchdServiceBinding | undefined;
+  bindActivation?: (input: BindCutoverActivationInput) => ReturnType<typeof bindCutoverActivation>;
+  verifyActivation?: (
+    binding: ReturnType<typeof bindCutoverActivation>,
+    serviceRoot: string,
+  ) => unknown;
 }
 
 export interface LocalBoundCutoverRestartInput {
@@ -56,6 +72,7 @@ function record(value: unknown): Record<string, unknown> {
 export function parseLiveCutoverHealth(value: unknown): LiveCutoverHealth {
   const root=record(value), build=record(root.build), capability=record(root.capabilityManifest), mcp=record(root.mcp);
   const sourceCommit=build.source_commit, buildId=build.build_id, pid=build.pid;
+  const releaseSha256=build.release_sha256, releasePath=build.release_path, activationCutoverId=build.activation_cutover_id;
   const capabilityManifestSha256=capability.manifestSha256;
   const serverInstanceId=mcp.serverInstanceId, cutoverMode=mcp.cutoverMode;
   const reconciliationRequired=mcp.reconciliationRequired;
@@ -63,6 +80,9 @@ export function parseLiveCutoverHealth(value: unknown): LiveCutoverHealth {
     typeof buildId!=="string" || !buildId ||
     !Number.isSafeInteger(pid) || (pid as number)<=0 ||
     typeof capabilityManifestSha256!=="string" || !/^[a-f0-9]{64}$/.test(capabilityManifestSha256) ||
+    (releaseSha256!==undefined && (typeof releaseSha256!=="string" || !/^[a-f0-9]{64}$/.test(releaseSha256))) ||
+    (releasePath!==undefined && (typeof releasePath!=="string" || !releasePath.startsWith("/"))) ||
+    (activationCutoverId!==undefined && (typeof activationCutoverId!=="string" || !activationCutoverId)) ||
     typeof serverInstanceId!=="string" || !serverInstanceId ||
     typeof cutoverMode!=="string" || typeof reconciliationRequired!=="boolean") {
     throw new CutoverStateError("Live DevSpace health payload lacks exact runtime identity.");
@@ -73,6 +93,9 @@ export function parseLiveCutoverHealth(value: unknown): LiveCutoverHealth {
       sourceCommit,
       buildId,
       capabilityManifestSha256,
+      ...(typeof releaseSha256==="string" ? {releaseSha256} : {}),
+      ...(typeof releasePath==="string" ? {releasePath} : {}),
+      ...(typeof activationCutoverId==="string" ? {activationCutoverId} : {}),
     },
     pid:pid as number,
     cutoverMode,
@@ -145,14 +168,43 @@ export async function performLocalBoundCutoverRestart(
     const preflight=await probe(packageRoot,approved.expectedIdentity);
     if(preflight.buildReady!==true) throw new CutoverBuildNotReadyError(preflight.detail);
 
+    const inspectStableService =
+      dependencies.inspectStableService ?? inspectBoundStableLaunchdService;
+    const stableService = inspectStableService({
+      livePid:health.pid,
+      serviceLabel:approved.restart.serviceLabel,
+      launchdTarget:approved.restart.launchdTarget,
+    });
+    if(!stableService) {
+      throw new CutoverStateError(
+        "Approved launchd target is not bound to the canonical stable DevSpace service launcher.",
+      );
+    }
+
+    const bindActivation = dependencies.bindActivation ?? bindCutoverActivation;
+    const verifyActivation = dependencies.verifyActivation ?? verifyActivationBinding;
+    const activationBinding = bindActivation({
+      cutoverId:input.cutoverId,
+      packageRoot,
+      serviceRoot:stableService.serviceRoot,
+      expected:approved.expectedIdentity,
+    });
+    const stateStore = new CutoverStateStore(input.config.stateDir);
+    stateStore.recordActivationBinding(input.cutoverId, activationBinding);
+    verifyActivation(activationBinding, stableService.serviceRoot);
+
     const createActuator=dependencies.createActuator ?? createBoundLaunchdRestartActuator;
     const actuator=createActuator({
       livePid:health.pid,
       serviceLabel:approved.restart.serviceLabel,
       launchdTarget:approved.restart.launchdTarget,
+      expectedStableServiceRoot:stableService.serviceRoot,
+      verifyActivation:()=>verifyActivation(activationBinding,stableService.serviceRoot),
     });
     if(!actuator) {
-      throw new CutoverStateError("Approved launchd target does not own the live drained DevSpace PID.");
+      throw new CutoverStateError(
+        "Approved launchd target does not own the live drained PID through the canonical stable launcher.",
+      );
     }
 
     const outcome=await manager.restartCutover(
@@ -162,8 +214,15 @@ export async function performLocalBoundCutoverRestart(
       expected=>probe(packageRoot,expected),
       actuator,
       local.context,
+      activationBinding,
     );
-    return { ...outcome, liveIdentity:health.identity, packageRoot };
+    return {
+      ...outcome,
+      liveIdentity:health.identity,
+      packageRoot,
+      stableServiceRoot:stableService.serviceRoot,
+      activationBinding,
+    };
   } finally {
     manager.close();
     bindings.close();

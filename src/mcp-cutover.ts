@@ -7,6 +7,7 @@ import type {
   BuildReadyReceipt,
   CutoverCoordinationBinding,
   CutoverBindingRepairReceipt,
+  CutoverActivationBinding,
   CutoverDrainEvidence,
   CutoverReconciliationReceipt,
   CutoverServerIdentity,
@@ -47,6 +48,7 @@ export interface CutoverIdentityComparison {
   sourceMatches: boolean;
   buildMatches: boolean;
   capabilityManifestMatches: boolean;
+  releaseMatches: boolean;
 }
 
 /**
@@ -330,6 +332,11 @@ export class McpCutoverController {
     if (!comparison.capabilityManifestMatches) {
       throw new CutoverStateError("Cannot finish cutover: capability manifest does not match the bound target.");
     }
+    if (!comparison.releaseMatches) {
+      throw new CutoverStateError(
+        "Cannot finish cutover: live release identity does not match the bound activation release.",
+      );
+    }
 
     if (record.phase !== "drained") {
       throw new CutoverStateError(
@@ -403,6 +410,13 @@ export function compareServerIdentity(
     capabilityManifestMatches:
       expected.capabilityManifestSha256 === undefined ||
       current.capabilityManifestSha256 === expected.capabilityManifestSha256,
+    releaseMatches:
+      record.activationBinding === undefined ||
+      (
+        current.releaseSha256 === record.activationBinding.releaseSha256 &&
+        current.releasePath === record.activationBinding.releasePath &&
+        current.activationCutoverId === record.cutoverId
+      ),
   };
 }
 
@@ -584,6 +598,7 @@ export interface CutoverHttpDependencies {
     agentId: string;
   }) => Promise<DurableReconciliationWitness>;
   restartSelf?: SelfRestartActuator;
+  ensureActivationBound?: (cutoverId: string) => CutoverActivationBinding;
   probeBuildReady?: (
     expected: ExpectedCutoverIdentity,
   ) => Promise<BuildReadyProbeResult> | BuildReadyProbeResult;
@@ -606,6 +621,7 @@ export function registerCutoverHttpRoutes(
     transportEvidence,
     reconcileDurableState,
     restartSelf,
+    ensureActivationBound,
     probeBuildReady,
     advance,
   } = dependencies;
@@ -655,6 +671,12 @@ export function registerCutoverHttpRoutes(
         throw new CutoverBuildNotReadyError(`Restart request ${cutoverId} lacks a build-ready attestation.`);
       }
       const buildReady = buildReadyReceipt(body.buildReady);
+      if (!ensureActivationBound) {
+        throw new CutoverStateError(
+          "Cutover restart is unavailable without a canonical activation-binding owner.",
+        );
+      }
+      ensureActivationBound(cutoverId);
       const request = controller.requestRestart(cutoverId, buildReady);
       const restart = request.record.restartRequest;
       if (!restart?.buildReady) {

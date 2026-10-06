@@ -27,7 +27,7 @@ import {
   permitsCoreCallerRebindGate,
   resolveDurableReconciliationWitnessFromInventory,
 } from "./server.js";
-import { CutoverStateStore } from "./cutover-state.js";
+import { CUTOVER_ACTIVATION_BINDING_SCHEMA, CutoverStateStore } from "./cutover-state.js";
 import { CONSEQUENTIAL_MCP_TOOLS, CUTOVER_SAFE_TOOLS, McpCutoverController } from "./mcp-cutover.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
@@ -1057,6 +1057,16 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
         outcome: "restart_already_scheduled",
         reason: "restart already durably scheduled",
         scheduledFor: "com.example.devspace",
+      }),
+      ensureActivationBound: (cutoverId) => ({
+        schema: CUTOVER_ACTIVATION_BINDING_SCHEMA,
+        cutoverId,
+        sourceCommit: "b".repeat(40),
+        buildId: "new-build",
+        releaseSha256: "e".repeat(64),
+        releasePath: join(root, "releases", "release-" + "b".repeat(40) + "-" + "e".repeat(16)),
+        pointerPath: join(root, "current-release.json"),
+        boundAt: "2026-10-06T00:00:00.000Z",
       }),
       restartSelf: {
         actuator: "launchd-self",

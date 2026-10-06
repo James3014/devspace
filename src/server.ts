@@ -83,6 +83,7 @@ import {
   CUTOVER_BINDING_REPAIR_SCHEMA,
   CUTOVER_BINDING_REPAIR_REASON,
   type CutoverBindingRepairReceipt,
+  type CutoverActivationBinding,
   type CutoverDrainEvidence,
   type DurableCutoverRecord,
   type ExpectedCutoverIdentity,
@@ -110,6 +111,10 @@ import {
   createLaunchdSelfRestartActuator,
   type SelfRestartActuator,
 } from "./cutover-restart.js";
+import {
+  bindCutoverActivation,
+  verifyActivationBinding,
+} from "./cutover-activation.js";
 import type { WorkspaceSession } from "./workspace-store.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
@@ -1873,6 +1878,7 @@ export interface CutoverMcpControlContext {
     agentId: string;
   }) => Promise<DurableReconciliationWitness>;
   restartSelf?: SelfRestartActuator;
+  ensureActivationBound?: (cutoverId: string) => CutoverActivationBinding;
   probeBuildReady?: (
     expected: ExpectedCutoverIdentity,
   ) => Promise<BuildReadyProbeResult> | BuildReadyProbeResult;
@@ -2028,7 +2034,12 @@ function registerCutoverMcpTools(
         reason: "Restart was requested but no durable schedule marker exists; reconcile the exact restart effect before any retry.",
       };
     }
-    if (comparison.sourceMatches && comparison.buildMatches && comparison.capabilityManifestMatches) {
+    if (
+      comparison.sourceMatches &&
+      comparison.buildMatches &&
+      comparison.capabilityManifestMatches &&
+      comparison.releaseMatches
+    ) {
       return {
         ...base,
         outcome: "replacement_observed",
@@ -2409,12 +2420,18 @@ function registerCutoverMcpTools(
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
       async ({ cutoverId, buildReady, carrierCredential }, extra) => {
+        if(!control.ensureActivationBound) {
+          throw new CutoverStateError(
+            "Cutover restart is unavailable without a canonical activation-binding owner.",
+          );
+        }
+        const activationBinding=control.ensureActivationBound(cutoverId);
         if(control.controller.record()?.coordinationBinding) {
           if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted coordination");
           const context=dependencyConsumerContext(extra);
           if(carrierCredential!==undefined && carrierBindings) carrierBindings.redeem(context,carrierCredential);
           const actuator=control.restartSelf!;
-          const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,context);
+          const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,context,activationBinding);
           return {content:[textBlock("Restart scheduling intent is recorded; execution remains unconfirmed and must not be replayed.")],structuredContent:{cutover:outcome.record as unknown as Record<string,unknown>,mode:control.controller.mode(),restart:{scheduled:outcome.scheduled,alreadyRequested:!outcome.scheduled,scheduleBlocked:false,actuator:"launchd-self" as const,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget}}};
         }
         const request = control.controller.requestRestart(cutoverId, buildReady);
@@ -8575,6 +8592,15 @@ export function createServer(
       sourceCommit: runtimeBuildIdentity.sourceCommit,
       buildId: runtimeBuildIdentity.buildId,
       capabilityManifestSha256: capabilityManifest.manifestSha256,
+      ...(runtimeBuildIdentity.activeReleaseSha256
+        ? { releaseSha256: runtimeBuildIdentity.activeReleaseSha256 }
+        : {}),
+      ...(runtimeBuildIdentity.activeReleasePath
+        ? { releasePath: runtimeBuildIdentity.activeReleasePath }
+        : {}),
+      ...(runtimeBuildIdentity.activationCutoverId
+        ? { activationCutoverId: runtimeBuildIdentity.activationCutoverId }
+        : {}),
     },
   );
   chatSwarmRuntimeOwner = config.chatSwarmEnabled
@@ -8585,7 +8611,21 @@ export function createServer(
   initializationCleanups.push(() => chatSwarmLifecycle.close());
   if (chatSwarmLifecycle.enabled) chatSwarmLifecycle.recoverAfterStartup();
   options.chatSwarmInitializationHook?.();
-  const restartSelfActuator = createLaunchdSelfRestartActuator();
+  const stableServiceRoot = process.env.DEVSPACE_STABLE_SERVICE_ROOT;
+  const restartSelfActuator = stableServiceRoot
+    ? createLaunchdSelfRestartActuator({
+        expectedStableServiceRoot: stableServiceRoot,
+        verifyActivation: () => {
+          const record = cutoverController.record();
+          if (!record?.activationBinding) {
+            throw new CutoverStateError(
+              "Stable launchd restart requires an exact durable activation binding.",
+            );
+          }
+          verifyActivationBinding(record.activationBinding, stableServiceRoot);
+        },
+      })
+    : undefined;
   const resolveDurableReconciliationWitness = async (
     preferredPair?: { workspaceId?: string; agentId?: string },
     requirePositiveInventory = Boolean(preferredPair),
@@ -8854,6 +8894,51 @@ export function createServer(
     ? (expected: ExpectedCutoverIdentity) =>
         probeBuildReady({ packageRoot: config.mcpCutoverBuildReadyRoot!, expected })
     : undefined;
+  const ensureCutoverActivationBound = (cutoverId: string) => {
+    const record = cutoverController.record();
+    if (!record || record.cutoverId !== cutoverId) {
+      throw new CutoverStateError(
+        "Cannot bind activation: active cutover generation changed.",
+      );
+    }
+    if (!stableServiceRoot) {
+      throw new CutoverStateError(
+        "Stable DevSpace service root is not bound by the canonical launcher.",
+      );
+    }
+    if (record.activationBinding) {
+      verifyActivationBinding(record.activationBinding, stableServiceRoot);
+      return record.activationBinding;
+    }
+    if (record.restartRequest) {
+      throw new CutoverStateError(
+        "Restart was already requested without an activation binding; terminal reconciliation is required.",
+      );
+    }
+    const targetRoot =
+      config.mcpCutoverBuildReadyRoot ??
+      process.env.DEVSPACE_PACKAGE_ROOT;
+    if (!targetRoot) {
+      throw new CutoverStateError(
+        "Cutover activation requires a fixed build-ready package root.",
+      );
+    }
+    const binding = bindCutoverActivation({
+      cutoverId,
+      packageRoot: targetRoot,
+      serviceRoot: stableServiceRoot,
+      expected: record.expectedNewIdentity,
+    });
+    const stored = new CutoverStateStore(config.stateDir)
+      .recordActivationBinding(cutoverId, binding).record;
+    if (!stored.activationBinding) {
+      throw new CutoverStateError(
+        "Activation binding was not durably readable after commit.",
+      );
+    }
+    verifyActivationBinding(stored.activationBinding, stableServiceRoot);
+    return stored.activationBinding;
+  };
   const orchestrator = restartSelfActuator
     ? new CutoverOrchestrator({
         controller: cutoverController,
@@ -9015,6 +9100,15 @@ export function createServer(
         source_commit: runtimeBuildIdentity.sourceCommit,
         source_dirty: runtimeBuildIdentity.sourceDirty,
         build_id: runtimeBuildIdentity.buildId,
+        ...(runtimeBuildIdentity.activeReleaseSha256
+          ? { release_sha256: runtimeBuildIdentity.activeReleaseSha256 }
+          : {}),
+        ...(runtimeBuildIdentity.activeReleasePath
+          ? { release_path: runtimeBuildIdentity.activeReleasePath }
+          : {}),
+        ...(runtimeBuildIdentity.activationCutoverId
+          ? { activation_cutover_id: runtimeBuildIdentity.activationCutoverId }
+          : {}),
         pid: runtimeBuildIdentity.pid,
         listen_port: runtimeBuildIdentity.listenPort,
       },
@@ -9049,6 +9143,7 @@ export function createServer(
     transportEvidence: () => transports.metrics(),
     reconcileDurableState: reconcileCutoverDurableState,
     ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
+    ...(restartSelfActuator ? { ensureActivationBound: ensureCutoverActivationBound } : {}),
     ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
     ...(advanceCutover ? { advance: advanceCutover } : {}),
   });
@@ -9091,6 +9186,7 @@ export function createServer(
       transportEvidence: () => transports.metrics(),
       reconcileDurableState: reconcileCutoverDurableState,
       ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
+      ...(restartSelfActuator ? { ensureActivationBound: ensureCutoverActivationBound } : {}),
       ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
       inspectWorkspace: (workspaceId) => workspaces.inspectWorkspace(workspaceId),
       listWorkspaceSessions: () => workspaceStore.listSessions(),

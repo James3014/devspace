@@ -287,7 +287,7 @@ function cutoverFixture() {
   const root=realpathSync(mkdtempSync(join(tmpdir(),"devspace-c3-cutover-")));
   const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
   const context=Object.freeze({});const grant={repository:"owner/repo",goal:"cutover",coordinatorThread:"controller",evidenceHash:"fixture-grant"};
-  const input={attemptKey:"start",currentIdentity:{serverInstanceId:"old-runtime",sourceCommit:"old-source",buildId:"old-build"},expectedIdentity:{sourceCommit:"target-source",buildId:"target-build"}};
+  const input={attemptKey:"start",currentIdentity:{serverInstanceId:"old-runtime",sourceCommit:"a".repeat(40),buildId:"old-build"},expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"target-build"}};
   let ownership:ControlPlaneOwnershipStore;let leaseId="";let permitted=true;
   const sort=(v:any):any=>v&&typeof v==="object"?Object.fromEntries(Object.entries(v).filter(([,v])=>v!==undefined).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,sort(v)])):v;
   const request={version:"devspace.execution.v1",baseRevision:input.currentIdentity.sourceCommit,stateRoot:config.stateDir,currentIdentity:input.currentIdentity,expectedIdentity:input.expectedIdentity};
@@ -296,6 +296,28 @@ function cutoverFixture() {
   const manager=new DurableOperationManager(config,undefined,undefined,undefined,options);ownership=manager.store.createOwnershipStore(options);ownership.putGrantEvidence(context,grant,0);
   leaseId=ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"filesystem",resourceId:config.stateDir,resource:config.stateDir,operation:"cutover_start",scope:[config.stateDir],baseRevision:input.currentIdentity.sourceCommit,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"cutover",grant}).leaseId;
   return {manager,config,context,input,options,ownership,leaseId,revoke:()=>{permitted=false;}};
+}
+
+async function bindCutoverFixtureActivation(
+  f:ReturnType<typeof cutoverFixture>,
+  cutoverId:string,
+) {
+  const {
+    CUTOVER_ACTIVATION_BINDING_SCHEMA,
+    CutoverStateStore,
+  }=await import("./cutover-state.js");
+  const binding={
+    schema:CUTOVER_ACTIVATION_BINDING_SCHEMA,
+    cutoverId,
+    sourceCommit:f.input.expectedIdentity.sourceCommit,
+    buildId:f.input.expectedIdentity.buildId,
+    releaseSha256:"e".repeat(64),
+    releasePath:join(f.config.stateDir,"releases",`release-${f.input.expectedIdentity.sourceCommit}`),
+    pointerPath:join(f.config.stateDir,"current-release.json"),
+    boundAt:"2026-10-06T00:00:00.000Z",
+  };
+  return new CutoverStateStore(f.config.stateDir)
+    .recordActivationBinding(cutoverId,binding).record.activationBinding!;
 }
 
 test("C3 cutover planning shares the exact execution identity without creating an intent", async()=>{
@@ -605,6 +627,7 @@ test("C3 guarded restart records intent before one actuator call and never repla
     const start=f.manager.startCutover(f.input,f.context);const id=start.receipt!.cutoverId as string;
     f.options.approveCutoverLifecycle=()=>true;
     f.manager.drainCutover(id,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context);
+    await bindCutoverFixtureActivation(f,id);
     const actuator={actuator:"launchd-self" as const,serviceLabel:"fixture",launchdTarget:"gui/1/fixture",schedule:()=>{
       schedules++;assert.ok(new CutoverStateStore(f.config.stateDir).get()?.restartRequest?.restartScheduledAt);
       return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"fixture",launchdTarget:"gui/1/fixture"};
@@ -624,6 +647,7 @@ test("C3 restart probe drift and uncertain actuator results never release or rep
     try {
       const start=f.manager.startCutover(f.input,f.context);const id=start.receipt!.cutoverId as string;
       f.options.approveCutoverLifecycle=()=>true;f.manager.drainCutover(id,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context);
+      await bindCutoverFixtureActivation(f,id);
       const ready={verifiedBy:"fixture",verifiedAt:new Date().toISOString()};
       const actuator={actuator:"launchd-self" as const,serviceLabel:"fixture",launchdTarget:"gui/1/fixture",schedule:()=>{calls++;if(failure==="actuator-throws")throw new Error("uncertain actuator response");return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"fixture",launchdTarget:"gui/1/fixture"};}};
       if(failure==="missing-approval") f.options.approveCutoverLifecycle=undefined;
