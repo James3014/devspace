@@ -118,7 +118,15 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
     const context={clientId:"shared-oauth",sessionId:"cutover-controller"};
     const pairing=f.store.requestPairing(context);
     const cutover={stateRoot:f.root,attemptKey:"approved-cutover",
-      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      currentIdentity:{
+        serverInstanceId:"original",
+        sourceCommit:f.contract.baseRevision,
+        buildId:"old",
+        capabilityManifestSha256:"c".repeat(64),
+        releaseSha256:"e".repeat(64),
+        releasePath:join(f.root,"releases","release-old"),
+        activationCutoverId:"bootstrap-old",
+      },
       expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
       expiresAt:new Date(Date.parse(f.contract.expiresAt)-30000).toISOString(),
       restart:{buildReady:{verifiedBy:"independent",verifiedAt:new Date(Date.parse(f.contract.expiresAt)-60000).toISOString(),evidence:"exact package digest"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
@@ -146,6 +154,9 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
     assert.equal(lease.operation,"cutover_start");
     assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,attemptKey:"other"}).subject));
     assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,expectedIdentity:{...cutover.expectedIdentity,buildId:"wrong"}}).subject));
+    assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,currentIdentity:{...cutover.currentIdentity,releaseSha256:"f".repeat(64)}}).subject));
+    assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,currentIdentity:{...cutover.currentIdentity,releasePath:join(f.root,"releases","release-other")}}).subject));
+    assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,currentIdentity:{...cutover.currentIdentity,activationCutoverId:"bootstrap-other"}}).subject));
     const child=f.store.requestPairing(f.worker);
     assert.throws(()=>f.store.delegate(context,child.pendingId,{...contract,role:"worker"}));
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
