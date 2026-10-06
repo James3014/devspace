@@ -729,6 +729,30 @@ test("Owner-facing elicitation approves exactly one bounded carrier without Term
     }));
     assert.equal(cancelledDurable.status,"PENDING_OWNER_APPROVAL");
 
+    const reconcilePending=data(await owner.callTool({name:"coordination_pair",arguments:{}}));
+    const reconcileContract:CarrierContract={...contract,goal:"issue407-reconcile"};
+    const reconcilePrepared=data(await owner.callTool({
+      name:"coordination_owner_approve",
+      arguments:{pendingId:reconcilePending.pendingId,contract:reconcileContract},
+    }));
+    assert.equal(reconcilePrepared.status,"PENDING_OWNER_APPROVAL");
+    const hostApprover=new CarrierBindingStore(config.stateDir,()=>carrierClock);
+    const externallyApproved=hostApprover.approveLocal(reconcilePending.pendingId,reconcileContract);
+    hostApprover.close();
+    const reconcileFresh=await connect("reconcile-status",false);
+    const reconciled=data(await reconcileFresh.callTool({
+      name:"coordination_owner_approval_status",
+      arguments:{pendingId:reconcilePending.pendingId},
+    }));
+    assert.equal(reconciled.status,"APPROVED");
+    assert.equal(reconciled.carrierId,externallyApproved.id);
+    const reconcileReplay=data(await owner.callTool({
+      name:"coordination_owner_approve",
+      arguments:{pendingId:reconcilePending.pendingId,contract:reconcileContract},
+    }));
+    assert.equal(reconcileReplay.status,"ALREADY_APPROVED_SAME_CONTRACT");
+    assert.equal(reconcileReplay.carrierId,externallyApproved.id);
+
     const expiringPending=data(await owner.callTool({name:"coordination_pair",arguments:{}}));
     const expiringContract:CarrierContract={...contract,goal:"issue407-expiring",expiresAt:new Date(carrierClock+1000).toISOString()};
     const expiring=data(await owner.callTool({
