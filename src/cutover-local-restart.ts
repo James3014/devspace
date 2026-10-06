@@ -211,6 +211,7 @@ export async function performLocalBoundCutoverRestart(
       expected=>probe(packageRoot,expected),
       actuator,
       local.context,
+      activationBinding,
     );
     return {
       ...outcome,
