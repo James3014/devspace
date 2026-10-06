@@ -212,8 +212,15 @@ export function hashReleaseTree(rootInput: string): string {
         hash.update("\0");
       } else if (info.isSymbolicLink()) {
         const target = readlinkSync(absolute);
-        const resolvedTarget = resolve(dirname(absolute), target);
-        if (!isPathInside(resolvedTarget, root)) {
+        let physicalTarget:string;
+        try {
+          physicalTarget=realpathSync.native(resolve(dirname(absolute), target));
+        } catch {
+          throw new CutoverStateError(
+            `Release contains a broken symlink: ${rel}`,
+          );
+        }
+        if (!isPathInside(physicalTarget, root) || physicalTarget===root) {
           throw new CutoverStateError(
             `Release symlink escapes the immutable release root: ${rel}`,
           );
