@@ -1979,7 +1979,7 @@ function isActivationBinding(value: unknown): value is CutoverActivationBinding 
     typeof binding.cutoverId === "string" &&
     binding.cutoverId.length > 0 &&
     typeof binding.sourceCommit === "string" &&
-    /^[0-9a-f]{40}$/.test(binding.sourceCommit) &&
+    binding.sourceCommit.length > 0 &&
     typeof binding.buildId === "string" &&
     binding.buildId.length > 0 &&
     typeof binding.releaseSha256 === "string" &&
