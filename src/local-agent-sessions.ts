@@ -582,6 +582,7 @@ export class LocalAgentSessionManager {
   private readonly herdrTurnTasks = new Map<string, Promise<void>>();
   private readonly herdrVerifierTasks = new Map<string, Promise<Record<string, unknown>>>();
   private readonly herdrVerifiedLive = new Set<string>();
+  private readonly startAttemptTails = new Map<string, Promise<void>>();
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
   private workResumeStore?: WorkResumeStore;
@@ -622,6 +623,32 @@ export class LocalAgentSessionManager {
 
   setWorkResumeStore(workResumeStore: WorkResumeStore): void {
     this.workResumeStore = workResumeStore;
+  }
+
+  /**
+   * Serialize the exact-replay precheck, admission, and durable start for one
+   * workspace/attemptKey pair. Concurrent MCP requests otherwise can both
+   * miss the durable replay row and race Core's single-writer admission CAS.
+   */
+  async withStartAttemptKeyLock<T>(input: {
+    workspaceRoot: string;
+    attemptKey?: string;
+  }, operation: () => Promise<T>): Promise<T> {
+    if (input.attemptKey === undefined) return operation();
+
+    const key = JSON.stringify([canonicalizePath(input.workspaceRoot), input.attemptKey]);
+    const previous = this.startAttemptTails.get(key);
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => { release = resolve; });
+    this.startAttemptTails.set(key, current);
+    if (previous) await previous;
+
+    try {
+      return await operation();
+    } finally {
+      release();
+      if (this.startAttemptTails.get(key) === current) this.startAttemptTails.delete(key);
+    }
   }
 
   bindCapabilityManifestSha256(manifestSha256: string): void {
@@ -1760,6 +1787,31 @@ export class LocalAgentSessionManager {
       return;
     }
     await this.settleHerdrTurn(record, handle);
+  }
+
+  /**
+   * Return only an exact durable replay of an agent_start request.
+   * Material conflicts intentionally return undefined so the caller continues
+   * through normal admission and startAgent reports the existing conflict.
+   */
+  findExactStartReplay(input: StartAgentInput): StartAgentOutput | undefined {
+    const { attemptKey, workspaceRoot, profileName, prompt, profiles, executionContract } = input;
+    if (attemptKey === undefined) return undefined;
+    const profile = profiles.find((candidate) => candidate.name === profileName);
+    if (!profile) return undefined;
+    const replayBinding = buildStartReplayBinding(attemptKey, {
+      workspaceRoot,
+      profile,
+      prompt,
+      executionContract,
+    });
+    try {
+      const replay = this.store.resolveStartReplay(workspaceRoot, replayBinding);
+      return replay ? recordToStartOutput(replay, this.getHerdrExternalHandle(replay.id)) : undefined;
+    } catch (error) {
+      if (error instanceof LocalAgentReplayConflictError) return undefined;
+      throw error;
+    }
   }
 
   /**

@@ -236,6 +236,7 @@ import {
   NEXUS_CAPABILITY_REPOSITORY,
   renderCapabilityDiscoveryForWorker,
   verifyCapabilityDiscoveryReceipt,
+  type CapabilityDiscoveryReceipt,
 } from "./capability-discovery.js";
 import { runToolchainVerifier, resolveToolchainExecutable, listToolchainCatalog } from "./local-agent-toolchains.js";
 import {
@@ -3499,6 +3500,8 @@ export function createMcpServer(
    * Legacy callers without a resumableWork pointer are unaffected.
    */
   workResumeStore?: WorkResumeStore,
+  /** Test-only seam; production uses the canonical Nexus capability index verifier. */
+  capabilityDiscoveryVerifier: typeof verifyCapabilityDiscoveryReceipt = verifyCapabilityDiscoveryReceipt,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -5991,6 +5994,11 @@ export function createMcpServer(
         const profiles = selection.profiles;
         const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
         let coreAdmission: CoreMutationAdmission | undefined;
+        let coreAdmissionRequest: {
+          pointer: { required: true; sessionId: string; bindingHash: string };
+          paths: string[];
+          receipt: CapabilityDiscoveryReceipt;
+        } | undefined;
         let discoveryContext: string | undefined;
         if (selectedProfile?.write_mode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
@@ -6013,7 +6021,7 @@ export function createMcpServer(
             }
             if (contract?.capabilityDiscovery) {
               try {
-                const verifiedDiscovery = await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery);
+                const verifiedDiscovery = await capabilityDiscoveryVerifier(contract.capabilityDiscovery);
                 discoveryContext = renderCapabilityDiscoveryForWorker(verifiedDiscovery);
               } catch (error) {
                 throw new AgentSessionError(
@@ -6036,7 +6044,7 @@ export function createMcpServer(
               );
             }
             try {
-              const verifiedDiscovery = await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery);
+              const verifiedDiscovery = await capabilityDiscoveryVerifier(contract.capabilityDiscovery);
               discoveryContext = renderCapabilityDiscoveryForWorker(verifiedDiscovery);
               if (coreMutationGuard) {
                 const corePointer = contract.coreMutation;
@@ -6044,14 +6052,11 @@ export function createMcpServer(
                   throw new Error("CORE_MUTATION_POINTER_REQUIRED: write-capable governed execution lost its Core pointer before admission.");
                 }
                 coreMutationGuard.assertDiscovery(workspaceId, verifiedDiscovery.receipt);
-                coreAdmission = await coreMutationGuard.admit({
-                  workspaceId,
-                  extra,
+                coreAdmissionRequest = {
                   pointer: { required: true, sessionId: corePointer.sessionId, bindingHash: corePointer.bindingHash },
-                  paths: contract.writePaths,
-                  pathContainment: "NOT_PROVEN",
-                  writerDomain: "AGENT",
-                });
+                  paths: contract.writePaths!,
+                  receipt: verifiedDiscovery.receipt,
+                };
               }
             } catch (error) {
               throw new AgentSessionError(
@@ -6070,44 +6075,7 @@ export function createMcpServer(
             ? { catalogReceipt: catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog) }
             : {}),
         };
-        // Must happen BEFORE provider launch for every write-capable worker in
-        // an enrolled repository. Non-enrolled repositories preserve legacy behavior.
-        if (selectedProfile?.write_mode !== "read_only") {
-          try {
-            const pointer = contract?.resumableWork;
-            if (pointer?.effectHandle !== undefined && pointer.effectHandle !== attemptKey) {
-              throw new Error(
-                "P0 agent_start requires resumableWork.effectHandle to exactly equal attemptKey.",
-              );
-            }
-            enforceNexusWriterAdmission({
-              workspaceRoot: workspace.root,
-              pointer,
-              store: workResumeStore,
-              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              operation: "agent_start",
-            });
-            if (pointer && workResumeStore) {
-              workResumeStore.bindEffectIdentity({
-                workKey: pointer.workKey,
-                leaseId: pointer.leaseId,
-                effectKind: "agent",
-                effectKey: attemptKey,
-                lineage: (contract?.role || contract?.parentEffectKey || contract?.supersedes) ? {
-                  role: contract?.role,
-                  parentEffectKey: contract?.parentEffectKey,
-                  supersedes: contract?.supersedes,
-                } : undefined,
-              });
-            }
-          } catch (err) {
-            throw new AgentSessionError(
-              "INVALID_EXECUTION_CONTRACT",
-              `P0_WRITER_ADMISSION_FAILED: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        }
-        const output = await agentSessionManager.startAgent({
+        const startInput = {
           workspaceId,
           workspaceRoot: workspace.root,
           profileName: selection.profileName,
@@ -6116,15 +6084,94 @@ export function createMcpServer(
           profileCatalog,
           attemptKey,
           executionContract: boundContract,
-        });
-        if (contract?.resumableWork && workResumeStore) {
-          workResumeStore.bindEffectHandle({
-            workKey: contract.resumableWork.workKey,
-            effectKind: "agent",
-            effectKey: attemptKey,
-            effectHandle: output.agentId,
-          });
-        }
+        };
+        const startWithAdmission = async () => {
+          let exactReplay;
+          if (coreAdmissionRequest && coreMutationGuard) {
+            try {
+              // Revalidate the exact caller and current Core binding/session
+              // while holding the attempt lock, before considering a replay.
+              coreMutationGuard.require({ workspaceId, extra, pointer: coreAdmissionRequest.pointer });
+              coreMutationGuard.assertDiscovery(workspaceId, coreAdmissionRequest.receipt);
+              exactReplay = agentSessionManager.findExactStartReplay(startInput);
+            } catch (error) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                error instanceof Error ? error.message : String(error),
+              );
+            }
+          }
+          if (!exactReplay && coreAdmissionRequest && coreMutationGuard) {
+            try {
+              // Changed payloads and new attempts retain the ordinary Core
+              // admission path. Only a durable byte-equivalent replay skips it.
+              coreAdmission = await coreMutationGuard.admit({
+                workspaceId,
+                extra,
+                pointer: coreAdmissionRequest.pointer,
+                paths: coreAdmissionRequest.paths,
+                pathContainment: "NOT_PROVEN",
+                writerDomain: "AGENT",
+              });
+            } catch (error) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                error instanceof Error ? error.message : String(error),
+              );
+            }
+          }
+          // Must happen BEFORE provider launch for every write-capable worker
+          // in an enrolled repository. Exact replay still rechecks the active
+          // pinned lease and effect identity before it can return.
+          if (selectedProfile?.write_mode !== "read_only") {
+            try {
+              const pointer = contract?.resumableWork;
+              if (pointer?.effectHandle !== undefined && pointer.effectHandle !== attemptKey) {
+                throw new Error(
+                  "P0 agent_start requires resumableWork.effectHandle to exactly equal attemptKey.",
+                );
+              }
+              enforceNexusWriterAdmission({
+                workspaceRoot: workspace.root,
+                pointer,
+                store: workResumeStore,
+                ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+                operation: "agent_start",
+              });
+              if (pointer && workResumeStore) {
+                workResumeStore.bindEffectIdentity({
+                  workKey: pointer.workKey,
+                  leaseId: pointer.leaseId,
+                  effectKind: "agent",
+                  effectKey: attemptKey,
+                  lineage: (contract?.role || contract?.parentEffectKey || contract?.supersedes) ? {
+                    role: contract?.role,
+                    parentEffectKey: contract?.parentEffectKey,
+                    supersedes: contract?.supersedes,
+                  } : undefined,
+                });
+              }
+            } catch (err) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                `P0_WRITER_ADMISSION_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+              );
+            }
+          }
+          const output = exactReplay ?? await agentSessionManager.startAgent(startInput);
+          if (contract?.resumableWork && workResumeStore) {
+            workResumeStore.bindEffectHandle({
+              workKey: contract.resumableWork.workKey,
+              effectKind: "agent",
+              effectKey: attemptKey,
+              effectHandle: output.agentId,
+            });
+          }
+          return output;
+        };
+        const output = coreAdmissionRequest
+          ? await agentSessionManager.withStartAttemptKeyLock({ workspaceRoot: workspace.root, attemptKey }, startWithAdmission)
+          : await startWithAdmission();
         logToolCall(config, {
           tool: "agent_start",
           workspaceId,

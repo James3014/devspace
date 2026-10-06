@@ -43,6 +43,7 @@ import { mcpToolCatalogGeneration } from "./capability-manifest.js";
 import { SqliteOAuthStore, SqliteOAuthClientsStore } from "./oauth-store.js";
 import {
   acceptanceContractHash,
+  capabilityDiscoveryReceiptHash,
   computeCoreMutationWorkspaceIdentity,
   computeRepositoryMutationBindingHash,
   CoreMutationSessionStore,
@@ -62,6 +63,16 @@ import {
   parseCoreMutationRebindOwnerRecoveryEvidence,
   recoverOrphanedProcessBeforeRebind,
 } from "./core-mutation-tools.js";
+import {
+  buildWorktreeLeaseInput,
+  computeWorkKey,
+  createWorkResumeStore,
+  type WorkKeyMaterial,
+  type WorkResumeStore,
+} from "./work-resume.js";
+import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import type { CapabilityDiscoveryReceipt, verifyCapabilityDiscoveryReceipt } from "./capability-discovery.js";
+import type { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1328,6 +1339,8 @@ interface ServerFixture {
   stateDir: string;
   processSessions: ProcessSessionManager;
   coreMutationSessions?: CoreMutationSessionStore;
+  workResumeStore?: WorkResumeStore;
+  workResumeOwnership?: ControlPlaneOwnershipStore;
   close: () => Promise<void>;
 }
 
@@ -1344,6 +1357,9 @@ async function fixture(
     controlPlaneInventory?: ControlPlaneInventory;
     coreMutation?: boolean | "enforced_missing";
     coreMutationRecoveryOwnerClientId?: string;
+    workResume?: boolean;
+    agentLauncher?: (agentId: string, promptFile: string, workerToken: string) => Promise<number | void>;
+    capabilityDiscoveryVerifier?: typeof verifyCapabilityDiscoveryReceipt;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -1428,11 +1444,19 @@ async function fixture(
   const workspaces = new WorkspaceRegistry(config, store);
   const { LocalAgentSessionManager } = await import("./local-agent-sessions.js");
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, async () => {}, async () => true)
+    ? new LocalAgentSessionManager(config, options.agentLauncher ?? (async () => {}), async () => true)
     : undefined;
   const durableOperations = new DurableOperationManager(config);
   const processSessions = new ProcessSessionManager();
   const coreMutationSessions = options.coreMutation === true ? new CoreMutationSessionStore(stateDir) : undefined;
+  const workResumeDb: DatabaseHandle | undefined = options.workResume ? openDatabase(stateDir) : undefined;
+  const workResume = workResumeDb
+    ? createWorkResumeStore(
+        workResumeDb.sqlite,
+        (context) => typeof context === "string" && context.length > 0 ? { ownerThread: context } : undefined,
+      )
+    : undefined;
+  if (agentSessionManager && workResume) agentSessionManager.setWorkResumeStore(workResume.store);
   const chatSwarmLifecycle = config.chatSwarmEnabled ? new ChatSwarmLifecycle({ stateDir }) : undefined;
   chatSwarmLifecycle?.recoverAfterStartup();
   const server = createMcpServer(
@@ -1458,6 +1482,8 @@ async function fixture(
     options.coreMutation === "enforced_missing" || coreMutationSessions
       ? undefined
       : CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
+    workResume?.store,
+    options.capabilityDiscoveryVerifier,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -1477,6 +1503,7 @@ async function fixture(
     coreMutationSessions?.close();
     chatSwarmLifecycle?.close();
     agentSessionManager?.close();
+    workResumeDb?.close();
     store.close();
   };
 
@@ -1485,7 +1512,17 @@ async function fixture(
     await rm(root, { recursive: true, force: true });
   });
 
-  return { client, project, config, stateDir, processSessions, coreMutationSessions, close };
+  return {
+    client,
+    project,
+    config,
+    stateDir,
+    processSessions,
+    coreMutationSessions,
+    workResumeStore: workResume?.store,
+    workResumeOwnership: workResume?.ownership,
+    close,
+  };
 }
 
 function testControlPlaneInventory(): ControlPlaneInventory {
@@ -1787,6 +1824,7 @@ async function bindTestCoreSession(input: {
   deletionPolicy?: "FORBID" | "ALLOW";
   identitySuffix?: string;
   authorityHash?: string;
+  capabilityDiscoveryReceipt?: CapabilityDiscoveryReceipt;
 }) {
   const store = input.fixture.coreMutationSessions;
   assert.ok(store, "test fixture must enable Core mutation sessions");
@@ -1826,8 +1864,10 @@ async function bindTestCoreSession(input: {
     },
     capability_discovery: {
       required: true,
-      receipt_hash: `sha256:${"5".repeat(64)}`,
-      index_revision: `git-commit:${"6".repeat(40)}`,
+      receipt_hash: input.capabilityDiscoveryReceipt
+        ? capabilityDiscoveryReceiptHash(input.capabilityDiscoveryReceipt)
+        : `sha256:${"5".repeat(64)}`,
+      index_revision: `git-commit:${input.capabilityDiscoveryReceipt?.indexRevision ?? "6".repeat(40)}`,
     },
     core: {
       protocol_version: NEXUS_CORE_PROTOCOL_VERSION,
@@ -2310,6 +2350,206 @@ test("createMcpServer without Core store fails closed unless explicit test bypas
   assert.equal(result.isError, true);
   assert.match(responseText(result), /CORE_MUTATION_STORE_REQUIRED/);
   assert.equal(existsSync(join(context.project, "must-not-write.txt")), false);
+});
+
+test("Core-bound agent_start exact concurrent replay bypasses only duplicate Core admission", async (t) => {
+  const conversationScopeId = "core-agent-start-active-replay";
+  const conversation = { "openai/session": conversationScopeId };
+  const receipt: CapabilityDiscoveryReceipt = {
+    schema: "nexus.capability_discovery_receipt.v1",
+    repository: "James3014/Nexus-new",
+    indexRevision: "6".repeat(40),
+    indexPath: "docs/agents/CAPABILITY_DISCOVERY_INDEX.v1.json",
+    indexSha256: "5".repeat(64),
+    intent: "Exercise the existing Core-bound agent admission contract.",
+    disposition: "REUSE_EXISTING",
+    matchedCapabilityIds: ["nexus-core"],
+    evidence: {
+      architecture: ["Core owns mutation completion."],
+      source: ["Core mutation admission."],
+      history: ["issue-330 test fixture."],
+      runtime: ["MCP agent_start."],
+    },
+  };
+  let workerLaunches = 0;
+  const context = await fixture(t, {
+    git: true,
+    coreMutation: true,
+    subagents: true,
+    workResume: true,
+    agentLauncher: async () => { workerLaunches++; },
+    capabilityDiscoveryVerifier: async (provided) => ({ receipt: provided, matchedCapabilities: [] }),
+  });
+  await addMutatorProfile(context.project);
+  await mkdir(join(context.project, ".nexus-core"), { recursive: true });
+  await writeFile(join(context.project, ".nexus-core", "config.toml"), "schema_version = 1\n");
+  await execFileAsync("git", ["add", ".devspace/agents/mutator.md", ".nexus-core/config.toml"], { cwd: context.project });
+  await execFileAsync("git", ["commit", "-m", "test fixture enrolled writable agent"], { cwd: context.project });
+  const opened = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot: context.project,
+    conversationScopeId,
+    allowedPaths: ["AGENTS.md"],
+    capabilityDiscoveryReceipt: receipt,
+  });
+
+  const canonicalRoot = await realpath(context.project);
+  const material: WorkKeyMaterial = {
+    repositoryKey: "James3014/devspace",
+    ownerIssueId: "issue-330-core-replay",
+    baseRevisionSha: bound.head,
+    worktreeRealpath: canonicalRoot,
+    writeScope: [join(canonicalRoot, "AGENTS.md")],
+    contractPurpose: "issue-330-core-agent-replay",
+  };
+  const workKey = computeWorkKey(material);
+  const grant = {
+    repository: "James3014/devspace",
+    goal: "issue-330-core-replay",
+    coordinatorThread: conversationScopeId,
+    evidenceHash: "issue-330-core-replay-fixture",
+  };
+  const ownership = context.workResumeOwnership;
+  const resumeStore = context.workResumeStore;
+  assert.ok(ownership && resumeStore, "test fixture must enable durable WorkResume admission");
+  ownership.putGrantEvidence(conversationScopeId, grant, 0);
+  const leaseInput = buildWorktreeLeaseInput(
+    workKey,
+    material,
+    grant,
+    new Date(Date.now() + 120_000).toISOString(),
+  );
+  const lease = ownership.acquire(conversationScopeId, leaseInput);
+  resumeStore.register(workKey, material, leaseInput.idempotencyKey, lease.leaseId);
+
+  const attemptKey = "issue330-core-agent-active-replay";
+  const startArguments = {
+    workspaceId,
+    profile: "mutator",
+    prompt: "perform one bounded active mutation",
+    attemptKey,
+    executionContract: {
+      authorityMode: "OWNER_DIRECT",
+      coreMutation: { sessionId: bound.session.id, bindingHash: bound.session.bindingHash },
+      capabilityDiscovery: receipt,
+      writePaths: ["AGENTS.md"],
+      resumableWork: {
+        workKey,
+        leaseId: lease.leaseId,
+        expectedLeaseVersion: lease.version,
+        baseRevisionSha: bound.head,
+        effectHandle: attemptKey,
+      },
+    },
+  };
+  const coreStore = context.coreMutationSessions!;
+  const originalAdmitEffect = coreStore.admitEffect.bind(coreStore);
+  type AdmissionInput = Parameters<typeof coreStore.admitEffect>[0];
+  let coreAdmissionCalls = 0;
+  let casArrivals = 0;
+  let releaseCasBarrier!: () => void;
+  const bothAtCas = new Promise<void>((resolve) => { releaseCasBarrier = resolve; });
+  const casTimeout = setTimeout(releaseCasBarrier, 100);
+  (coreStore as unknown as { admitEffect: (input: AdmissionInput) => ReturnType<typeof coreStore.admitEffect> }).admitEffect = (input) => {
+    coreAdmissionCalls++;
+    return originalAdmitEffect({
+      ...input,
+      beforeAdmissionCas: async () => {
+        casArrivals++;
+        if (casArrivals === 2) releaseCasBarrier();
+        await bothAtCas;
+      },
+    });
+  };
+  let concurrentResults: Awaited<ReturnType<Client["callTool"]>>[];
+  try {
+    concurrentResults = await Promise.all([
+      context.client.callTool({ name: "agent_start", arguments: structuredClone(startArguments), _meta: conversation }),
+      context.client.callTool({ name: "agent_start", arguments: structuredClone(startArguments), _meta: conversation }),
+    ]);
+  } finally {
+    clearTimeout(casTimeout);
+    (coreStore as unknown as { admitEffect: (input: AdmissionInput) => ReturnType<typeof coreStore.admitEffect> }).admitEffect = originalAdmitEffect;
+  }
+  for (const replay of concurrentResults) assert.equal(replay.isError, undefined, responseText(replay));
+  const [firstAgentId, secondAgentId] = concurrentResults.map((result) => structuredContent(result).agentId as string);
+  assert.ok(firstAgentId);
+  assert.equal(firstAgentId, secondAgentId, "concurrent byte-equivalent starts must resolve to one durable agent");
+  assert.equal(structuredContent(concurrentResults[0]).status, "starting");
+  assert.equal(coreAdmissionCalls, 1, "one concurrent start wins Core admission; its exact active replay bypasses only the second admission");
+  assert.equal(casArrivals, 1, "duplicate attemptKey must be serialized before Core's admission CAS");
+  assert.equal(workerLaunches, 1, "exact active replay must not launch another provider worker");
+  const firstSession = coreStore.getById(bound.session.id)!;
+  assert.equal(firstSession.writerReconciliationState, "OUTCOME_UNKNOWN");
+  assert.deepEqual(firstSession.writerDomains, ["AGENT"]);
+  const firstResumeStatus = resumeStore.disposition(workKey);
+  assert.equal(firstResumeStatus.disposition, "RUNNING");
+  assert.equal(firstResumeStatus.effectHandle, firstAgentId);
+  const replayedSession = coreStore.getById(bound.session.id)!;
+  assert.equal(replayedSession.lastEffectAt, firstSession.lastEffectAt, "replay must not create a new Core effect admission");
+  assert.deepEqual(resumeStore.disposition(workKey), firstResumeStatus, "replay must preserve the exact active pinned resumableWork effect");
+
+  const agents = new LocalAgentStore(context.stateDir);
+  try {
+    assert.equal(agents.list({ workspaceId, workspaceRoot: context.project }).length, 1, "one durable agent must own this attemptKey");
+  } finally {
+    agents.close();
+  }
+
+  let changedPayloadAdmissionCalls = 0;
+  (coreStore as unknown as { admitEffect: (input: AdmissionInput) => ReturnType<typeof coreStore.admitEffect> }).admitEffect = (input) => {
+    changedPayloadAdmissionCalls++;
+    return originalAdmitEffect(input);
+  };
+  let changedPayload: Awaited<ReturnType<Client["callTool"]>>;
+  try {
+    changedPayload = await context.client.callTool({
+      name: "agent_start",
+      arguments: { ...structuredClone(startArguments), prompt: "changed payload must conflict" },
+      _meta: conversation,
+    });
+  } finally {
+    (coreStore as unknown as { admitEffect: (input: AdmissionInput) => ReturnType<typeof coreStore.admitEffect> }).admitEffect = originalAdmitEffect;
+  }
+  assert.equal(changedPayload.isError, true);
+  assert.equal(changedPayloadAdmissionCalls, 1, "changed payload must use normal Core admission and cannot take the exact replay bypass");
+  assert.equal(workerLaunches, 1);
+
+  let changedBindingAdmissionCalls = 0;
+  (coreStore as unknown as { admitEffect: (input: AdmissionInput) => ReturnType<typeof coreStore.admitEffect> }).admitEffect = (input) => {
+    changedBindingAdmissionCalls++;
+    return originalAdmitEffect(input);
+  };
+  let changedBinding: Awaited<ReturnType<Client["callTool"]>>;
+  try {
+    changedBinding = await context.client.callTool({
+      name: "agent_start",
+      arguments: {
+        ...structuredClone(startArguments),
+        executionContract: {
+          ...structuredClone(startArguments.executionContract),
+          coreMutation: { sessionId: bound.session.id, bindingHash: `sha256:${"0".repeat(64)}` },
+        },
+      },
+      _meta: conversation,
+    });
+  } finally {
+    (coreStore as unknown as { admitEffect: (input: AdmissionInput) => ReturnType<typeof coreStore.admitEffect> }).admitEffect = originalAdmitEffect;
+  }
+  assert.equal(changedBinding.isError, true);
+  assert.match(responseText(changedBinding), /CORE_MUTATION_BINDING_MISMATCH/);
+  assert.equal(changedBindingAdmissionCalls, 0, "a changed Core binding must fail the active-session check before replay lookup or admission");
+
+  const unauthorizedReplay = await context.client.callTool({
+    name: "agent_start",
+    arguments: structuredClone(startArguments),
+    _meta: { "openai/session": "different-core-caller" },
+  });
+  assert.equal(unauthorizedReplay.isError, true, "a replay cannot bypass the original Core caller identity");
+  assert.equal(workerLaunches, 1);
 });
 
 test("Core COMPLETE composes active agent manager state and fails closed", async (t) => {
