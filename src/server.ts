@@ -463,6 +463,7 @@ const DIRECT_CODING_TOOL_NAMES = new Set<string>([
 const DIRECT_DISPATCH_TOOL_NAMES = new Set<string>([
   toolNames.openWorkspace,
   toolNames.read,
+  "work_resume_prepare",
   "agent_catalog",
   "agent_preflight",
   "agent_start",
@@ -495,7 +496,7 @@ function serverInstructions(config: ServerConfig): string {
   const directCodingMode = config.toolMode === "minimal";
   const directDispatchMode = config.toolMode === "dispatch";
   if (directDispatchMode) {
-    return "Use DevSpace only for direct worker dispatch. Call open_workspace once for the project checkout or isolated worktree, then reuse its workspaceId. Use read only for bounded instruction or result inspection. Use agent_catalog when exact provider/model catalog membership matters, then agent_preflight before launch. Start exactly one worker with agent_start using a stable attemptKey and authorityMode OWNER_DIRECT. For write-capable work, provide expectedHead when known, bounded writePaths, and maxFiles. Poll the same agent with agent_status. Use agent_continue only for one evidence-guided follow-up on that same agentId. After a timeout, disconnect, or ambiguous response, query the same agentId and use agent_reconcile; never redispatch the logical task under a new attemptKey until the original effect is reconciled. Use agent_list to recover durable sessions and agent_cancel only for the exact worker that must be stopped. This surface grants no acceptance, merge, release, or production authority.";
+    return "Use DevSpace only for direct worker dispatch. Call open_workspace once for the project checkout or isolated worktree, then reuse its workspaceId. Use read only for bounded instruction or result inspection. Use agent_catalog when exact provider/model catalog membership matters, then agent_preflight before launch. For a write-capable worker in a Nexus-enrolled repository, call work_resume_prepare first and pass its resumableWork pointer to agent_start with the exact same attemptKey in effectHandle. Start exactly one worker with agent_start using a stable attemptKey and authorityMode OWNER_DIRECT. For write-capable work, provide expectedHead when known, bounded writePaths, and maxFiles. Poll the same agent with agent_status. Use agent_continue only for one evidence-guided follow-up on that same agentId. After a timeout, disconnect, or ambiguous response, query the same agentId and use agent_reconcile; never redispatch the logical task under a new attemptKey until the original effect is reconciled. Use agent_list to recover durable sessions and agent_cancel only for the exact worker that must be stopped. This surface grants no acceptance, merge, release, or production authority.";
   }
   const artifactInstruction = !directCodingMode && config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
     ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
@@ -3102,6 +3103,9 @@ function createDirectDispatchAgentStartInputSchema() {
     ),
     writePaths: z.array(z.string().min(1)).min(1).optional().describe(
       "Required for write-capable workers. Canonical writable path scope relative to the workspace root.",
+    ),
+    resumableWork: resumableWorkSchema().optional().describe(
+      "Lightweight Nexus writer-admission pointer. Required for write-capable workers when the repository is enrolled by .nexus-core/config.toml.",
     ),
     maxFiles: z.number().int().min(1).optional().describe(
       "Optional maximum number of files the worker may change.",
