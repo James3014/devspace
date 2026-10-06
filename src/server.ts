@@ -3738,7 +3738,6 @@ export function createMcpServer(
       };
     },
   );
-
   registerAppTool(
     server,
     "host_operation_external_status",
@@ -6315,11 +6314,14 @@ export function createMcpServer(
       {
         title: "Prepare resumable work",
         description:
-          "Create or exactly replay one P0 work identity and exclusive writer lease using the current authenticated #62 carrier. Repository, base SHA, scope and expiry come from that carrier; this prepares ownership only and starts no effect.",
+          "Create or exactly replay one durable work identity and exclusive writer lease using the current authenticated mutation authority. Repository, base SHA, scope and expiry come from that authority; this prepares ownership only and starts no effect.",
         inputSchema: {
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
           contractPurpose: z.string().min(1).max(512).describe(
-            "Stable purpose identity within the already-approved carrier goal. Repository, goal, base SHA, scope and expiry come only from that carrier.",
+            "Stable purpose identity within the already-approved work authority. Repository, goal, base SHA, scope and expiry come only from that authority.",
+          ),
+          carrierCredential: z.string().optional().describe(
+            "Optional previously approved writer credential for reconnecting on a fresh MCP session.",
           ),
         },
         outputSchema: {
@@ -6342,19 +6344,20 @@ export function createMcpServer(
           openWorldHint: false,
         },
       },
-      async ({ workspaceId, contractPurpose }, extra) => {
+      async ({ workspaceId, contractPurpose, carrierCredential }, extra) => {
         if (!workResumeStore || !carrierBindings) {
           throw new AgentSessionError(
             "INVALID_EXECUTION_CONTRACT",
-            "P0 work-resume preparation requires the canonical #62 carrier/ownership authority.",
+            "Work-resume preparation requires the configured mutation ownership authority.",
           );
         }
         const context = dependencyConsumerContext(extra);
+        if (carrierCredential !== undefined) carrierBindings.redeem(context, carrierCredential);
         const carrier = carrierBindings.status(context);
         if (!carrier.contract.operations.includes("worktree_write")) {
           throw new AgentSessionError(
             "INVALID_EXECUTION_CONTRACT",
-            "Current carrier contract does not authorize worktree_write.",
+            "Current write authority does not authorize worktree_write.",
           );
         }
 
@@ -6366,7 +6369,7 @@ export function createMcpServer(
         if (currentHead !== carrier.contract.baseRevision) {
           throw new AgentSessionError(
             "STALE_WORKSPACE",
-            `P0 carrier base ${carrier.contract.baseRevision} does not match current workspace HEAD ${currentHead}.`,
+            `Approved writer base ${carrier.contract.baseRevision} does not match current workspace HEAD ${currentHead}.`,
           );
         }
 

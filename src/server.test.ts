@@ -5153,6 +5153,17 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
     "work_resume_prepare",
   ]);
   assert.equal(names.length, 12);
+
+  const resumePrepare = toolsList.tools.find((tool) => tool.name === "work_resume_prepare");
+  assert.ok(resumePrepare);
+  const resumePrepareSchema = JSON.stringify(resumePrepare);
+  assert.match(resumePrepareSchema, /carrierCredential/);
+  assert.doesNotMatch(
+    resumePrepareSchema,
+    /Core|Nexus|coordination|cutover|host.?operation|#62|P0/i,
+    "direct-dispatch admission metadata must stay implementation-neutral",
+  );
+
   assert.deepEqual(
     names.filter(
       (name) =>
@@ -5187,6 +5198,170 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
   assert.match(instructions, /agent_reconcile/);
   assert.match(instructions, /read/);
   assert.doesNotMatch(instructions, /Core|Nexus|coordination|cutover|host.?operation/i);
+});
+
+test("dispatch mode rebinds an approved writer credential and admits enrolled agent_start", async () => {
+  const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+  const { CarrierBindingStore } = await import("./carrier-binding.js");
+  const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-dispatch-admission-http-")));
+  const project = join(root, "project");
+  const stateDir = join(root, "state");
+  const agentDir = join(root, "agents");
+  await mkdir(join(project, ".devspace", "agents"), { recursive: true });
+  await mkdir(join(project, ".nexus-core"), { recursive: true });
+  await mkdir(agentDir, { recursive: true });
+  await writeFile(join(project, "README.md"), "dispatch admission fixture\n");
+  await writeFile(join(project, ".nexus-core", "config.toml"), "schema_version = 1\n");
+  await addMutatorProfile(project);
+  await git(project, ["init"]);
+  await git(project, ["config", "user.email", "devspace@example.com"]);
+  await git(project, ["config", "user.name", "DevSpace Test"]);
+  await git(project, ["add", "."]);
+  await git(project, ["commit", "-m", "dispatch admission fixture"]);
+  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: project })).stdout.trim();
+
+  const loadedConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, "config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_TOOL_MODE: "dispatch",
+    PORT: "1",
+  });
+  const config: ServerConfig = {
+    ...loadedConfig,
+    toolMode: "dispatch",
+    subagents: {
+      ...loadedConfig.subagents,
+      enabled: true,
+      providers: [{ id: "codex", enabled: true }],
+    },
+  };
+
+  const provider = new SingleUserOAuthProvider(config.oauth, new URL("/mcp", config.publicBaseUrl), config.stateDir);
+  const oauthClient = await provider.clientsStore.registerClient!({
+    redirect_uris: ["http://localhost/callback"],
+    client_name: "dispatch admission fixture",
+    token_endpoint_auth_method: "none",
+  });
+  let redirect = "";
+  await provider.authorize(
+    oauthClient,
+    {
+      redirectUri: "http://localhost/callback",
+      codeChallenge: "fixture",
+      scopes: config.oauth.scopes,
+      resource: new URL("/mcp", config.publicBaseUrl),
+    },
+    {
+      req: { method: "POST", body: { owner_token: config.oauth.ownerToken } },
+      redirect: (_status: number, url: string) => { redirect = url; },
+    } as never,
+  );
+  const tokens = await provider.exchangeAuthorizationCode(
+    oauthClient,
+    new URL(redirect).searchParams.get("code")!,
+  );
+
+  const running = createServer(config);
+  const listener = running.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => listener.once("listening", resolve));
+  const address = listener.address() as { port: number };
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`http://127.0.0.1:${address.port}/mcp`),
+    { requestInit: { headers: { Authorization: `Bearer ${tokens.access_token}` } } },
+  );
+  const client = new Client({ name: "dispatch-admission-fixture", version: "1" });
+  let approver: InstanceType<typeof CarrierBindingStore> | undefined;
+  try {
+    await client.connect(transport);
+    const conversationScopeId = "issue396-dispatch-admission";
+    const opened = await callOpen(client, project, conversationScopeId);
+    const workspaceId = structuredContent(opened).workspaceId as string;
+    const tools = await client.listTools();
+    const prepareTool = tools.tools.find((tool) => tool.name === "work_resume_prepare");
+    assert.ok(prepareTool);
+    assert.ok(
+      (prepareTool.inputSchema as { properties?: Record<string, unknown> }).properties?.carrierCredential,
+      "direct dispatch must expose only the narrow credential-rebind input on work_resume_prepare",
+    );
+    assert.equal(tools.tools.some((tool) => tool.name === "coordination_resume"), false);
+
+    const unbound = await client.callTool({
+      name: "work_resume_prepare",
+      arguments: { workspaceId, contractPurpose: "issue396-positive-admission" },
+      _meta: { "openai/session": conversationScopeId },
+    });
+    assert.equal(unbound.isError, true);
+    assert.match(responseText(unbound), /current paired carrier is required/i);
+
+    assert.ok(transport.sessionId);
+    approver = new CarrierBindingStore(stateDir);
+    const pairing = approver.requestPairing({
+      clientId: oauthClient.client_id,
+      sessionId: transport.sessionId,
+    });
+    approver.approveLocal(pairing.pendingId, {
+      repository: "James3014/devspace",
+      goal: "issue-396",
+      role: "controller",
+      scope: [project],
+      baseRevision: head,
+      operations: ["worktree_write"],
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    const prepared = await client.callTool({
+      name: "work_resume_prepare",
+      arguments: {
+        workspaceId,
+        contractPurpose: "issue396-positive-admission",
+        carrierCredential: pairing.credential,
+      },
+      _meta: { "openai/session": conversationScopeId },
+    });
+    assert.equal(prepared.isError, undefined, responseText(prepared));
+    assert.doesNotMatch(JSON.stringify(prepared), new RegExp(pairing.credential));
+    const resumableWork = structuredContent(prepared).resumableWork as {
+      workKey: string;
+      leaseId: string;
+      expectedLeaseVersion: number;
+      baseRevisionSha: string;
+    };
+    assert.match(resumableWork.workKey, /^wk_[0-9a-f]{32}$/);
+    assert.equal(resumableWork.baseRevisionSha, head);
+
+    const attemptKey = "issue396-positive-agent";
+    const started = await client.callTool({
+      name: "agent_start",
+      arguments: {
+        workspaceId,
+        profile: "mutator",
+        prompt: "perform one bounded direct change",
+        attemptKey,
+        executionContract: {
+          authorityMode: "OWNER_DIRECT",
+          expectedHead: head,
+          writePaths: ["README.md"],
+          resumableWork: { ...resumableWork, effectHandle: attemptKey },
+          maxFiles: 1,
+        },
+      },
+      _meta: { "openai/session": conversationScopeId },
+    });
+    assert.equal(started.isError, undefined, responseText(started));
+    assert.ok(structuredContent(started).agentId);
+    assert.equal(structuredContent(started).coreMutation, undefined);
+  } finally {
+    await client.close().catch(() => {});
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await running.close();
+    approver?.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("dispatch mode requires bounded write scope and launches OWNER_DIRECT without governance inputs", async (t) => {
