@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBinding } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
-import { CutoverStateStore } from "./cutover-state.js";
+import { CUTOVER_ACTIVATION_BINDING_SCHEMA, CutoverStateStore } from "./cutover-state.js";
 import { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
@@ -1503,11 +1503,46 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
     });
     const actuatorCalls: Array<{livePid:number;serviceLabel:string;launchdTarget:string}>=[];
     let scheduled=0;
+    let activationVerifications=0;
+    const activationBinding={
+      schema:CUTOVER_ACTIVATION_BINDING_SCHEMA,
+      cutoverId,
+      sourceCommit:cutover.expectedIdentity.sourceCommit,
+      buildId:cutover.expectedIdentity.buildId,
+      releaseSha256:"e".repeat(64),
+      releasePath:join(f.root,"release-target"),
+      pointerPath:join(f.root,"current-release.json"),
+      boundAt:new Date(f.clock()).toISOString(),
+    };
     const dependencies={
       readHealth:async()=>health(),
       probeTarget:async()=>({buildReady:true,detail:"exact package"}),
-      createActuator:(options:{livePid:number;serviceLabel:string;launchdTarget:string})=>{
-        actuatorCalls.push(options);
+      inspectStableService:()=>({
+        serviceRoot:f.root,
+        program:process.execPath,
+        arguments:[process.execPath,"dist/service-launcher.js","serve"],
+        pid:4321,
+      }),
+      bindActivation:()=>activationBinding,
+      verifyActivation:(binding:typeof activationBinding,serviceRoot:string)=>{
+        assert.deepEqual(binding,activationBinding);
+        assert.equal(serviceRoot,f.root);
+        activationVerifications+=1;
+      },
+      createActuator:(options:{
+        livePid:number;
+        serviceLabel:string;
+        launchdTarget:string;
+        expectedStableServiceRoot?:string;
+        verifyActivation?:()=>void;
+      })=>{
+        actuatorCalls.push({
+          livePid:options.livePid,
+          serviceLabel:options.serviceLabel,
+          launchdTarget:options.launchdTarget,
+        });
+        assert.equal(options.expectedStableServiceRoot,f.root);
+        options.verifyActivation?.();
         return {
           actuator:"launchd-self" as const,
           serviceLabel:options.serviceLabel,
@@ -1565,7 +1600,10 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
       serviceLabel:"test.service",
       launchdTarget:"gui/501/test.service",
     });
-    assert.ok(new CutoverStateStore(f.root).get()?.restartRequest?.restartScheduledAt);
+    const storedCutover=new CutoverStateStore(f.root).get();
+    assert.ok(storedCutover?.restartRequest?.restartScheduledAt);
+    assert.deepEqual(storedCutover?.activationBinding,activationBinding);
+    assert.ok(activationVerifications>=2);
 
     const replay=await performLocalBoundCutoverRestart({
       config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,carrierCredential:pairing.credential,
