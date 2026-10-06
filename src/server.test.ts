@@ -5164,6 +5164,11 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
   assert.match(agentStartSchema, /expectedHead/);
   assert.match(agentStartSchema, /writePaths/);
   assert.match(agentStartSchema, /resumableWork/);
+  const workResumePrepare = toolsList.tools.find((tool) => tool.name === "work_resume_prepare");
+  assert.ok(workResumePrepare);
+  const workResumePrepareSchema = JSON.stringify(workResumePrepare.inputSchema);
+  assert.match(workResumePrepareSchema, /carrierCredential/);
+  assert.doesNotMatch(workResumePrepareSchema, /Core|Nexus|coordination|cutover|host.?operation/i);
   assert.doesNotMatch(
     agentStartSchema,
     /nexusGrant|coreMutation|capabilityDiscovery|authorizedToolCeiling|toolProjectionManifest|effectProjection/,
