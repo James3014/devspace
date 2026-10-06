@@ -108,7 +108,7 @@ test("activation verification rejects release tampering before restart", () => {
   }
 });
 
-test("durable restart request is impossible before exact activation binding", () => {
+test("activation binding stays idempotent after restart intent but before scheduling", () => {
   const f = fixture();
   try {
     const stateDir = join(f.root, "state");
@@ -125,27 +125,6 @@ test("durable restart request is impossible before exact activation binding", ()
       },
     });
     store.recordDrain(record.cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
-    assert.throws(
-      () => store.recordRestartRequest(record.cutoverId, {
-        actuator: "launchd-self",
-        requestedByServerInstanceId: "old",
-        buildReady: {
-          verifiedBy: "test",
-          verifiedAt: new Date().toISOString(),
-          evidence: "target verified",
-        },
-      }),
-      /activation binding/i,
-    );
-
-    const binding = bindCutoverActivation({
-      cutoverId: record.cutoverId,
-      packageRoot: f.packageRoot,
-      serviceRoot: f.serviceRoot,
-      expected: record.expectedNewIdentity,
-    });
-    assert.equal(store.recordActivationBinding(record.cutoverId, binding).newlyBound, true);
-    assert.equal(store.recordActivationBinding(record.cutoverId, binding).newlyBound, false);
     const request = store.recordRestartRequest(record.cutoverId, {
       actuator: "launchd-self",
       requestedByServerInstanceId: "old",
@@ -156,6 +135,17 @@ test("durable restart request is impossible before exact activation binding", ()
       },
     });
     assert.equal(request.newlyRequested, true);
+    assert.equal(request.record.restartRequest?.restartScheduledAt, undefined);
+
+    const binding = bindCutoverActivation({
+      cutoverId: record.cutoverId,
+      packageRoot: f.packageRoot,
+      serviceRoot: f.serviceRoot,
+      expected: record.expectedNewIdentity,
+    });
+    assert.equal(store.recordActivationBinding(record.cutoverId, binding).newlyBound, true);
+    assert.equal(store.recordActivationBinding(record.cutoverId, binding).newlyBound, false);
+    assert.deepEqual(store.get()?.activationBinding, binding);
   } finally {
     f.cleanup();
   }
