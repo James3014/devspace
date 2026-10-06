@@ -153,6 +153,7 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
     let scheduled=0;
     const actuator={actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget,schedule:()=>{scheduled++;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget};}};
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    let activation:CutoverActivationBinding|undefined;
     try {
       assert.throws(()=>manager.drainCutover(id,{...cutover.currentIdentity,serverInstanceId:"other"},()=>({activeSessions:0,oldestAgeMs:0}),context));
       assert.equal(manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context).phase,"drained");
@@ -160,7 +161,7 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
         manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"test"}),actuator,context),
         /activation binding/i,
       );
-      const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
+      activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
       await assert.rejects(manager.restartCutover(id,cutover.currentIdentity,{...cutover.restart.buildReady,evidence:"wrong"},async()=>({buildReady:true,detail:"test"}),actuator,context));
       await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"test"}),actuator,context);
       await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>{throw new Error("replay must not probe");},actuator,context);
@@ -180,7 +181,7 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
       }
       assert.throws(()=>resumedStore.status(successor));
       resumedStore.redeem(successor,pairing.credential);
-      const replacement=withFixtureRelease({serverInstanceId:"replacement",...cutover.expectedIdentity},activation);
+      const replacement=withFixtureRelease({serverInstanceId:"replacement",...cutover.expectedIdentity},activation!);
       const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
       await assert.rejects(resumedManager.finishCutover(id,cutover.currentIdentity,cutover.finish,async()=>witness,successor));
       await assert.rejects(resumedManager.finishCutover(id,replacement,{...cutover.finish,agentId:"wrong"},async()=>witness,successor));
