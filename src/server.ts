@@ -2032,7 +2032,12 @@ function registerCutoverMcpTools(
         reason: "Restart was requested but no durable schedule marker exists; reconcile the exact restart effect before any retry.",
       };
     }
-    if (comparison.sourceMatches && comparison.buildMatches && comparison.capabilityManifestMatches) {
+    if (
+      comparison.sourceMatches &&
+      comparison.buildMatches &&
+      comparison.capabilityManifestMatches &&
+      comparison.releaseMatches
+    ) {
       return {
         ...base,
         outcome: "replacement_observed",
