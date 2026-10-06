@@ -5134,8 +5134,9 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
     "agent_status",
     "open_workspace",
     "read",
+    "work_resume_prepare",
   ]);
-  assert.equal(names.length, 10);
+  assert.equal(names.length, 11);
   assert.deepEqual(
     names.filter((name) => /core|coordination|cutover|host_operation|candidate|repository_intelligence|^bash$|^write$|^edit$|apply_patch|^git_/.test(name)),
     [],
@@ -5147,6 +5148,7 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
   assert.match(agentStartSchema, /attemptKey/);
   assert.match(agentStartSchema, /expectedHead/);
   assert.match(agentStartSchema, /writePaths/);
+  assert.match(agentStartSchema, /resumableWork/);
   assert.doesNotMatch(
     agentStartSchema,
     /nexusGrant|coreMutation|capabilityDiscovery|authorizedToolCeiling|toolProjectionManifest|effectProjection/,
@@ -5156,6 +5158,7 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
   assert.match(instructions, /open_workspace/);
   assert.match(instructions, /agent_catalog/);
   assert.match(instructions, /agent_preflight/);
+  assert.match(instructions, /work_resume_prepare/);
   assert.match(instructions, /agent_start/);
   assert.match(instructions, /OWNER_DIRECT/);
   assert.match(instructions, /attemptKey/);
