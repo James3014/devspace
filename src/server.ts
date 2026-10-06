@@ -1,4 +1,4 @@
-import { CarrierBindingStore, type CarrierCompletionBinding } from "./carrier-binding.js";
+import { CarrierBindingStore, type CarrierCompletionBinding, type CarrierContract } from "./carrier-binding.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
 import {
@@ -19,7 +19,7 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest, type ServerNotification, type ServerRequest } from "@modelcontextprotocol/sdk/types.js";
+import { ElicitResultSchema, isInitializeRequest, type ServerNotification, type ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import {
@@ -4518,9 +4518,73 @@ export function createMcpServer(
 
     if (carrierBindings) {
       const contractSchema=z.object({repository:z.string(),goal:z.string(),role:z.enum(["controller","worker"]),scope:z.array(z.string()),baseRevision:z.string(),operations:z.array(z.enum(["dependency_sync","worktree_write"])),expiresAt:z.string()}).strict();
+      const carrierIdentitySchema=z.object({sourceCommit:z.string().regex(/^[a-f0-9]{40,64}$/),buildId:z.string().min(1),capabilityManifestSha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
+      const ownerContractSchema=z.object({
+        repository:z.string().min(1),goal:z.string().min(1),role:z.enum(["controller","worker"]),scope:z.array(z.string()).min(1),
+        baseRevision:z.string().regex(/^[a-f0-9]{40,64}$/),operations:z.array(z.enum(["dependency_sync","worktree_write","cutover_start"])).min(1),
+        expiresAt:z.string().datetime(),
+        cutover:z.object({
+          stateRoot:z.string().min(1),attemptKey:z.string().min(1),
+          currentIdentity:carrierIdentitySchema.extend({serverInstanceId:z.string().min(1)}).strict(),
+          expectedIdentity:carrierIdentitySchema,expiresAt:z.string().datetime(),
+          restart:z.object({buildReady:z.object({verifiedBy:z.string().min(1),verifiedAt:z.string().datetime(),evidence:z.string().min(1)}).strict(),actuator:z.literal("launchd-self"),serviceLabel:z.string().min(1),launchdTarget:z.string().min(1)}).strict(),
+          finish:z.object({workspaceId:z.string().min(1),agentId:z.string().min(1)}).strict(),
+        }).strict().optional(),
+        maxDepth:z.number().int().nonnegative().optional(),remainingDepth:z.number().int().nonnegative().optional(),
+      }).strict();
       const registration={annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},_meta:{}};
       const result=(value:unknown)=>({content:[textBlock(JSON.stringify(value))]});
-      registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request local Owner approval for new bounded authority. Save the returned pendingId; once approved locally by the Owner via CLI, resume the carrier using coordination_resume with the pendingId.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
+      registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request explicit Owner approval for new bounded authority. Save the returned pendingId; an Owner-facing client may approve the exact contract with coordination_owner_approve before coordination_resume.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
+      const ownerApprovalRoots=[...config.allowedRoots,config.worktreeRoot];
+      const ownerApprovalPreview=(pendingId:string,contract:CarrierContract,extra:{authInfo?:{clientId:string;scopes:string[]};sessionId?:string},sameSession=true)=>{
+        const context=dependencyConsumerContext(extra);
+        const pending=carrierBindings.pending(pendingId);
+        if(pending.client_id!==context.clientId) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","Pairing belongs to a different authenticated client");
+        if(sameSession && pending.session_id!==context.sessionId) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","Owner approval must originate from the session that requested the pairing");
+        const canonical=carrierBindings.validateLocalScope(contract,ownerApprovalRoots);
+        const contractHash=createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+        if(pending.binding_id) {
+          const approved=carrierBindings.inspectLocal(pending.binding_id);
+          const approvedHash=createHash("sha256").update(JSON.stringify(approved.contract)).digest("hex");
+          if(approvedHash!==contractHash) return {status:"CONTRACT_MISMATCH" as const,pendingId,contractHash,approvedContractHash:approvedHash,expiresAt:new Date(pending.expires_at).toISOString()};
+          return {status:"ALREADY_APPROVED_SAME_CONTRACT" as const,pendingId,contractHash,carrierId:approved.id,expiresAt:new Date(pending.expires_at).toISOString(),canonical};
+        }
+        return {status:"PENDING_OWNER_APPROVAL" as const,pendingId,contractHash,expiresAt:new Date(pending.expires_at).toISOString(),canonical};
+      };
+      registerAppTool(server,"coordination_owner_approval_prepare",{...registration,annotations:{...registration.annotations,readOnlyHint:true,idempotentHint:true},title:"Prepare exact Owner carrier approval",description:"Validate and hash one exact pending carrier contract before human approval. Grants no authority and exposes no credential.",inputSchema:{pendingId:z.string(),contract:ownerContractSchema}},async({pendingId,contract},extra)=>{
+        const preview=ownerApprovalPreview(pendingId,contract as CarrierContract,extra);
+        return result({...preview,canonical:undefined});
+      });
+      registerAppTool(server,"coordination_owner_approval_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true,idempotentHint:true},title:"Read Owner carrier approval status",description:"Read pending or approved state for one pairing from the authenticated OAuth client. Does not bind the current session or grant authority.",inputSchema:{pendingId:z.string(),contract:ownerContractSchema}},async({pendingId,contract},extra)=>{
+        const preview=ownerApprovalPreview(pendingId,contract as CarrierContract,extra,false);
+        return result({...preview,canonical:undefined});
+      });
+      registerAppTool(server,"coordination_owner_approve",{...registration,title:"Request explicit Owner carrier approval",description:"Ask the connected human Owner to approve one exact pending carrier contract through MCP elicitation. Tool arguments alone cannot approve it; decline, cancel, unsupported elicitation, drift, or expiry grants no authority.",inputSchema:{pendingId:z.string(),contract:ownerContractSchema}},async({pendingId,contract},extra)=>{
+        const exact=contract as CarrierContract;
+        const preview=ownerApprovalPreview(pendingId,exact,extra);
+        if(preview.status!=="PENDING_OWNER_APPROVAL") return result({...preview,canonical:undefined});
+        let elicited;
+        try {
+          elicited=await extra.sendRequest({
+            method:"elicitation/create",
+            params:{
+              message:`Approve this exact DevSpace carrier? repository=${preview.canonical.repository}; goal=${preview.canonical.goal}; role=${preview.canonical.role}; base=${preview.canonical.baseRevision}; operations=${preview.canonical.operations.join(",")}; scope=${preview.canonical.scope.join(",")}; expiresAt=${preview.canonical.expiresAt}; contractSha256=${preview.contractHash}`,
+              requestedSchema:{type:"object",properties:{approve:{type:"boolean",title:"Approve exact bounded carrier"}},required:["approve"]},
+            },
+          },ElicitResultSchema);
+        } catch(error) {
+          const message=error instanceof Error?error.message:String(error);
+          return {content:[textBlock(`ELICITATION_UNAVAILABLE: ${message}`)],isError:true,structuredContent:{status:"PENDING_OWNER_APPROVAL",pendingId,contractHash:preview.contractHash,code:"ELICITATION_UNAVAILABLE",message}};
+        }
+        const content=elicited.content as {approve?:unknown}|undefined;
+        if(elicited.action!=="accept" || content?.approve!==true) {
+          return result({status:elicited.action==="decline"||elicited.action==="accept"?"REJECTED":"PENDING_OWNER_APPROVAL",pendingId,contractHash:preview.contractHash,elicitationAction:elicited.action});
+        }
+        const rechecked=ownerApprovalPreview(pendingId,exact,extra);
+        if(rechecked.status!=="PENDING_OWNER_APPROVAL" || rechecked.contractHash!==preview.contractHash) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Pairing or exact Owner-approved contract changed before commit");
+        const carrier=carrierBindings.approveLocal(pendingId,rechecked.canonical);
+        return result({status:"APPROVED",pendingId,contractHash:preview.contractHash,carrier});
+      });
       registerAppTool(server,"coordination_recovery_request",{...registration,title:"Request existing-carrier recovery",description:"Create a pending recovery verifier for this MCP session. This does not create a carrier or grant authority. A host Owner must bind this pendingId to one exact existing carrier with `devspace carrier recover <pendingId> --carrier <carrierId> --version <version> --validity-version <validityVersion> --confirm <carrierId>` before coordination_resume can succeed.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
       registerAppTool(server,"coordination_resume",{...registration,title:"Resume a paired carrier",description:"Resume a paired or recovered carrier on the current authenticated MCP session using an Owner-approved pendingId, or verification token.",inputSchema:{pendingId:z.string().optional().describe("The pendingId returned from coordination_pair or coordination_recovery_request once approved by the Owner"),token:z.string().optional().describe("Optional pairing verification token"),credential:z.string().optional().describe("Legacy pairing verification token")}},async(args,extra)=>{
         try {
