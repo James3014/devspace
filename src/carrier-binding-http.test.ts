@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { ElicitRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { loadConfig } from "./config.js";
 import { createServer } from "./server.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
@@ -581,5 +582,143 @@ test("approved cutover credential survives fresh MCP sessions for prepare and st
     if (previousIdentityPath === undefined) delete process.env.DEVSPACE_BUILD_IDENTITY_PATH;
     else process.env.DEVSPACE_BUILD_IDENTITY_PATH = previousIdentityPath;
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+
+test("Owner-facing elicitation approves exactly one bounded carrier without Terminal fallback",async()=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"carrier-owner-elicitation-")));
+  const workspace=join(root,"workspace");mkdirSync(workspace);
+  const config=loadConfig({
+    DEVSPACE_CONFIG_DIR:join(root,"config"),
+    DEVSPACE_STATE_DIR:join(root,"state"),
+    DEVSPACE_ALLOWED_ROOTS:root,
+    DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),
+    DEVSPACE_SUBAGENTS:"false",
+    DEVSPACE_TOOL_MODE:"full",
+    DEVSPACE_PUBLIC_BASE_URL:"http://127.0.0.1:1",
+    DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",
+    PORT:"1",
+  });
+  const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
+  const oauthClient=await provider.clientsStore.registerClient!({
+    redirect_uris:["http://localhost/callback"],
+    client_name:"owner elicitation fixture",
+    token_endpoint_auth_method:"none",
+  });
+  let redirect="";
+  await provider.authorize(
+    oauthClient,
+    {redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)},
+    {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never,
+  );
+  const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
+  const running=createServer(config);
+  const listener=running.app.listen(0,"127.0.0.1");
+  await new Promise<void>((resolve,reject)=>{listener.once("listening",resolve);listener.once("error",reject);});
+  const url=new URL(`http://127.0.0.1:${(listener.address() as {port:number}).port}/mcp`);
+  const clients:Client[]=[];
+  let approval:"accept"|"decline"|"cancel"="accept";
+  const connect=async(name:string,withElicitation=true)=>{
+    const client=new Client(
+      {name,version:"1"},
+      withElicitation?{capabilities:{elicitation:{}}}:undefined,
+    );
+    clients.push(client);
+    if(withElicitation) {
+      client.setRequestHandler(ElicitRequestSchema,async(request)=>{
+        assert.match(request.params.message,/James3014\/devspace/);
+        assert.match(request.params.message,/contractSha256=[0-9a-f]{64}/);
+        if(approval==="cancel") return {action:"cancel" as const};
+        if(approval==="decline") return {action:"decline" as const};
+        return {action:"accept" as const,content:{approve:true}};
+      });
+    }
+    await client.connect(new StreamableHTTPClientTransport(url,{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+    return client;
+  };
+  try {
+    const owner=await connect("owner-elicitation");
+    const pending=data(await owner.callTool({name:"coordination_pair",arguments:{}}));
+    const contract:CarrierContract={
+      repository:"James3014/devspace",
+      goal:"issue407",
+      role:"controller",
+      scope:[workspace],
+      baseRevision:"a".repeat(40),
+      operations:["worktree_write"],
+      expiresAt:new Date(Date.now()+120000).toISOString(),
+    };
+    const prepared=data(await owner.callTool({
+      name:"coordination_owner_approval_prepare",
+      arguments:{pendingId:pending.pendingId,contract},
+    }));
+    assert.equal(prepared.status,"PENDING_OWNER_APPROVAL");
+    assert.match(prepared.contractHash,/^[0-9a-f]{64}$/);
+
+    const before=await owner.callTool({name:"coordination_resume",arguments:{pendingId:pending.pendingId}});
+    assert.equal(before.isError,true);
+
+    const approved=data(await owner.callTool({
+      name:"coordination_owner_approve",
+      arguments:{pendingId:pending.pendingId,contract},
+    }));
+    assert.equal(approved.status,"APPROVED");
+    assert.equal(approved.contractHash,prepared.contractHash);
+    const carrierId=(approved.carrier as {id:string}).id;
+    assert.match(carrierId,/^carrier_/);
+
+    const resumed=data(await owner.callTool({name:"coordination_resume",arguments:{pendingId:pending.pendingId}}));
+    assert.equal(resumed.id,carrierId);
+
+    const replay=data(await owner.callTool({
+      name:"coordination_owner_approve",
+      arguments:{pendingId:pending.pendingId,contract},
+    }));
+    assert.equal(replay.status,"ALREADY_APPROVED_SAME_CONTRACT");
+    assert.equal(replay.carrierId,carrierId);
+
+    const mismatch=data(await owner.callTool({
+      name:"coordination_owner_approval_status",
+      arguments:{pendingId:pending.pendingId,contract:{...contract,goal:"issue407-changed"}},
+    }));
+    assert.equal(mismatch.status,"CONTRACT_MISMATCH");
+
+    const fresh=await connect("fresh-status",false);
+    const durable=data(await fresh.callTool({
+      name:"coordination_owner_approval_status",
+      arguments:{pendingId:pending.pendingId,contract},
+    }));
+    assert.equal(durable.status,"ALREADY_APPROVED_SAME_CONTRACT");
+    assert.equal(durable.carrierId,carrierId);
+    const hijack=await fresh.callTool({
+      name:"coordination_owner_approve",
+      arguments:{pendingId:pending.pendingId,contract},
+    });
+    assert.equal(hijack.isError,true);
+
+    approval="decline";
+    const declinedPending=data(await owner.callTool({name:"coordination_pair",arguments:{}}));
+    const declined=data(await owner.callTool({
+      name:"coordination_owner_approve",
+      arguments:{pendingId:declinedPending.pendingId,contract},
+    }));
+    assert.equal(declined.status,"REJECTED");
+    assert.equal((await owner.callTool({name:"coordination_resume",arguments:{pendingId:declinedPending.pendingId}})).isError,true);
+
+    approval="cancel";
+    const cancelledPending=data(await owner.callTool({name:"coordination_pair",arguments:{}}));
+    const cancelled=data(await owner.callTool({
+      name:"coordination_owner_approve",
+      arguments:{pendingId:cancelledPending.pendingId,contract},
+    }));
+    assert.equal(cancelled.status,"PENDING_OWNER_APPROVAL");
+    assert.equal(cancelled.elicitationAction,"cancel");
+    assert.equal((await owner.callTool({name:"coordination_resume",arguments:{pendingId:cancelledPending.pendingId}})).isError,true);
+  } finally {
+    for(const client of clients.reverse()) await client.close().catch(()=>{});
+    await new Promise<void>(resolve=>listener.close(()=>resolve()));
+    await running.close();
+    rmSync(root,{recursive:true,force:true});
   }
 });
