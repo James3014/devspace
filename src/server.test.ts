@@ -258,6 +258,7 @@ test("initialize rejects explicitly when every resident MCP session is in flight
     DEVSPACE_CONFIG_DIR: join(root, ".config"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     DEVSPACE_PUBLIC_BASE_URL: baseUrl,
     DEVSPACE_TOOL_MODE: "codex",
@@ -571,26 +572,30 @@ test("concurrent checkout opens return one full context and one reuse instructio
   );
 });
 
-test("new worktrees always receive a fresh workspace and complete worktree context", async (t) => {
+test("same-conversation worktree opens reuse the resolved-base workspace and suppress repeated bootstrap context", async (t) => {
   const context = await fixture(t, { git: true });
   const checkout = await callOpen(context.client, context.project, "chat-1");
   const firstWorktree = await callOpen(context.client, context.project, "chat-1", "worktree");
   const secondWorktree = await callOpen(context.client, context.project, "chat-1", "worktree");
   const checkoutAgain = await callOpen(context.client, context.project, "chat-1");
 
-  assert.notEqual(structuredContent(firstWorktree).workspaceId, structuredContent(secondWorktree).workspaceId);
+  assert.equal(structuredContent(firstWorktree).workspaceId, structuredContent(secondWorktree).workspaceId);
   assert.equal(structuredContent(checkoutAgain).workspaceId, structuredContent(checkout).workspaceId);
-  for (const result of [firstWorktree, secondWorktree]) {
-    const structured = structuredContent(result);
-    assert.equal(structured.mode, "worktree");
-    assert.ok(Array.isArray(structured.agentsFiles));
-    assert.ok(Array.isArray(structured.availableAgentsFiles));
-    assert.ok(Array.isArray(structured.skills));
-    assert.ok(Array.isArray(structured.agentProviders));
-    assert.ok(Array.isArray(structured.agents));
-    assert.ok(Array.isArray(structured.skillDiagnostics));
-    assert.match(responseText(result), /Opened isolated worktree workspace/);
-  }
+  const firstStructured = structuredContent(firstWorktree);
+  assert.equal(firstStructured.mode, "worktree");
+  assert.ok(Array.isArray(firstStructured.agentsFiles));
+  assert.ok(Array.isArray(firstStructured.availableAgentsFiles));
+  assert.ok(Array.isArray(firstStructured.skills));
+  assert.ok(Array.isArray(firstStructured.agentProviders));
+  assert.ok(Array.isArray(firstStructured.agents));
+  assert.ok(Array.isArray(firstStructured.skillDiagnostics));
+  assert.match(responseText(firstWorktree), /Opened isolated worktree workspace/);
+
+  const secondStructured = structuredContent(secondWorktree);
+  assert.equal(secondStructured.mode, "worktree");
+  assert.equal(secondStructured.agentsFiles, undefined);
+  assert.equal(secondStructured.availableAgentsFiles, undefined);
+  assert.match(responseText(secondWorktree), /Workspace already open as/);
   assert.equal(structuredContent(checkoutAgain).agentsFiles, undefined);
 });
 

@@ -192,10 +192,10 @@ test("dry-run classifies clean old managed worktree and apply is receipt-idempot
   assert.equal(deleted, 1);
 });
 
-test("loaded, bound, process-active, process-unknown, resumable-agent, agent-reconciliation, dirty and committed worktrees fail closed", async () => {
+test("recent-loaded, bound, process-active, process-unknown, resumable-agent, agent-reconciliation, dirty and unintegrated committed worktrees fail closed", async () => {
   const f = fixture();
   const paths = Object.fromEntries(
-    ["loaded", "bound", "process", "processUnknown", "agent", "agentUnknown", "dirty", "committed"]
+    ["loadedRecent", "bound", "process", "processUnknown", "agent", "agentUnknown", "dirty", "committed"]
       .map((name) => [name, makeWorktree(f, name)]),
   ) as Record<string, string>;
   writeFileSync(join(paths.dirty, "untracked.txt"), "do not delete\n");
@@ -207,8 +207,8 @@ test("loaded, bound, process-active, process-unknown, resumable-agent, agent-rec
     conversationScopeId: "conversation",
     targetKey: "target",
     workspaceSessionId: "ws_bound",
-    createdAt: "2026-09-17T00:00:00.000Z",
-    lastUsedAt: "2026-09-17T00:00:00.000Z",
+    createdAt: "2026-09-19T11:30:00.000Z",
+    lastUsedAt: "2026-09-19T11:30:00.000Z",
   }];
   const agents: LocalAgentRecord[] = [
     {
@@ -238,7 +238,7 @@ test("loaded, bound, process-active, process-unknown, resumable-agent, agent-rec
 
   const plan = await buildHostStoragePlan(input(f, {
     workspaceSessions: [
-      session(f, "ws_loaded", paths.loaded),
+      session(f, "ws_loaded_recent", paths.loadedRecent, f.source, "2026-09-19T11:30:00.000Z"),
       session(f, "ws_bound", paths.bound),
       session(f, "ws_process", paths.process),
       session(f, "ws_process_unknown", paths.processUnknown),
@@ -248,7 +248,7 @@ test("loaded, bound, process-active, process-unknown, resumable-agent, agent-rec
       session(f, "ws_committed", paths.committed),
     ],
     conversationBindings: bindings,
-    loadedWorkspaceIds: new Set(["ws_loaded"]),
+    loadedWorkspaceIds: new Set(["ws_loaded_recent"]),
     processWorkspaceStates: new Map([
       ["ws_process", "ACTIVE"],
       ["ws_process_unknown", "UNKNOWN"],
@@ -256,7 +256,7 @@ test("loaded, bound, process-active, process-unknown, resumable-agent, agent-rec
     agentRecords: agents,
   }));
 
-  assert.equal(artifact(plan, "workspace:ws_loaded").lifecycle, "ACTIVE");
+  assert.equal(artifact(plan, "workspace:ws_loaded_recent").lifecycle, "ACTIVE");
   assert.equal(artifact(plan, "workspace:ws_bound").lifecycle, "PINNED");
   assert.equal(artifact(plan, "workspace:ws_process").lifecycle, "PINNED");
   assert.equal(artifact(plan, "workspace:ws_process_unknown").lifecycle, "UNKNOWN");
@@ -264,6 +264,95 @@ test("loaded, bound, process-active, process-unknown, resumable-agent, agent-rec
   assert.equal(artifact(plan, "workspace:ws_agent_unknown").lifecycle, "UNKNOWN");
   assert.equal(artifact(plan, "workspace:ws_dirty").lifecycle, "TERMINAL_BUT_RETAINED");
   assert.equal(artifact(plan, "workspace:ws_committed").lifecycle, "TERMINAL_BUT_RETAINED");
+});
+
+test("integrated committed managed worktree becomes collectable after grace", async () => {
+  const f = fixture();
+  const path = makeWorktree(f, "integrated-commit");
+  writeFileSync(join(path, "candidate.txt"), "candidate\n");
+  git(path, "add", ".");
+  git(path, "commit", "-m", "candidate");
+  const candidateHead = git(path, "rev-parse", "HEAD");
+  git(f.source, "merge", "--ff-only", candidateHead);
+
+  const plan = await buildHostStoragePlan(input(f, {
+    workspaceSessions: [session(f, "ws_integrated", path)],
+  }));
+
+  assert.equal(artifact(plan, "workspace:ws_integrated").lifecycle, "GC_ELIGIBLE");
+});
+
+test("old loaded workspace cache does not permanently block retention", async () => {
+  const f = fixture();
+  const path = makeWorktree(f, "loaded-old");
+  const args = input(f, {
+    workspaceSessions: [session(f, "ws_loaded_old", path)],
+    loadedWorkspaceIds: new Set(["ws_loaded_old"]),
+  });
+
+  const plan = await buildHostStoragePlan(args);
+  assert.equal(artifact(plan, "workspace:ws_loaded_old").lifecycle, "GC_ELIGIBLE");
+
+  let unloaded = false;
+  let deleted = false;
+  await applyHostStoragePlan(args, plan.planId, {
+    claimWorkspaceSessionForGc: (workspaceId, expectedLastUsedAt) => {
+      assert.equal(workspaceId, "ws_loaded_old");
+      assert.equal(expectedLastUsedAt, args.workspaceSessions[0]!.lastUsedAt);
+      unloaded = true;
+    },
+    assertWorkspaceSessionUnloaded: () => {
+      assert.equal(unloaded, true, "GC must unload stale in-memory workspace state before deletion");
+    },
+    deleteWorkspaceSession: () => {
+      deleted = true;
+    },
+  });
+  assert.equal(deleted, true);
+});
+
+test("GC claim checks the exact workspace last-use identity before deletion", async () => {
+  const f = fixture();
+  const path = makeWorktree(f, "last-use-fence");
+  const args = input(f, {
+    workspaceSessions: [session(f, "ws_last_use_fence", path)],
+  });
+
+  const plan = await buildHostStoragePlan(args);
+  const expectedLastUsedAt = args.workspaceSessions[0]!.lastUsedAt;
+  let deleted = false;
+
+  await assert.rejects(
+    () => applyHostStoragePlan(args, plan.planId, {
+      claimWorkspaceSessionForGc: (_workspaceId, observedLastUsedAt) => {
+        assert.equal(observedLastUsedAt, expectedLastUsedAt);
+        throw new Error("STORAGE_PLAN_STALE: workspace was reused after inventory");
+      },
+      deleteWorkspaceSession: () => {
+        deleted = true;
+      },
+    }),
+    /STORAGE_RECONCILIATION_REQUIRED.*STORAGE_PLAN_STALE/,
+  );
+  assert.equal(deleted, false);
+});
+
+test("stale conversation bindings do not pin an inactive managed worktree forever", async () => {
+  const f = fixture();
+  const path = makeWorktree(f, "binding-old");
+  const staleBinding: WorkspaceConversationBinding = {
+    conversationScopeId: "old-conversation",
+    targetKey: "old-target",
+    workspaceSessionId: "ws_binding_old",
+    createdAt: "2026-09-17T00:00:00.000Z",
+    lastUsedAt: "2026-09-17T00:00:00.000Z",
+  };
+  const plan = await buildHostStoragePlan(input(f, {
+    workspaceSessions: [session(f, "ws_binding_old", path)],
+    conversationBindings: [staleBinding],
+  }));
+
+  assert.equal(artifact(plan, "workspace:ws_binding_old").lifecycle, "GC_ELIGIBLE");
 });
 
 test("unresolved durable operation keeps an otherwise collectable worktree in reconciliation-required state", async () => {

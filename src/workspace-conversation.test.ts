@@ -114,7 +114,7 @@ test("a checkout without a conversation scope does not use conversation reuse", 
   assert.notEqual(second.workspace.id, first.workspace.id);
 });
 
-test("worktree requests remain fresh without replacing the reusable checkout", async (t) => {
+test("a conversation reuses its managed worktree without replacing the reusable checkout", async (t) => {
   const { project, registry } = await fixture(t, { git: true });
   const worktreeInput = { path: project, mode: "worktree" as const };
 
@@ -127,8 +127,9 @@ test("worktree requests remain fresh without replacing the reusable checkout", a
   });
   const checkoutAgain = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
 
-  assert.notEqual(firstWorktree.workspace.id, secondWorktree.workspace.id);
-  assert.notEqual(firstWorktree.workspace.root, secondWorktree.workspace.root);
+  assert.equal(secondWorktree.workspace.id, firstWorktree.workspace.id);
+  assert.equal(secondWorktree.workspace.root, firstWorktree.workspace.root);
+  assert.equal(secondWorktree.workspaceReused, true);
   assert.equal(checkoutAgain.workspace.id, checkout.workspace.id);
 });
 
@@ -147,7 +148,7 @@ test("a worktree-first conversation creates and then reuses its checkout", async
   assert.equal(checkoutAgain.workspace.id, checkout.workspace.id);
 });
 
-test("concurrent worktree opens remain fresh and return complete context", async (t) => {
+test("concurrent worktree opens in one conversation coalesce to one isolated workspace", async (t) => {
   const { project, registry } = await fixture(t, { git: true });
   const worktreeInput = { path: project, mode: "worktree" as const };
 
@@ -156,16 +157,96 @@ test("concurrent worktree opens remain fresh and return complete context", async
     registry.openWorkspace(worktreeInput, { conversationScopeId: "chat-1" }),
   ]);
 
+  assert.equal(first.workspace.id, second.workspace.id);
+  assert.equal(first.workspace.root, second.workspace.root);
+  assert.deepEqual(first.agentsFiles, second.agentsFiles);
+  assert.deepEqual(first.availableAgentsFiles, second.availableAgentsFiles);
+});
+
+test("different conversations receive separate managed worktrees", async (t) => {
+  const { project, registry } = await fixture(t, { git: true });
+  const worktreeInput = { path: project, mode: "worktree" as const };
+
+  const first = await registry.openWorkspace(worktreeInput, { conversationScopeId: "chat-1" });
+  const second = await registry.openWorkspace(worktreeInput, { conversationScopeId: "chat-2" });
+
   assert.notEqual(first.workspace.id, second.workspace.id);
   assert.notEqual(first.workspace.root, second.workspace.root);
-  assert.deepEqual(
-    first.agentsFiles.map((file) => file.content),
-    second.agentsFiles.map((file) => file.content),
+});
+
+test("managed worktrees cannot silently become managed-worktree sources", async (t) => {
+  const { project, registry } = await fixture(t, { git: true });
+  const first = await registry.openWorkspace(
+    { path: project, mode: "worktree" },
+    { conversationScopeId: "chat-1" },
   );
-  assert.deepEqual(
-    first.availableAgentsFiles.map((file) => file.path.replace(first.workspace.root, "<root>")),
-    second.availableAgentsFiles.map((file) => file.path.replace(second.workspace.root, "<root>")),
+
+  await assert.rejects(
+    () => registry.openWorkspace(
+      { path: first.workspace.root, mode: "worktree" },
+      { conversationScopeId: "chat-2" },
+    ),
+    /managed worktree.*source|worktree.*source/i,
   );
+});
+
+test("symbolic HEAD worktree reuse is fenced by the resolved base SHA", async (t) => {
+  const context = await fixture(t, { git: true });
+  const input = { path: context.project, mode: "worktree" as const, baseRef: "HEAD" };
+
+  const first = await context.registry.openWorkspace(input, {
+    conversationScopeId: "chat-base-sha",
+  });
+
+  await writeFile(join(context.project, "advanced.txt"), "advanced\n");
+  await execFileAsync("git", ["-C", context.project, "add", "advanced.txt"]);
+  await execFileAsync("git", ["-C", context.project, "commit", "-m", "advance source"]);
+
+  const second = await context.registry.openWorkspace(input, {
+    conversationScopeId: "chat-base-sha",
+  });
+
+  assert.notEqual(second.workspace.id, first.workspace.id);
+  assert.notEqual(second.workspace.worktree?.baseSha, first.workspace.worktree?.baseSha);
+});
+
+test("GC claim uses last-used CAS and makes the claimed workspace non-restorable", async (t) => {
+  const context = await fixture(t, { git: true });
+  const opened = await context.registry.openWorkspace(
+    { path: context.project, mode: "worktree" },
+    { conversationScopeId: "chat-gc-cas" },
+  );
+  const workspaceId = opened.workspace.id;
+  const session = context.store.getSession(workspaceId);
+  assert.ok(session);
+
+  assert.throws(
+    () => context.registry.claimDurableSessionForGc(workspaceId, "2000-01-01T00:00:00.000Z"),
+    /STORAGE_PLAN_STALE/,
+  );
+  assert.equal(context.store.getSession(workspaceId)?.status, "active");
+
+  context.registry.claimDurableSessionForGc(workspaceId, session.lastUsedAt);
+  assert.equal(context.store.getSession(workspaceId)?.status, "gc_pending");
+  assert.throws(() => context.registry.getWorkspace(workspaceId), /not active/);
+});
+
+test("managed worktree reuse survives a registry restart", async (t) => {
+  const context = await fixture(t, { git: true });
+  const input = { path: context.project, mode: "worktree" as const };
+  const first = await context.registry.openWorkspace(input, {
+    conversationScopeId: "chat-1",
+  });
+  context.closeStore(context.store);
+
+  const restoredStore = context.openStore();
+  const restoredRegistry = new WorkspaceRegistry(context.config, restoredStore);
+  const restored = await restoredRegistry.openWorkspace(input, {
+    conversationScopeId: "chat-1",
+  });
+
+  assert.equal(restored.workspace.id, first.workspace.id);
+  assert.equal(restored.workspace.root, first.workspace.root);
 });
 
 test("checkout reuse survives a registry restart", async (t) => {

@@ -135,6 +135,7 @@ export async function buildHostStoragePlan(input: HostStorageRetentionInput): Pr
 
 export interface HostStorageApplyCallbacks {
   deleteWorkspaceSession: (workspaceId: string) => void;
+  claimWorkspaceSessionForGc?: (workspaceId: string, expectedLastUsedAt: string) => void;
   assertWorkspaceSessionUnloaded?: (workspaceId: string) => void;
   assertPathUnreferenced?: (path: string) => void;
 }
@@ -202,6 +203,10 @@ export async function applyHostStoragePlan(
         if (!artifact.workspaceId || !artifact.sourceRoot) {
           throw new Error("managed worktree inventory is missing workspace/source identity");
         }
+        if (!artifact.lastUseAt) {
+          throw new Error("workspace GC inventory is missing last-use identity");
+        }
+        callbacks.claimWorkspaceSessionForGc?.(artifact.workspaceId, artifact.lastUseAt);
         callbacks.assertWorkspaceSessionUnloaded?.(artifact.workspaceId);
         await removeManagedWorktreeArtifact(artifact);
         callbacks.deleteWorkspaceSession(artifact.workspaceId);
@@ -209,6 +214,10 @@ export async function applyHostStoragePlan(
         if (!artifact.workspaceId) {
           throw new Error("workspace record inventory is missing workspace identity");
         }
+        if (!artifact.lastUseAt) {
+          throw new Error("workspace GC inventory is missing last-use identity");
+        }
+        callbacks.claimWorkspaceSessionForGc?.(artifact.workspaceId, artifact.lastUseAt);
         callbacks.assertWorkspaceSessionUnloaded?.(artifact.workspaceId);
         await removeWorkspaceReviewRefs(artifact);
         callbacks.deleteWorkspaceSession(artifact.workspaceId);
@@ -407,7 +416,7 @@ async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<Host
       continue;
     }
 
-    const reference = workspaceReferenceState(session.id, input);
+    const reference = workspaceReferenceState(session, input, nowMs, graceMs);
     if (reference) {
       artifacts.push({
         ...base,
@@ -451,15 +460,30 @@ async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<Host
       });
       continue;
     }
+    let integratedCommittedHead = false;
     if (gitState.head !== session.baseSha) {
-      artifacts.push({
-        ...base,
-        path: canonicalWorktreePath,
-        sourceRoot: canonicalSourceRoot,
-        lifecycle: "TERMINAL_BUT_RETAINED",
-        reason: "managed worktree contains committed HEAD state that differs from its opening base commit",
-      });
-      continue;
+      const integrationState = await commitIntegrationState(gitState.head, canonicalSourceRoot);
+      if (integrationState.state === "unknown") {
+        artifacts.push({
+          ...base,
+          path: canonicalWorktreePath,
+          sourceRoot: canonicalSourceRoot,
+          lifecycle: "UNKNOWN",
+          reason: integrationState.reason,
+        });
+        continue;
+      }
+      if (!integrationState.integrated) {
+        artifacts.push({
+          ...base,
+          path: canonicalWorktreePath,
+          sourceRoot: canonicalSourceRoot,
+          lifecycle: "TERMINAL_BUT_RETAINED",
+          reason: "managed worktree contains committed HEAD state that is not an ancestor of the current source HEAD",
+        });
+        continue;
+      }
+      integratedCommittedHead = true;
     }
 
     const lastUsedMs = Date.parse(session.lastUsedAt);
@@ -480,7 +504,9 @@ async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<Host
       sourceRoot: canonicalSourceRoot,
       ownershipRoot: canonicalWorktreeRoot,
       lifecycle: "GC_ELIGIBLE",
-      reason: "DevSpace-owned managed worktree is unloaded, unbound, process-free, agent-terminal, clean, unchanged from its base commit, and past grace",
+      reason: integratedCommittedHead
+        ? "DevSpace-owned managed worktree is inactive, unbound, process-free, agent-terminal, clean, integrated into the current source HEAD ancestry, and past grace"
+        : "DevSpace-owned managed worktree is inactive, unbound, process-free, agent-terminal, clean, unchanged from its base commit, and past grace",
       ownershipEvidence: "durable managed-worktree session plus canonical containment in configured worktreeRoot",
     });
   }
@@ -493,7 +519,7 @@ async function inspectWorkspaceRecords(input: HostStorageRetentionInput): Promis
   const artifacts: HostStorageArtifact[] = [];
   for (const session of input.workspaceSessions) {
     if (session.mode !== "checkout" || session.managed) continue;
-    const reference = workspaceReferenceState(session.id, input);
+    const reference = workspaceReferenceState(session, input, nowMs, graceMs);
     const base: HostStorageArtifact = {
       id: `workspace-record:${session.id}`,
       kind: "workspace_record",
@@ -690,11 +716,20 @@ async function inspectManagedClones(input: HostStorageRetentionInput): Promise<H
 }
 
 function workspaceReferenceState(
-  workspaceId: string,
+  session: WorkspaceSession,
   input: HostStorageRetentionInput,
+  nowMs: number,
+  graceMs: number,
 ): { lifecycle: "ACTIVE" | "PINNED" | "UNKNOWN"; reason: string } | undefined {
+  const workspaceId = session.id;
   if (input.loadedWorkspaceIds.has(workspaceId)) {
-    return { lifecycle: "ACTIVE", reason: "workspace is loaded in the running server" };
+    const lastUsedMs = Date.parse(session.lastUsedAt);
+    if (!Number.isFinite(lastUsedMs) || nowMs - lastUsedMs < graceMs) {
+      return {
+        lifecycle: "ACTIVE",
+        reason: "workspace is loaded in the running server and still inside the retention grace window",
+      };
+    }
   }
   const processState = input.processWorkspaceStates.get(workspaceId);
   if (processState === "ACTIVE") {
@@ -715,13 +750,15 @@ function workspaceReferenceState(
     };
   }
 
-  const bindingCount = input.conversationBindings.filter(
-    (binding) => binding.workspaceSessionId === workspaceId,
-  ).length;
+  const bindingCount = input.conversationBindings.filter((binding) => {
+    if (binding.workspaceSessionId !== workspaceId) return false;
+    const lastUsedMs = Date.parse(binding.lastUsedAt);
+    return !Number.isFinite(lastUsedMs) || nowMs - lastUsedMs < graceMs;
+  }).length;
   if (bindingCount > 0) {
     return {
       lifecycle: "PINNED",
-      reason: `workspace has ${bindingCount} durable conversation binding(s)`,
+      reason: `workspace has ${bindingCount} recently used durable conversation binding(s)`,
     };
   }
 
@@ -1274,6 +1311,29 @@ async function inspectGitWorktree(
     return {
       state: "unknown",
       reason: `unable to prove managed worktree state: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function commitIntegrationState(
+  head: string,
+  sourceRoot: string,
+): Promise<{ state: "known"; integrated: boolean } | { state: "unknown"; reason: string }> {
+  try {
+    await execFileAsync("git", ["-C", sourceRoot, "merge-base", "--is-ancestor", head, "HEAD"], {
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    return { state: "known", integrated: true };
+  } catch (error) {
+    const exitCode = typeof error === "object" && error && "code" in error
+      ? (error as { code?: number | string }).code
+      : undefined;
+    if (exitCode === 1) return { state: "known", integrated: false };
+    return {
+      state: "unknown",
+      reason: `unable to prove committed worktree integration into source HEAD: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
 }

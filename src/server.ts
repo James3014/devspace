@@ -3698,6 +3698,8 @@ export function createMcpServer(
     },
     async ({ expectedPlanId }) => {
       const result = await applyHostStoragePlan(hostStorageInput(), expectedPlanId, {
+        claimWorkspaceSessionForGc: (workspaceId, expectedLastUsedAt) =>
+          workspaces.claimDurableSessionForGc(workspaceId, expectedLastUsedAt),
         assertWorkspaceSessionUnloaded: (workspaceId) => workspaces.assertDurableSessionUnloaded(workspaceId),
         deleteWorkspaceSession: (workspaceId) => workspaces.deleteDurableSession(workspaceId),
         assertPathUnreferenced: assertStoragePathUnreferenced,
