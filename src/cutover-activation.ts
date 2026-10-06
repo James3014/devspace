@@ -211,7 +211,14 @@ export function hashReleaseTree(rootInput: string): string {
         hash.update(readFileSync(absolute));
         hash.update("\0");
       } else if (info.isSymbolicLink()) {
-        hash.update(`l\0${rel}\0${readlinkSync(absolute)}\0`);
+        const target = readlinkSync(absolute);
+        const resolvedTarget = resolve(dirname(absolute), target);
+        if (!isPathInside(resolvedTarget, root)) {
+          throw new CutoverStateError(
+            `Release symlink escapes the immutable release root: ${rel}`,
+          );
+        }
+        hash.update(`l\0${rel}\0${target}\0`);
       } else {
         throw new CutoverStateError(
           `Release contains unsupported filesystem entry: ${rel}`,
