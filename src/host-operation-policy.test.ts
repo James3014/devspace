@@ -403,17 +403,17 @@ if (process.platform !== "darwin") {
     const precedenceAncestorChoice = join(precedenceAncestorDir, "libchoice.dylib");
     const precedenceChild = join(precedenceChildDir, "libchild.dylib");
     const precedenceRunner = join(precedenceBinDir, "runner");
-    await writeFile(precedenceChoiceSrc, "int choice(void) { return 7; }\\n");
-    await writeFile(precedenceChildSrc, "int choice(void); int child_value(void) { return choice(); }\\n");
-    await writeFile(precedenceRunnerSrc, "int child_value(void); int main(void) { return child_value() == 7 ? 0 : 1; }\\n");
+    await writeFile(precedenceChoiceSrc, "int choice(void) { return 7; }\n");
+    await writeFile(precedenceChildSrc, "int choice(void); int child_value(void) { return choice(); }\n");
+    await writeFile(precedenceRunnerSrc, "int child_value(void); int main(void) { return child_value() == 7 ? 0 : 1; }\n");
 
     const ccChildChoice = ccSpawnSync("clang", ["-shared", "-o", precedenceChildChoice, precedenceChoiceSrc, "-install_name", "@rpath/libchoice.dylib"], { encoding: "utf8" });
     assert.equal(ccChildChoice.status, 0, ccChildChoice.stderr);
     const ccAncestorChoice = ccSpawnSync("clang", ["-shared", "-o", precedenceAncestorChoice, precedenceChoiceSrc, "-install_name", "@rpath/libchoice.dylib"], { encoding: "utf8" });
     assert.equal(ccAncestorChoice.status, 0, ccAncestorChoice.stderr);
-    const ccPrecedenceChild = ccSpawnSync("clang", ["-shared", "-o", precedenceChild, precedenceChildSrc, "-install_name", "@rpath/libchild.dylib", \`-L\${precedenceChildPrivateDir}\`, "-lchoice", "-Wl,-rpath,@loader_path/private"], { encoding: "utf8" });
+    const ccPrecedenceChild = ccSpawnSync("clang", ["-shared", "-o", precedenceChild, precedenceChildSrc, "-install_name", "@rpath/libchild.dylib", `-L${precedenceChildPrivateDir}`, "-lchoice", "-Wl,-rpath,@loader_path/private"], { encoding: "utf8" });
     assert.equal(ccPrecedenceChild.status, 0, ccPrecedenceChild.stderr);
-    const ccPrecedenceRunner = ccSpawnSync("clang", ["-o", precedenceRunner, precedenceRunnerSrc, \`-L\${precedenceChildDir}\`, "-lchild", "-Wl,-rpath,@loader_path/../child", "-Wl,-rpath,@loader_path/../ancestor"], { encoding: "utf8" });
+    const ccPrecedenceRunner = ccSpawnSync("clang", ["-o", precedenceRunner, precedenceRunnerSrc, `-L${precedenceChildDir}`, "-lchild", "-Wl,-rpath,@loader_path/../child", "-Wl,-rpath,@loader_path/../ancestor"], { encoding: "utf8" });
     assert.equal(ccPrecedenceRunner.status, 0, ccPrecedenceRunner.stderr);
     await chmod(precedenceRunner, 0o755);
 
@@ -441,7 +441,7 @@ if (process.platform !== "darwin") {
     };
     const boundPrecedence = await bindHostOperation(precedencePolicy, precedenceRequest, "owner-client");
     const wrappedPrecedence = await prepareHostOperationSandbox(boundPrecedence);
-    const precedenceProfile = wrappedPrecedence.argv.join("\\n");
+    const precedenceProfile = wrappedPrecedence.argv.join("\n");
     assert.ok(precedenceProfile.includes(canonicalChildChoice), "current image LC_RPATH must resolve its own child-private dylib first");
     assert.ok(!precedenceProfile.includes(canonicalAncestorChoice), "inherited ancestor LC_RPATH must not shadow the current image LC_RPATH");
 
@@ -454,16 +454,16 @@ if (process.platform !== "darwin") {
     const relativeRunnerSrc = join(relativeFixtureDir, "relative-runner.c");
     const relativeLib = join(relativePrivateDir, "librelative.dylib");
     const relativeRunner = join(relativeBinDir, "runner");
-    await writeFile(relativeLibSrc, "int relative_value(void) { return 9; }\\n");
-    await writeFile(relativeRunnerSrc, "int relative_value(void); int main(void) { return relative_value() == 9 ? 0 : 1; }\\n");
+    await writeFile(relativeLibSrc, "int relative_value(void) { return 9; }\n");
+    await writeFile(relativeRunnerSrc, "int relative_value(void); int main(void) { return relative_value() == 9 ? 0 : 1; }\n");
     const ccRelativeLib = ccSpawnSync("clang", ["-shared", "-o", relativeLib, relativeLibSrc, "-install_name", "@rpath/librelative.dylib"], { encoding: "utf8" });
     assert.equal(ccRelativeLib.status, 0, ccRelativeLib.stderr);
-    const ccRelativeRunner = ccSpawnSync("clang", ["-o", relativeRunner, relativeRunnerSrc, \`-L\${relativePrivateDir}\`, "-lrelative", "-Wl,-rpath,relative-private"], { encoding: "utf8" });
+    const ccRelativeRunner = ccSpawnSync("clang", ["-o", relativeRunner, relativeRunnerSrc, `-L${relativePrivateDir}`, "-lrelative", "-Wl,-rpath,relative-private"], { encoding: "utf8" });
     assert.equal(ccRelativeRunner.status, 0, ccRelativeRunner.stderr);
     await chmod(relativeRunner, 0o755);
     const relativeRpaths = ccSpawnSync("/usr/bin/otool", ["-l", relativeRunner], { encoding: "utf8" });
     assert.equal(relativeRpaths.status, 0, relativeRpaths.stderr);
-    assert.match(relativeRpaths.stdout, /path relative-private \\(offset \\d+\\)/, "fixture must contain the unsupported relative LC_RPATH");
+    assert.match(relativeRpaths.stdout, /path relative-private \(offset \d+\)/, "fixture must contain the unsupported relative LC_RPATH");
 
     const canonicalRelativeRunner = await realpath(relativeRunner);
     const canonicalRelativeLib = await realpath(relativeLib);
@@ -488,7 +488,7 @@ if (process.platform !== "darwin") {
     };
     const boundRelative = await bindHostOperation(relativePolicy, relativeRequest, "owner-client");
     const wrappedRelative = await prepareHostOperationSandbox(boundRelative);
-    const relativeProfile = wrappedRelative.argv.join("\\n");
+    const relativeProfile = wrappedRelative.argv.join("\n");
     assert.ok(!relativeProfile.includes(canonicalRelativeLib), "unsupported relative LC_RPATH must not create an exact dylib carveout");
   } finally {
     await SandboxManager.reset().catch(() => undefined);
