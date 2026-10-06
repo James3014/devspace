@@ -109,7 +109,6 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "codex_goal_status",
 
   // Safe read/preflight inspection
-  "nexus_gateway_recovery_preflight",
   "candidate_integration_readiness",
   "remote_writability_probe",
 ]);
@@ -207,8 +206,6 @@ export const CONSEQUENTIAL_MCP_TOOLS = new Set([
   "workspace_clone",
   "dependency_sync",
   "workspace_verify",
-  "nexus_gateway_recover",
-  "nexus_gateway_recovery_materialize",
   "codex_goal_start",
   "codex_goal_continue",
   "codex_goal_cancel",

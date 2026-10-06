@@ -10,10 +10,6 @@ import {
   type ToolProjectionManifest,
 } from "./execution-protocol.js";
 import {
-  parseCapabilityDiscoveryReceipt,
-  type CapabilityDiscoveryReceipt,
-} from "./capability-discovery.js";
-import {
   assertLocalEffectProjectionCoherence,
   parseLocalEffectProjection,
   type LocalEffectProjection,
@@ -96,8 +92,8 @@ export interface ExecutionContract {
    * Filesystem write authority remains solely in writePaths.
    */
   effectProjection?: LocalEffectProjection;
-  /** Verified reuse-before-invention discovery evidence for mutating delegated work. */
-  capabilityDiscovery?: CapabilityDiscoveryReceipt;
+  /** Optional capability discovery receipt for compatibility. */
+  capabilityDiscovery?: unknown;
   /** Exact pointer to an already-open Core-bound mutation session. */
   coreMutation?: { sessionId: string; bindingHash: string };
   /**
@@ -360,7 +356,7 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
   }
 
   if (record.capabilityDiscovery !== undefined) {
-    contract.capabilityDiscovery = parseCapabilityDiscoveryReceipt(record.capabilityDiscovery);
+    contract.capabilityDiscovery = record.capabilityDiscovery;
   }
 
   if (record.coreMutation !== undefined) {

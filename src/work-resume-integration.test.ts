@@ -51,7 +51,6 @@ import {
   ControlPlaneOwnershipStore,
   ControlPlaneOwnershipError,
 } from "./control-plane-ownership.js";
-import { CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
 import type { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
@@ -311,7 +310,7 @@ async function makeFixture(): Promise<IntegrationFixture> {
     undefined, // controlPlaneInventoryOverride
     undefined, // controlPlaneInventoryReader
     undefined, // coreMutationSessions
-    CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
+    undefined,
     store,
   );
 

@@ -30,16 +30,6 @@ import {
 import { createMcpServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
-import {
-  acceptanceContractHash,
-  computeCoreMutationWorkspaceIdentity,
-  computeRepositoryMutationBindingHash,
-  CoreMutationSessionStore,
-  NEXUS_CORE_PROTOCOL_VERSION,
-  type RepositoryMutationBinding,
-} from "./core-mutation-session.js";
-import { CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
-
 const execFileAsync = promisify(execFile);
 const OWNER_TOKEN = "test-owner-token-that-is-long-enough";
 
@@ -115,7 +105,6 @@ interface GoalFixture {
   goals: CodexGoalSessionManager;
   spawnLogPath: string;
   stateDir: string;
-  coreMutationSessions?: CoreMutationSessionStore;
   close: () => Promise<void>;
 }
 
@@ -125,7 +114,6 @@ interface GoalFixtureOptions {
   codexBinOverride?: string;
   emitGoalMarker?: boolean;
   startupTimeoutMs?: number;
-  coreMutation?: boolean;
   writePathOnGoal?: string;
   exitAfterGoalMs?: number;
 }
@@ -183,7 +171,6 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
     typeChunkDelayMs: 30,
     cancelTimeoutMs: 3_000,
   });
-  const coreMutationSessions = options.coreMutation ? new CoreMutationSessionStore(stateDir) : undefined;
 
   const server = createMcpServer(
     config,
@@ -194,18 +181,6 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
     [],
     undefined,
     goals,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    coreMutationSessions,
-    coreMutationSessions ? undefined : CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-goals-test-client", version: "1.0.0" });
@@ -219,13 +194,12 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
     await server.close();
     goals.shutdown();
     processes.shutdown();
-    coreMutationSessions?.close();
     store.close();
     rmSync(rootDir, { recursive: true, force: true });
   };
   t.after(close);
 
-  return { client, projectA, projectB, config, processes, goals, spawnLogPath, stateDir, coreMutationSessions, close };
+  return { client, projectA, projectB, config, processes, goals, spawnLogPath, stateDir, close };
 }
 
 async function callTool(
@@ -256,94 +230,7 @@ function structured(result: CallToolResult): Record<string, unknown> {
   return result.structuredContent as Record<string, unknown>;
 }
 
-test("Codex goal sessions retain the exact Core binding for continuation", async (t) => {
-  const fixture = await goalFixture(t);
-  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: fixture.projectA })).stdout.trim();
-  const coreMutation = {
-    sessionId: `cms_${"a".repeat(32)}`,
-    bindingHash: `sha256:${"b".repeat(64)}`,
-  };
-  const started = await fixture.goals.startPrompt({
-    workspaceId: "ws_core_goal",
-    workspaceRoot: fixture.projectA,
-    goal: "retain exact Core binding",
-    expectedHead: head,
-    coreMutation,
-  } as Parameters<CodexGoalSessionManager["startPrompt"]>[0]);
-  assert.deepEqual(
-    (started as unknown as { coreMutation?: unknown }).coreMutation,
-    coreMutation,
-    "start result must expose the binding retained by the live goal",
-  );
-  assert.deepEqual(
-    (fixture.goals as unknown as {
-      getCoreMutationBinding(workspaceId: string, goalId: string): unknown;
-    }).getCoreMutationBinding("ws_core_goal", started.goalId),
-    coreMutation,
-  );
-});
 
-test("codex_goal_start allows direct unbound execution without minting Core provenance", async (t) => {
-  const fixture = await goalFixture(t, { coreMutation: true });
-  const conversation = { "openai/session": "core-unbound-goal" };
-  const opened = await fixture.client.callTool({
-    name: "open_workspace",
-    arguments: { path: fixture.projectA },
-    _meta: conversation,
-  });
-  const workspaceId = structured(opened).workspaceId as string;
-  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: fixture.projectA })).stdout.trim();
-  const result = await fixture.client.callTool({
-    name: "codex_goal_start",
-    arguments: { workspaceId, goal: "direct goal without core", expectedHead: head },
-    _meta: conversation,
-  });
-  assert.equal(result.isError, undefined);
-  assert.ok(structured(result).goalId, "direct unbound goal should return one durable goal handle");
-  assert.equal(structured(result).coreMutation, undefined, "direct goal must not mint Core provenance");
-});
-
-test("terminal codex_goal_status rejects out-of-scope Core mutation", async (t) => {
-  const fixture = await goalFixture(t, {
-    coreMutation: true,
-    writePathOnGoal: "outside.txt",
-    exitAfterGoalMs: 250,
-  });
-  const conversationScopeId = "core-goal-terminal-scope";
-  const conversation = { "openai/session": conversationScopeId };
-  const opened = await fixture.client.callTool({ name: "open_workspace", arguments: { path: fixture.projectA }, _meta: conversation });
-  const workspaceId = structured(opened).workspaceId as string;
-  const session = await bindGoalCoreSession(fixture, workspaceId, conversationScopeId, ["allowed.txt"]);
-  const started = await fixture.client.callTool({
-    name: "codex_goal_start",
-    arguments: { workspaceId, goal: "write outside then exit", expectedHead: await headSha(fixture.projectA) },
-    _meta: conversation,
-  });
-  assert.equal(started.isError, undefined, textOf(started));
-  const goalId = structured(started).goalId as string;
-  let rejected: CallToolResult | undefined;
-  let observedRetainedBinding = false;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const status = await fixture.client.callTool({
-      name: "codex_goal_status",
-      arguments: { workspaceId, goalId, waitMs: 50 },
-      _meta: conversation,
-    }) as CallToolResult;
-    if (status.isError) {
-      rejected = status;
-      break;
-    }
-    const body = structured(status);
-    const core = body.coreMutation as Record<string, unknown> | undefined;
-    if (core?.bindingHash === session.bindingHash) observedRetainedBinding = true;
-    if (body.terminal) assert.fail("terminal Core goal status must enforce physical scope before returning success");
-  }
-  assert.equal(observedRetainedBinding, true, "status must retain the exact state.coreMutation pointer while running");
-  assert.ok(rejected, "terminal scope escape must return a typed error");
-  assert.match(textOf(rejected!), /CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE/);
-  assert.equal(existsSync(join(fixture.projectA, "outside.txt")), true);
-  assert.equal(fixture.coreMutationSessions!.getById(session.id)?.rebindState, "REBIND_REQUIRED");
-});
 
 function textOf(result: CallToolResult): string {
   const content = result.content as Array<{ type: string; text?: string }> | undefined;
@@ -362,65 +249,7 @@ async function headSha(project: string): Promise<string> {
   return stdout.trim();
 }
 
-async function bindGoalCoreSession(
-  fixture: GoalFixture,
-  workspaceId: string,
-  conversationScopeId: string,
-  allowedPaths: string[],
-) {
-  assert.ok(fixture.coreMutationSessions);
-  const head = await headSha(fixture.projectA);
-  const tree = (await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: fixture.projectA })).stdout.trim();
-  const origin = "https://github.com/James3014/devspace.git";
-  await execFileAsync("git", ["remote", "add", "origin", origin], { cwd: fixture.projectA });
-  const contract = {
-    contract_id: "codex-goal-core-test",
-    requirements_hash: `sha256:${"3".repeat(64)}`,
-    required_verifier_ids: ["focused-tests"],
-    allowed_paths: allowedPaths,
-    deletion_policy: "FORBID" as const,
-  };
-  const base: Omit<RepositoryMutationBinding, "binding_hash"> = {
-    schema: "nexus.repository_mutation_binding.v1",
-    binding_id: "binding-codex-goal-core",
-    operation_id: "operation-codex-goal-core",
-    attempt_id: "attempt-codex-goal-core",
-    repository: {
-      canonical_id: "James3014/devspace",
-      origin,
-      source_revision: `git-commit:${head}`,
-      source_tree: `git-tree:${tree}`,
-      workspace_identity: `sha256:${"0".repeat(64)}`,
-      workspace_mode: "checkout",
-    },
-    integration_authority: {
-      execution_lane: "DIRECT_DELEGATED",
-      authority_ref: "James3014/devspace#135:test",
-      authority_hash: `sha256:${"4".repeat(64)}`,
-    },
-    capability_discovery: {
-      required: true,
-      receipt_hash: `sha256:${"5".repeat(64)}`,
-      index_revision: `git-commit:${"6".repeat(40)}`,
-    },
-    core: {
-      protocol_version: NEXUS_CORE_PROTOCOL_VERSION,
-      acceptance_contract: contract,
-      acceptance_contract_hash: acceptanceContractHash(contract),
-    },
-    freshness: { created_at: new Date().toISOString(), valid_until: null, revalidate_before_first_effect: true },
-  };
-  base.repository.workspace_identity = computeCoreMutationWorkspaceIdentity({ workspaceSessionId: workspaceId, binding: { ...base, binding_hash: `sha256:${"0".repeat(64)}` } });
-  const binding = { ...base, binding_hash: computeRepositoryMutationBindingHash(base) };
-  return fixture.coreMutationSessions.open({
-    workspaceSessionId: workspaceId,
-    workspaceRoot: fixture.projectA,
-    workspaceMode: "checkout",
-    managed: false,
-    actorKey: `openai:${createHash("sha256").update(conversationScopeId).digest("hex")}`,
-    binding,
-  });
-}
+
 
 function spawnCount(logPath: string): number {
   if (!existsSync(logPath)) return 0;

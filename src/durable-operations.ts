@@ -26,13 +26,9 @@ export type DurableOperationKind =
   | "workspace_clone"
   | "git_push"
   | "dependency_sync"
-  | "nexus_gateway_recover"
-  | "nexus_gateway_recovery_preflight"
-  | "nexus_gateway_recovery_materialize"
   | "cutover_start"
   | "host_operation"
-  | "chat_swarm_reconciliation"
-  | "core_candidate_acquisition";
+  | "chat_swarm_reconciliation";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
 export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 
@@ -58,42 +54,6 @@ export function cutoverTerminalRecordHash(record: NonNullable<ReturnType<Cutover
   const {expired,...durable}=record;
   return hashJson(durable);
 }
-
-import {
-  NexusRecoveryAdapter,
-  NEXUS_GATEWAY_RECOVERY_SCHEMA,
-  NEXUS_GATEWAY_INTERPRETER,
-  NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
-  NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
-  NEXUS_GATEWAY_STATE_ROOT,
-  type NexusGatewayRecoveryRequest,
-  type NexusGatewayRecoveryInput,
-  type NexusGatewayRecoveryBridgeResult,
-  type NexusGatewayRecoveryReceipt,
-  type NexusGatewayRecoveryMaterializationReceipt,
-  type NexusGatewayRecoveryMaterializationRequest,
-  type NexusGatewayRecoveryMaterializationInput,
-  type NexusGatewayPreflightResult,
-  type NexusGatewayRecoveryPreflightResult,
-  type NexusGatewayRecoveryRunner,
-  type NexusGatewayRecoveryMaterializationRunner,
-  assertNexusGatewayRecoveryRequest,
-  assertNexusGatewayRecoveryMaterializationRequest,
-  validateNexusGatewayPreflightReceipt,
-  validateNexusGatewayRecoveryReceipt,
-  validateNexusGatewayMaterializationReceipt,
-  buildNexusGatewayRecoveryBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
-  spawnNexusGatewayRecovery,
-  buildNexusGatewayRecoveryPreflightBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
-  spawnNexusGatewayRecoveryPreflight,
-  buildNexusGatewayRecoveryMaterializationBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
-  spawnNexusGatewayRecoveryMaterialize,
-} from "./nexus-recovery-adapter.js";
 
 export interface DurableOperationRecord {
   operationId: string;
@@ -145,12 +105,6 @@ export class DurableOperationError extends Error {
       | "DEPENDENCY_RECIPE_UNSUPPORTED"
       | "DEPENDENCY_SYNC_FAILED"
       | "FROZEN_INPUT_CHANGED"
-      | "NEXUS_GATEWAY_REQUEST_INVALID"
-      | "NEXUS_GATEWAY_PREFLIGHT_FAILED"
-      | "NEXUS_GATEWAY_RECOVERY_FAILED"
-      | "NEXUS_GATEWAY_RECOVERY_UNCERTAIN"
-      | "NEXUS_GATEWAY_MATERIALIZATION_FAILED"
-      | "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN"
       | "RECONCILIATION_REQUIRED",
     message: string,
     readonly operation?: DurableOperationRecord,
@@ -217,14 +171,6 @@ export class DurableOperationStore {
 
   markInterruptedUnknown(): number {
     const now = new Date().toISOString();
-    const preflight = this.database.sqlite.prepare(`
-      update durable_operations
-      set status = 'outcome_unknown', retry_safe = 'false',
-          error_code = 'RECONCILIATION_REQUIRED',
-          error_message = 'DevSpace restarted while the read-only Gateway preflight was nonterminal; reconcile the same stored request.',
-          updated_at = ?
-      where status = 'started' and kind = 'nexus_gateway_recovery_preflight'
-    `).run(now);
     const result = this.database.sqlite.prepare(`
       update durable_operations
       set status = 'outcome_unknown', retry_safe = 'false',
@@ -232,9 +178,9 @@ export class DurableOperationStore {
           error_message = 'DevSpace restarted while the mutating operation was nonterminal; reconcile physical state before any replay.',
           updated_at = ?
       where status = 'started'
-        and kind not in ('dependency_sync', 'cutover_start', 'nexus_gateway_recovery_preflight')
+        and kind not in ('dependency_sync', 'cutover_start')
     `).run(now);
-    return result.changes + preflight.changes;
+    return result.changes;
   }
 
   getByOperationId(operationId: string): DurableOperationRecord | undefined {
@@ -402,23 +348,16 @@ export class DurableOperationManager {
   readonly store: DurableOperationStore;
   private readonly consumer?: ControlPlaneConsumer;
 
-  readonly recoveryAdapter: NexusRecoveryAdapter;
-
   constructor(
     private readonly config: ServerConfig,
     private readonly runCommand: CommandRunner = spawnCommand,
-    runNexusGatewayRecovery?: NexusGatewayRecoveryRunner,
-    runNexusGatewayRecoveryPreflight?: NexusGatewayRecoveryRunner,
+    _runNexusGatewayRecovery?: unknown,
+    _runNexusGatewayRecoveryPreflight?: unknown,
     coordination?: ControlPlaneConsumerOptions,
-    runNexusGatewayRecoveryMaterialize?: NexusGatewayRecoveryMaterializationRunner,
+    _runNexusGatewayRecoveryMaterialize?: unknown,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
-    this.recoveryAdapter = new NexusRecoveryAdapter(this.store, {
-      runRecovery: runNexusGatewayRecovery,
-      runPreflight: runNexusGatewayRecoveryPreflight,
-      runMaterialize: runNexusGatewayRecoveryMaterialize,
-    });
     if (coordination) this.consumer = new ControlPlaneConsumer(this.store.createOwnershipStore(coordination), coordination);
   }
 
@@ -1076,22 +1015,6 @@ export class DurableOperationManager {
     });
   }
 
-  async nexusGatewayRecover(input: NexusGatewayRecoveryInput): Promise<DurableOperationRecord> {
-    return await this.recoveryAdapter.recover(input);
-  }
-
-  async nexusGatewayRecoveryPreflight(input: NexusGatewayRecoveryInput): Promise<NexusGatewayPreflightResult> {
-    return await this.recoveryAdapter.preflight(input);
-  }
-
-  async nexusGatewayRecoveryPreflightStart(input: NexusGatewayRecoveryInput): Promise<DurableOperationRecord> {
-    return await this.recoveryAdapter.preflightStart(input);
-  }
-
-  async nexusGatewayRecoveryMaterialize(input: NexusGatewayRecoveryMaterializationInput): Promise<DurableOperationRecord> {
-    return await this.recoveryAdapter.materialize(input);
-  }
-
   async reconcile(operationId: string, consumerContext?: unknown): Promise<DurableOperationRecord> {
     const record = this.store.getByOperationId(operationId);
     if (!record) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
@@ -1104,13 +1027,6 @@ export class DurableOperationManager {
       if (!this.consumer || typeof record.request.baseRevision !== "string") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires revision-bound host authority");
       const subject = {operationId, requestHash:record.requestHash, workspaceRoot:record.scopeRoot, baseRevision:record.request.baseRevision, operation:"dependency_sync" as const};
       return this.reconcileDependencySync(operationId, this.consumer.readReconciliation(consumerContext, subject), consumerContext);
-    }
-    if (
-      record.kind === "nexus_gateway_recovery_preflight"
-      || record.kind === "nexus_gateway_recover"
-      || record.kind === "nexus_gateway_recovery_materialize"
-    ) {
-      return await this.recoveryAdapter.reconcile(record);
     }
 
     if (record.kind === "workspace_clone") {
@@ -1385,38 +1301,3 @@ async function spawnCommand(
   });
 }
 
-export {
-  NEXUS_GATEWAY_RECOVERY_SCHEMA,
-  NEXUS_GATEWAY_INTERPRETER,
-  NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
-  NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
-  NEXUS_GATEWAY_STATE_ROOT,
-  type NexusGatewayRecoveryRequest,
-  type NexusGatewayRecoveryInput,
-  type NexusGatewayRecoveryBridgeResult,
-  type NexusGatewayRecoveryReceipt,
-  type NexusGatewayRecoveryMaterializationReceipt,
-  type NexusGatewayRecoveryMaterializationRequest,
-  type NexusGatewayRecoveryMaterializationInput,
-  type NexusGatewayPreflightResult,
-  type NexusGatewayRecoveryPreflightResult,
-  type NexusGatewayRecoveryRunner,
-  type NexusGatewayRecoveryMaterializationRunner,
-  assertNexusGatewayRecoveryRequest,
-  assertNexusGatewayRecoveryMaterializationRequest,
-  validateNexusGatewayPreflightReceipt,
-  validateNexusGatewayRecoveryReceipt,
-  validateNexusGatewayMaterializationReceipt,
-  buildNexusGatewayRecoveryBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
-  spawnNexusGatewayRecovery,
-  buildNexusGatewayRecoveryPreflightBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
-  spawnNexusGatewayRecoveryPreflight,
-  buildNexusGatewayRecoveryMaterializationBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
-  spawnNexusGatewayRecoveryMaterialize,
-  NexusRecoveryAdapter,
-} from "./nexus-recovery-adapter.js";
