@@ -105,7 +105,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$UV_TOOL_BIN_DIR"
-          uv tool install --force "git+https://github.com/James3014/nexus-core.git@00c791009aa4d626dacfe31012454ed1569a7b7c"
+          uv tool install --force "git+https://github.com/James3014/nexus-core.git@ef81b65914f6d64e5dc1b13eb47f323d80b7a071"
           echo "$UV_TOOL_BIN_DIR" >> "$GITHUB_PATH"
 
       - name: Set up Node 22
@@ -140,13 +140,21 @@ jobs:
           path = receipts[-1]
           payload = json.load(open(path, encoding="utf-8"))
           verifier = payload.get("verifier") or {}
+          artifacts = payload.get("evidence_artifacts") or []
+          outcome = payload.get("outcome") or {}
           print("NEXUS_CORE_DIAGNOSTIC_RECEIPT:", path)
-          print("status:", payload.get("status"))
-          print("reason_codes:", payload.get("reason_codes"))
-          print("verifier_command:", verifier.get("command"))
-          print("verifier_exit_code:", verifier.get("exit_code"))
-          print("--- verifier stdout ---")
-          print(verifier.get("stdout", ""))
-          print("--- verifier stderr ---")
-          print(verifier.get("stderr", ""))
+          print("status:", outcome.get("status") or payload.get("status"))
+          print("reason_codes:", outcome.get("reason_codes") or payload.get("reason_codes"))
+          if verifier:
+              print("verifier_command:", verifier.get("command"))
+              print("verifier_exit_code:", verifier.get("exit_code"))
+              print(verifier.get("stdout", ""))
+              print(verifier.get("stderr", ""))
+          for artifact in artifacts:
+              print("producer_id:", artifact.get("producer_id"))
+              print("kind:", artifact.get("producer_kind"))
+              print("status:", artifact.get("status"))
+              print("exit_code:", artifact.get("exit_code"))
+              print(artifact.get("stdout", ""))
+              print(artifact.get("stderr", ""))
           PY

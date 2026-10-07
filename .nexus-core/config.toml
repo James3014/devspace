@@ -1,6 +1,24 @@
-version = 1
+version = 2
 base_ref = "origin/main"
 allowed_patterns = ["**"]
 deletion_policy = "FORBID"
-verifier_command = ["npm", "run", "verify:nexus-core"]
+universe_generation = 1
+materials = []
+
+[[verifiers]]
+id = "isolated-full-tests"
+command = ["npm", "run", "verify:nexus-core"]
 timeout_seconds = 3600
+logical_subject_id = "devspace/full-tests"
+evidence_kind = "test-result"
+requirement_mode = "REQUIRED"
+applicability = "APPLICABLE"
+
+[[verifiers]]
+id = "typecheck-build-doctor"
+command = ["bash", "-lc", "set -euo pipefail; export DEVSPACE_ALLOWED_ROOTS=\"$PWD\" DEVSPACE_OAUTH_OWNER_TOKEN=ci-owner-token-that-is-long-enough DEVSPACE_PUBLIC_BASE_URL=http://127.0.0.1:7676; npm ci --no-audit --no-fund; npm run typecheck; npm run build; node dist/cli.js doctor"]
+timeout_seconds = 1800
+logical_subject_id = "devspace/typecheck-build-doctor"
+evidence_kind = "package-smoke"
+requirement_mode = "REQUIRED"
+applicability = "APPLICABLE"
