@@ -314,9 +314,20 @@ export class ControlPlaneOwnershipStore {
       if (row.lease_id === ownLeaseId) continue;
       const other = rowLease(row);
       if (other.terminalState !== undefined) continue;
-      this.assertPhysicalBinding(other);
-      if (overlaps(resource.scope, other.scope) || (other.resourceKind !== "filesystem" && other.resourceKind !== "checkout" && other.resourceKind === resource.resourceKind && other.resourceId === resource.resourceId && other.resource === resource.resource)) {
+      const storedConflict = overlaps(resource.scope, other.scope) ||
+        (other.resourceKind !== "filesystem" && other.resourceKind !== "checkout" &&
+          other.resourceKind === resource.resourceKind && other.resourceId === resource.resourceId && other.resource === resource.resource);
+      if (storedConflict) {
         throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "overlapping resource scope is already leased");
+      }
+      try {
+        this.assertPhysicalBinding(other);
+      } catch (error) {
+        const expiredMissingPhysicalResource = Date.parse(other.expiresAt) <= this.now() &&
+          error instanceof ControlPlaneOwnershipError && error.code === "INVALID_INPUT" &&
+          error.message === "resource identity cannot be resolved";
+        if (expiredMissingPhysicalResource) continue;
+        throw error;
       }
     }
     // Resolver callbacks may reenter this transaction; no callbacks follow this fence.

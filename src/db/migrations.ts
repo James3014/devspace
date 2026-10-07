@@ -88,6 +88,7 @@ const migrations: Migration[] = [
   { version: 23, name: "core-candidate-acquisition-observations", up: migrateCoreCandidateAcquisitionObservations },
   { version: 24, name: "core-candidate-acquisition-receipt-path", up: migrateCoreCandidateAcquisitionReceiptPath },
   { version: 25, name: "work-resume-registry", up: migrateWorkResumeRegistry },
+  { version: 26, name: "carrier-idle-lease-cleanup-receipts", up: migrateCarrierIdleLeaseCleanupReceipts },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -755,4 +756,14 @@ function migrateWorkResumeRegistry(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "work_resume_registry", "effect_kind", "text");
   addColumnIfMissing(sqlite, "work_resume_registry", "effect_key", "text");
   addColumnIfMissing(sqlite, "work_resume_registry", "effect_handle", "text");
+}
+function migrateCarrierIdleLeaseCleanupReceipts(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists carrier_idle_lease_cleanup_receipts (
+      lease_id text primary key references control_plane_resource_leases(lease_id),
+      receipt_id text not null unique,
+      receipt_json text not null,
+      created_at text not null
+    );
+  `);
 }

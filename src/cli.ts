@@ -442,6 +442,7 @@ function printHelp(): void {
       "  devspace carrier reauthorize <carrier-id> --validity-version <version> --until <ISO expiry>",
       "  devspace carrier approve <pending-id> --contract <file> --confirm <pending-id>",
       "  devspace carrier revoke <carrier-id> --version <version>",
+      "  devspace carrier release-revoked-idle-cutover-lease <lease-id> --lease-version <n> --carrier <id> --carrier-version <n> --validity-version <n> --operation-id <id> --confirm <lease-id>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
@@ -1952,6 +1953,19 @@ function runCarrierCommand(args: string[]): void {
       bindings.validateLocalScope(contract,[...config.allowedRoots,config.worktreeRoot]);
       result=bindings.approveLocal(id,contract);
     } else if(action==="revoke" && flags.length===2 && flags[0]==="--version") result=bindings.revokeLocal(id,Number(flags[1]));
+    else if(action==="release-revoked-idle-cutover-lease" && flags.length===12 &&
+      flags[0]==="--lease-version" && flags[2]==="--carrier" && flags[4]==="--carrier-version" &&
+      flags[6]==="--validity-version" && flags[8]==="--operation-id" && flags[10]==="--confirm") {
+      result=bindings.releaseRevokedIdleCutoverLeaseLocal({
+        leaseId:id,
+        expectedLeaseVersion:Number(flags[1]),
+        carrierId:flags[3]!,
+        expectedCarrierVersion:Number(flags[5]),
+        expectedValidityVersion:Number(flags[7]),
+        expectedOperationId:flags[9]!,
+        confirmLeaseId:flags[11]!,
+      });
+    }
     else throw new Error("Invalid carrier arguments. Inspect the exact pending pairing before approving its bounded contract.");
     console.log(JSON.stringify(result,null,2));
   } finally { bindings.close(); }
