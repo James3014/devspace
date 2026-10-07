@@ -1050,6 +1050,7 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
           retryable: false,
           model: "cline-pass/glm-5.3-flash",
           variant: "high",
+          rawProviderCode: "EntitlementError",
           providerSessionId: "sess-cline-live-1",
           providerMessage: "ClinePass entitlement required api_key=synthetic-secret-value-9f3a",
         });
@@ -1081,6 +1082,7 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
       code: "CLINEPASS_ENTITLEMENT_REQUIRED",
       errorClass: "ENTITLEMENT_REQUIRED",
       retryable: false,
+      rawProviderCode: "EntitlementError",
       model: "cline-pass/glm-5.3-flash",
       variant: "high",
       providerSessionId: "sess-cline-live-1",

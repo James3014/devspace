@@ -3857,6 +3857,9 @@ export class LocalAgentSessionManager {
           code: error.code,
           errorClass: error.errorClass,
           retryable: error.retryable,
+          ...(error.rawProviderCode
+            ? { rawProviderCode: redactSensitiveText(error.rawProviderCode) }
+            : {}),
           model: error.model,
           variant: error.variant,
           providerSessionId: error.providerSessionId,
@@ -4667,11 +4670,13 @@ function classifyDispatchFailure(record: LocalAgentRecord): DispatchFailureClass
     case "PROVIDER_AUTH_ERROR":
       failureClass = "PROVIDER_AUTH_ERROR";
       break;
+    case "PROVIDER_MODEL_UNAVAILABLE":
+      failureClass = "PROVIDER_MODEL_UNAVAILABLE";
+      break;
     case "WORKER_LAUNCH_FAILED":
       failureClass = "PROVIDER_STARTUP_FAILED";
       break;
     case "PROVIDER_TIMEOUT":
-    case "PROVIDER_MODEL_UNAVAILABLE":
     case "PROVIDER_VARIANT_UNAVAILABLE":
     case "PROVIDER_CANCELLED":
     case "PROVIDER_PROTOCOL_ERROR":
