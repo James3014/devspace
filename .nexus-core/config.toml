@@ -1,6 +1,6 @@
 version = 1
 base_ref = "origin/main"
 allowed_patterns = ["**"]
-deletion_policy = "ALLOW"
+deletion_policy = "FORBID"
 verifier_command = ["npm", "run", "verify:nexus-core"]
 timeout_seconds = 3600
