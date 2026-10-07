@@ -198,6 +198,55 @@ test("P2-A: requested/resolved metadata is not fabricated as physical model atte
   }
 });
 
+test("P2-A: legacy Agy JSON model claims fail closed on status read without rewriting durable history", async () => {
+  const { projectRoot, manager, cleanup } = setupEnv();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_p2_legacy_agy_attestation",
+      workspaceRoot: projectRoot,
+      profileName: "direct-opus",
+      prompt: "legacy Agy attestation projection",
+      profiles: mockProfiles,
+      attemptKey: "att-legacy-agy-json-output",
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const sqlite = (store as any).database.sqlite;
+
+    for (const attestationState of ["MATCH", "MODEL_ATTESTATION_MISMATCH"] as const) {
+      const record = store.getById(started.agentId)!;
+      const lifecycleState = {
+        ...record.lifecycleState,
+        modelAttestation: {
+          requestedModel: "claude-opus-4-6",
+          resolvedModel: "claude-opus-4-6",
+          observedModel: attestationState === "MATCH" ? "claude-opus-4-6" : "gemini-3.8-flash",
+          attestationSource: "agy_json_output",
+          attestationState,
+          attestedAt: "2026-10-05T00:00:00.000Z",
+        },
+      };
+      sqlite.prepare("update local_agent_sessions set lifecycle_state=? where id=?")
+        .run(JSON.stringify(lifecycleState), started.agentId);
+
+      const status = await manager.getAgentStatus({
+        workspaceId: "ws_p2_legacy_agy_attestation",
+        workspaceRoot: projectRoot,
+        agentId: started.agentId,
+      });
+
+      assert.deepEqual(status.modelAttestation, {
+        ...lifecycleState.modelAttestation,
+        observedModel: null,
+        attestationSource: "metadata_only",
+        attestationState: "ATTESTATION_UNAVAILABLE",
+      });
+      assert.deepEqual(store.getById(started.agentId)?.lifecycleState?.modelAttestation, lifecycleState.modelAttestation);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 test("P2-D: Dispatcher heartbeat is separated from providerProcessState and timeline", async () => {
   const { projectRoot, manager, cleanup } = setupEnv();
   try {

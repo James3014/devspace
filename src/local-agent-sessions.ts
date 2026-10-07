@@ -4827,7 +4827,18 @@ function recordToStatusOutput(
 
   // P2-A: Model attestation
   if (record.lifecycleState?.modelAttestation) {
-    output.modelAttestation = record.lifecycleState.modelAttestation;
+    const attestation = record.lifecycleState.modelAttestation;
+    // Older Agy adapters treated JSON keys as provider identity even though
+    // their provenance was never established. Keep the stored record intact
+    // for audit, but never expose that legacy claim as physical attestation.
+    output.modelAttestation = attestation.attestationSource === "agy_json_output"
+      ? {
+          ...attestation,
+          observedModel: null,
+          attestationSource: "metadata_only",
+          attestationState: "ATTESTATION_UNAVAILABLE",
+        }
+      : attestation;
   } else if (record.model || record.executionContract?.directSelection?.model) {
     const requested = record.executionContract?.directSelection?.model;
     const resolved = record.model;
