@@ -314,8 +314,21 @@ export class ControlPlaneOwnershipStore {
       if (row.lease_id === ownLeaseId) continue;
       const other = rowLease(row);
       if (other.terminalState !== undefined) continue;
-      this.assertPhysicalBinding(other);
-      if (overlaps(resource.scope, other.scope) || (other.resourceKind !== "filesystem" && other.resourceKind !== "checkout" && other.resourceKind === resource.resourceKind && other.resourceId === resource.resourceId && other.resource === resource.resource)) {
+      const conflicts = overlaps(resource.scope, other.scope) ||
+        (other.resourceKind !== "filesystem" && other.resourceKind !== "checkout" && other.resourceKind === resource.resourceKind && other.resourceId === resource.resourceId && other.resource === resource.resource);
+      try {
+        this.assertPhysicalBinding(other);
+      } catch (error) {
+        const missingFilesystemIdentity = error instanceof ControlPlaneOwnershipError &&
+          error.code === "INVALID_INPUT" && error.message === "resource identity cannot be resolved" &&
+          (other.resourceKind === "filesystem" || other.resourceKind === "checkout");
+        if (!missingFilesystemIdentity) throw error;
+        if (conflicts) {
+          throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "overlapping stale physical lease requires Owner-local cleanup");
+        }
+        continue;
+      }
+      if (conflicts) {
         throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "overlapping resource scope is already leased");
       }
     }

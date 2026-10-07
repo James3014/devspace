@@ -1394,6 +1394,93 @@ export class CarrierBindingStore {
   }
 
   /**
+   * Owner-local hygiene for an expired lease left behind by a revoked root
+   * carrier before any durable effect began. This never proves an effect
+   * terminal: any pin, durable operation, terminal witness, or resumable-work
+   * record keeps the lease fenced for its normal reconciler.
+   */
+  releaseExpiredRevokedUnpinnedLeaseLocal(input: {
+    leaseId: string;
+    expectedLeaseVersion: number;
+    carrierId: string;
+    expectedCarrierVersion: number;
+    confirmLeaseId: string;
+  }) {
+    if(input.confirmLeaseId!==input.leaseId) deny("Orphan lease release confirmation must equal the exact lease id");
+    if(!Number.isSafeInteger(input.expectedLeaseVersion) || input.expectedLeaseVersion<1 ||
+       !Number.isSafeInteger(input.expectedCarrierVersion) || input.expectedCarrierVersion<2) {
+      throw new ControlPlaneOwnershipError("CAS_CONFLICT","Orphan lease release identity is invalid");
+    }
+    return this.database.sqlite.transaction(()=>{
+      const row=this.database.sqlite.prepare("select * from carrier_bindings where id=?").get(input.carrierId) as BindingRow|undefined;
+      if(!row || row.revoked!==1 || row.version!==input.expectedCarrierVersion || row.parent_id) {
+        deny("Orphan lease release requires the exact revoked root carrier");
+      }
+      let contract:CarrierContract;
+      try { contract=JSON.parse(row.contract_json) as CarrierContract; }
+      catch { throw new ControlPlaneOwnershipError("MALFORMED","Orphan lease carrier contract is malformed"); }
+      if(!contract || contract.role!=="controller" || normalizeRepositoryKey(contract.repository)!==contract.repository ||
+         !/^[a-f0-9]{40,64}$/.test(contract.baseRevision) || !Array.isArray(contract.scope) || contract.scope.length<1 ||
+         !Array.isArray(contract.operations) || contract.operations.length<1 ||
+         contract.operations.some(op=>op!=="dependency_sync" && op!=="cutover_start" && op!=="worktree_write") ||
+         contract.scope.some(path=>typeof path!=="string" || !isAbsolute(path) || path.includes("\0")) ||
+         !Number.isFinite(Date.parse(contract.expiresAt)) || JSON.stringify(contract)!==row.contract_json) {
+        throw new ControlPlaneOwnershipError("MALFORMED","Orphan lease carrier contract is not canonical");
+      }
+
+      const lease=this.ownership.get(input.leaseId);
+      if(!lease || lease.ownerThread!==row.id || lease.repositoryKey!==contract.repository ||
+         lease.baseRevision!==contract.baseRevision || !contract.operations.includes(lease.operation as CarrierContract["operations"][number]) ||
+         lease.resourceKind!=="filesystem" || lease.scope.some(path=>!contract.scope.some(root=>contains(root,path))) ||
+         !contract.scope.some(root=>contains(root,lease.resource))) {
+        deny("Orphan lease release binding does not match the revoked carrier");
+      }
+      if(contract.cutover && (lease.operation!=="cutover_start" || lease.resource!==contract.cutover.stateRoot ||
+         lease.scope.length!==1 || lease.scope[0]!==contract.cutover.stateRoot)) {
+        deny("Orphan cutover lease release binding changed");
+      }
+      if(Date.parse(lease.expiresAt)>this.now()) deny("Orphan lease release requires an expired lease");
+      if(lease.operationHandle!==undefined || lease.operationState!==undefined) {
+        deny("Pinned or completed operations require normal reconciliation");
+      }
+
+      const bindings=this.database.sqlite.prepare("select binding_id,operation_id,subject_json from carrier_effect_bindings where lease_id=? order by operation_id").all(input.leaseId) as Array<{binding_id:string;operation_id:string;subject_json:string}>;
+      if(bindings.length!==1 || bindings[0]!.binding_id!==row.id) deny("Orphan lease release requires one exact prepared effect binding");
+      let subject:{operationId?:unknown;requestHash?:unknown;workspaceRoot?:unknown;baseRevision?:unknown;operation?:unknown};
+      try { subject=JSON.parse(bindings[0]!.subject_json); }
+      catch { throw new ControlPlaneOwnershipError("MALFORMED","Orphan lease effect binding is malformed"); }
+      if(subject.operationId!==bindings[0]!.operation_id || typeof subject.requestHash!=="string" || !/^[a-f0-9]{64}$/.test(subject.requestHash) ||
+         subject.workspaceRoot!==lease.resource || subject.baseRevision!==lease.baseRevision || subject.operation!==lease.operation) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Orphan lease effect binding changed");
+      }
+      const operationId=bindings[0]!.operation_id;
+      const durable=this.database.sqlite.prepare("select 1 from durable_operations where operation_id=? limit 1").get(operationId);
+      const terminal=this.database.sqlite.prepare("select 1 from dependency_terminal_witnesses where operation_id=? limit 1").get(operationId);
+      const resumable=this.database.sqlite.prepare("select 1 from work_resume_registry where lease_id=? or effect_handle=? limit 1").get(input.leaseId,operationId);
+      if(durable || terminal || resumable) deny("Orphan lease has durable effect or witness evidence and requires normal reconciliation");
+
+      if(lease.terminalState!==undefined) {
+        if(lease.terminalState!=="released" || lease.version!==input.expectedLeaseVersion+1) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT","Orphan lease release replay changed");
+        }
+        return {lease,carrier:{id:row.id,version:row.version},operationId,replayed:true};
+      }
+      if(lease.version!==input.expectedLeaseVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Orphan lease version changed");
+
+      const updatedAt=new Date(this.now()).toISOString();
+      const result=this.database.sqlite.prepare("update control_plane_resource_leases set terminal_state='released',version=version+1,updated_at=? where lease_id=? and owner_thread=? and version=? and terminal_state is null and active_operation_handle is null and operation_state is null")
+        .run(updatedAt,input.leaseId,row.id,input.expectedLeaseVersion);
+      if(result.changes!==1) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Orphan lease release raced");
+      const released=this.ownership.get(input.leaseId);
+      if(!released || released.terminalState!=="released" || released.version!==input.expectedLeaseVersion+1 ||
+         released.operationHandle!==undefined || released.operationState!==undefined) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Orphan lease release post-effect readback is incomplete");
+      }
+      return {lease:released,carrier:{id:row.id,version:row.version},operationId,replayed:false};
+    }).immediate();
+  }
+
+  /**
    * Host-local terminal hygiene for one successfully closed coordination-bound cutover
    * whose original root carrier has already been revoked. This can only destroy the
    * stale lease. It never revives carrier authority, transfers ownership, changes the

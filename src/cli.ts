@@ -439,6 +439,7 @@ function printHelp(): void {
       "  devspace models refresh  Refresh current provider model catalog and bump generation",
       "  devspace carrier inspect <pending-id>",
       "  devspace carrier show <carrier-id>",
+      "  devspace carrier release-expired-orphan <lease-id> --lease-version <version> --carrier <carrier-id> --carrier-version <version> --confirm <lease-id>",
       "  devspace carrier reauthorize <carrier-id> --validity-version <version> --until <ISO expiry>",
       "  devspace carrier approve <pending-id> --contract <file> --confirm <pending-id>",
       "  devspace carrier revoke <carrier-id> --version <version>",
@@ -1940,6 +1941,9 @@ function runCarrierCommand(args: string[]): void {
       }
       if(intent.schema!=="devspace.carrier_credential_rotation.v1" || intent.carrierId!==id || intent.expectedVersion!==expectedVersion || intent.expectedValidityVersion!==expectedValidityVersion || !/^[a-f0-9]{64}$/.test(intent.expectedCredentialHash) || !/^[A-Za-z0-9_-]{43}$/.test(intent.credential) || Object.keys(intent).sort().join(",")!=="carrierId,credential,expectedCredentialHash,expectedValidityVersion,expectedVersion,schema") throw new Error("Carrier credential intent file does not match the requested rotation");
       result={...bindings.rotateCredentialLocal(id,expectedVersion,expectedValidityVersion,intent.expectedCredentialHash,intent.credential),credentialFile:intentPath};
+    }
+    else if(action==="release-expired-orphan" && flags.length===8 && flags[0]==="--lease-version" && flags[2]==="--carrier" && flags[4]==="--carrier-version" && flags[6]==="--confirm" && flags[7]===id) {
+      result=bindings.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:id,expectedLeaseVersion:Number(flags[1]),carrierId:flags[3]!,expectedCarrierVersion:Number(flags[5]),confirmLeaseId:flags[7]!});
     }
     else if(action==="recover" && flags.length===8 && flags[0]==="--carrier" && flags[2]==="--version" && flags[4]==="--validity-version" && flags[6]==="--confirm" && flags[7]===flags[1]) {
       const carrierId=flags[1]!, expectedVersion=Number(flags[3]), expectedValidityVersion=Number(flags[5]);

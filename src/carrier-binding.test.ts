@@ -1725,6 +1725,85 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
 });
 
 
+test("owner-local orphan hygiene releases only expired revoked unpinned no-effect root leases", () => {
+  const f=fixture();
+  const make=(sessionId:string,{pin=false,witness=false,durable=false,child=false}:{pin?:boolean;witness?:boolean;durable?:boolean;child?:boolean}={})=>{
+    const resource=join(f.workspace,sessionId);mkdirSync(resource,{recursive:true});
+    const rootContext={clientId:"shared-oauth",sessionId:`${sessionId}-root`};
+    const rootPairing=f.store.requestPairing(rootContext);
+    const rootContract:CarrierContract={...f.contract,goal:`issue415-${sessionId}`,scope:[resource],operations:["worktree_write"],expiresAt:new Date(f.clock()+30000).toISOString()};
+    const root=f.store.approveLocal(rootPairing.pendingId,rootContract);f.store.redeem(rootContext,rootPairing.credential);
+    let context=rootContext,approved=root,contract=rootContract;
+    if(child){
+      const childContext={clientId:"shared-oauth",sessionId:`${sessionId}-child`};
+      const childPair=f.store.requestPairing(childContext);
+      const childContract:CarrierContract={...rootContract,role:"worker"};
+      approved=f.store.delegate(rootContext,childPair.pendingId,childContract);f.store.redeem(childContext,childPair.credential);
+      context=childContext;contract=childContract;
+    }
+    const subject={operationId:`orphan-${sessionId}`,requestHash:"a".repeat(64),workspaceRoot:resource,baseRevision:contract.baseRevision,operation:"worktree_write" as const};
+    const lease=f.store.prepareEffect(context,subject);
+    const current=pin?f.store.ownership.beginOperation(context,lease.leaseId,lease.version,subject.operationId):lease;
+    if(witness) f.db.sqlite.prepare("insert into dependency_terminal_witnesses(operation_id,request_hash,lease_id,exit_code,frozen_inputs_unchanged) values(?,?,?,?,?)").run(subject.operationId,subject.requestHash,lease.leaseId,0,1);
+    if(durable) {
+      const now=new Date(f.clock()).toISOString();
+      f.db.sqlite.prepare("insert into durable_operations(operation_id,attempt_key,request_hash,kind,authority_mode,scope_root,workspace_id,status,retry_safe,request_json,receipt_json,error_code,error_message,created_at,updated_at) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .run(subject.operationId,`attempt-${sessionId}`,subject.requestHash,"dependency_sync","OWNER_DIRECT",resource,null,"succeeded","false","{}",null,null,null,now,now);
+    }
+    if(child) f.store.revokeDelegation(rootContext,approved.id,approved.version); else f.store.revokeLocal(approved.id,approved.version);
+    return {context,rootContext,approved,lease:current,subject};
+  };
+  try {
+    const activeResource=join(f.workspace,"active");mkdirSync(activeResource,{recursive:true});
+    const activeContext={clientId:"shared-oauth",sessionId:"active-root"};
+    const activePair=f.store.requestPairing(activeContext);
+    const activeContract:CarrierContract={...f.contract,goal:"issue415-active",scope:[activeResource],operations:["worktree_write"],expiresAt:new Date(f.clock()+30000).toISOString()};
+    const active=f.store.approveLocal(activePair.pendingId,activeContract);f.store.redeem(activeContext,activePair.credential);
+    const activeSubject={operationId:"orphan-active",requestHash:"b".repeat(64),workspaceRoot:activeResource,baseRevision:activeContract.baseRevision,operation:"worktree_write" as const};
+    const activeLease=f.store.prepareEffect(activeContext,activeSubject);
+    assert.throws(()=>f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:activeLease.leaseId,expectedLeaseVersion:activeLease.version,carrierId:active.id,expectedCarrierVersion:2,confirmLeaseId:activeLease.leaseId}),/revoked/i);
+    f.store.revokeLocal(active.id,active.version);
+    assert.throws(()=>f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:activeLease.leaseId,expectedLeaseVersion:activeLease.version,carrierId:active.id,expectedCarrierVersion:2,confirmLeaseId:activeLease.leaseId}),/expired/i);
+
+    const success=make("success");f.advance(40000);
+    assert.throws(()=>f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:"lease_wrong",expectedLeaseVersion:success.lease.version,carrierId:success.approved.id,expectedCarrierVersion:2,confirmLeaseId:"lease_wrong"}));
+    assert.throws(()=>f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:success.lease.leaseId,expectedLeaseVersion:success.lease.version+1,carrierId:success.approved.id,expectedCarrierVersion:2,confirmLeaseId:success.lease.leaseId}),/version/i);
+    assert.throws(()=>f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:success.lease.leaseId,expectedLeaseVersion:success.lease.version,carrierId:active.id,expectedCarrierVersion:2,confirmLeaseId:success.lease.leaseId}),/binding|carrier/i);
+    const released=f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:success.lease.leaseId,expectedLeaseVersion:success.lease.version,carrierId:success.approved.id,expectedCarrierVersion:2,confirmLeaseId:success.lease.leaseId});
+    assert.equal(released.replayed,false);assert.equal(released.lease.terminalState,"released");assert.equal(released.lease.version,success.lease.version+1);
+    const replay=f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:success.lease.leaseId,expectedLeaseVersion:success.lease.version,carrierId:success.approved.id,expectedCarrierVersion:2,confirmLeaseId:success.lease.leaseId});
+    assert.equal(replay.replayed,true);assert.equal(replay.lease.version,released.lease.version);
+
+    const pinned=make("pinned",{pin:true});f.advance(40000);
+    assert.throws(()=>f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:pinned.lease.leaseId,expectedLeaseVersion:pinned.lease.version,carrierId:pinned.approved.id,expectedCarrierVersion:2,confirmLeaseId:pinned.lease.leaseId}),/pinned|operation/i);
+    const witnessed=make("witness",{witness:true});f.advance(40000);
+    assert.throws(()=>f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:witnessed.lease.leaseId,expectedLeaseVersion:witnessed.lease.version,carrierId:witnessed.approved.id,expectedCarrierVersion:2,confirmLeaseId:witnessed.lease.leaseId}),/effect|witness/i);
+    const child=make("child",{child:true});f.advance(40000);
+    assert.throws(()=>f.store.releaseExpiredRevokedUnpinnedLeaseLocal({leaseId:child.lease.leaseId,expectedLeaseVersion:child.lease.version,carrierId:child.approved.id,expectedCarrierVersion:2,confirmLeaseId:child.lease.leaseId}),/root carrier/i);
+  } finally {f.close();}
+});
+
+test("carrier CLI releases and idempotently replays one exact expired revoked orphan lease",()=>{
+  const f=fixture();try {
+    const resource=join(f.workspace,"cli-orphan");mkdirSync(resource,{recursive:true});
+    const context={clientId:"shared-oauth",sessionId:"cli-orphan-controller"};
+    const pairing=f.store.requestPairing(context);
+    const contract:CarrierContract={...f.contract,goal:"issue415-cli",scope:[resource],operations:["worktree_write"],expiresAt:new Date(f.clock()+60000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);f.store.redeem(context,pairing.credential);
+    const subject={operationId:"orphan-cli",requestHash:"c".repeat(64),workspaceRoot:resource,baseRevision:contract.baseRevision,operation:"worktree_write" as const};
+    const lease=f.store.prepareEffect(context,subject);f.store.revokeLocal(approved.id,approved.version);
+    f.db.sqlite.prepare("update control_plane_resource_leases set expires_at=? where lease_id=?").run(new Date(Date.now()-1000).toISOString(),lease.leaseId);
+    const cli=fileURLToPath(new URL("./cli.ts",import.meta.url));
+    const env={...process.env,DEVSPACE_CONFIG_DIR:join(f.root,"cli-config"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_ALLOWED_ROOTS:f.root,DEVSPACE_WORKTREE_ROOT:join(f.root,"cli-worktrees"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"};
+    const args=["--import","tsx",cli,"carrier","release-expired-orphan",lease.leaseId,"--lease-version",String(lease.version),"--carrier",approved.id,"--carrier-version","2","--confirm",lease.leaseId];
+    const first=JSON.parse(execFileSync(process.execPath,args,{env,encoding:"utf8"})) as {replayed:boolean;lease:{leaseId:string;version:number;terminalState?:string};operationId:string};
+    assert.equal(first.replayed,false);assert.equal(first.lease.leaseId,lease.leaseId);assert.equal(first.lease.version,lease.version+1);assert.equal(first.lease.terminalState,"released");assert.equal(first.operationId,subject.operationId);
+    const replay=JSON.parse(execFileSync(process.execPath,args,{env,encoding:"utf8"})) as typeof first;
+    assert.equal(replay.replayed,true);assert.equal(replay.lease.version,first.lease.version);
+    assert.throws(()=>execFileSync(process.execPath,[...args.slice(0,-1),"lease_wrong"],{env,stdio:"pipe"}));
+  } finally {f.close();}
+});
+
 test("terminal hygiene releases only the exact normally closed cutover lease after root carrier revocation", async () => {
   const f=fixture();
   let manager:DurableOperationManager|undefined;
