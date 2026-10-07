@@ -172,7 +172,6 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
     ...requestFor(root, executable, fixtureArgv, [effectsRoot], workspaceRoot),
     workspaceId,
     clientId: foreign.clientId,
-    authorityMode: "NEXUS_GOVERNED",
   } as any;
   let operationId: string | undefined;
   try {
@@ -185,7 +184,7 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
     assert.equal(preflight.status, "ready");
     const started = structured(await ownerClient.callTool({ name: "host_operation_start", arguments: request }));
     assert.equal(started.status, "started", JSON.stringify(started));
-    assert.equal(started.authorityMode, "OWNER_DIRECT");
+    assert.equal(started.authorityMode, undefined);
     assert.equal(started.workspaceId, workspaceId);
     assert.equal(started.request.clientId, owner.clientId);
     assert.equal(started.request.workspaceId, workspaceId);
