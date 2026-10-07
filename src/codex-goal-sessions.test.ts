@@ -367,8 +367,8 @@ test("codex mode compatibility: goal tools coexist with exec_command/write_stdin
   assert.equal(continueTool?.annotations?.destructiveHint, true);
   assert.equal(statusTool?.annotations?.readOnlyHint, true);
   assert.equal(cancelTool?.annotations?.destructiveHint, true);
-  assert.ok((continueTool?.outputSchema?.properties as Record<string, unknown> | undefined)?.coreMutation);
-  assert.ok((statusTool?.outputSchema?.properties as Record<string, unknown> | undefined)?.coreMutation);
+  assert.equal((continueTool?.outputSchema?.properties as Record<string, unknown> | undefined)?.coreMutation, undefined);
+  assert.equal((statusTool?.outputSchema?.properties as Record<string, unknown> | undefined)?.coreMutation, undefined);
 });
 
 // ── Start fences ─────────────────────────────────────────────────────────────
