@@ -468,6 +468,7 @@ function truncateOutput(output: string, maxCharacters: number): { output: string
 export class ProcessSessionManager {
   private readonly sessions = new Map<number, ProcessSession>();
   private readonly attemptKeyToSessionId = new Map<string, number>();
+  private readonly expiredAttemptKeys = new Set<string>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
   private nextSessionId = 1;
@@ -503,6 +504,11 @@ export class ProcessSessionManager {
           return this.getSnapshot(existing, normalizedInput.maxOutputTokens);
         }
       }
+      if (this.expiredAttemptKeys.has(attemptIndexKey)) {
+        throw new Error(
+          `ATTEMPT_REPLAY_EVIDENCE_EXPIRED: attemptKey '${input.attemptKey}' already completed in this server process; terminal evidence expired and the command will not be spawned again.`,
+        );
+      }
     }
 
     const session = this.createSession(normalizedInput);
@@ -529,7 +535,7 @@ export class ProcessSessionManager {
       if (normalizedInput.tty) await this.startPty(session, normalizedInput);
       else this.startPipe(session, normalizedInput);
     } catch (error) {
-      this.removeSession(session.id);
+      this.removeSession(session.id, false);
       throw error;
     }
 
@@ -597,6 +603,7 @@ export class ProcessSessionManager {
     }
     this.sessions.clear();
     this.attemptKeyToSessionId.clear();
+    this.expiredAttemptKeys.clear();
   }
 
   private canonicalWorkspaceRoot(workspaceRoot: string | undefined): string | undefined {
@@ -654,9 +661,15 @@ export class ProcessSessionManager {
     }
     if (attemptKey !== undefined) {
       const canonicalRoot = this.canonicalWorkspaceRoot(workspaceRoot);
-      const id = this.attemptKeyToSessionId.get(this.attemptIndexKey(workspaceId, canonicalRoot, attemptKey));
+      const attemptIndexKey = this.attemptIndexKey(workspaceId, canonicalRoot, attemptKey);
+      const id = this.attemptKeyToSessionId.get(attemptIndexKey);
       if (id !== undefined) {
         return this.getOwnedSession(workspaceId, id, canonicalRoot);
+      }
+      if (this.expiredAttemptKeys.has(attemptIndexKey)) {
+        throw new Error(
+          `ATTEMPT_REPLAY_EVIDENCE_EXPIRED: attemptKey '${attemptKey}' already completed in this server process; terminal evidence expired and the attempt remains consumed.`,
+        );
       }
       throw new Error(`Unknown process attemptKey '${attemptKey}' in workspace ${workspaceId}.`);
     }
@@ -922,13 +935,17 @@ export class ProcessSessionManager {
     return session;
   }
 
-  private removeSession(sessionId: number): void {
+  private removeSession(sessionId: number, preserveAttemptTombstone = true): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     if (session.executionTimer) clearTimeout(session.executionTimer);
     if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
     if (session.attemptKey) {
-      this.attemptKeyToSessionId.delete(this.attemptIndexKey(session.workspaceId, session.workspaceRoot, session.attemptKey));
+      const attemptIndexKey = this.attemptIndexKey(session.workspaceId, session.workspaceRoot, session.attemptKey);
+      this.attemptKeyToSessionId.delete(attemptIndexKey);
+      if (preserveAttemptTombstone && !session.running) {
+        this.expiredAttemptKeys.add(attemptIndexKey);
+      }
     }
     this.sessions.delete(sessionId);
   }

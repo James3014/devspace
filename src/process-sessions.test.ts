@@ -292,6 +292,45 @@ await assert.rejects(
 );
 reconnectManager.shutdown();
 
+// Completed output may expire, but the attempt identity remains consumed for
+// the lifetime of the server process so delayed transport replay cannot spawn
+// a duplicate effect.
+const expiredReplayManager = new ProcessSessionManager({ completedSessionTtlMs: 25 });
+const expiredReplayRoot = process.cwd();
+const expiredReplayInput = {
+  workspaceId: "ws_expired_replay",
+  workspaceRoot: expiredReplayRoot,
+  cwd: expiredReplayRoot,
+  command: "echo expired_replay_once",
+  attemptKey: "g5:expired-replay:001",
+  yieldTimeMs: 2_000,
+};
+const expiredReplayFirst = await expiredReplayManager.start(expiredReplayInput);
+assert.equal(expiredReplayFirst.exitCode, 0);
+await new Promise((resolve) => setTimeout(resolve, 75));
+await assert.rejects(
+  expiredReplayManager.getStatus({
+    workspaceId: "ws_expired_replay",
+    workspaceRoot: expiredReplayRoot,
+    attemptKey: "g5:expired-replay:001",
+  }),
+  /ATTEMPT_REPLAY_EVIDENCE_EXPIRED/,
+);
+await assert.rejects(
+  expiredReplayManager.start(expiredReplayInput),
+  /ATTEMPT_REPLAY_EVIDENCE_EXPIRED/,
+  "an expired completed attempt must fail closed instead of spawning a duplicate command",
+);
+await assert.rejects(
+  expiredReplayManager.start({
+    ...expiredReplayInput,
+    command: "echo materially_different_after_expiry",
+  }),
+  /ATTEMPT_REPLAY_EVIDENCE_EXPIRED/,
+  "once terminal evidence expires, the consumed attemptKey cannot be reinterpreted as a new command",
+);
+expiredReplayManager.shutdown();
+
 // Root and attempt-key delimiters must not create ambiguous replay identities.
 const collisionBase = mkdtempSync("/tmp/devspace-g5-collision-");
 const collisionRootA = join(collisionBase, "a");
