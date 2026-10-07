@@ -1394,6 +1394,133 @@ export class CarrierBindingStore {
   }
 
   /**
+   * Host-local hygiene for one revoked, expired, prepare-only cutover carrier whose
+   * resource lease was acquired but whose durable cutover_start effect never existed.
+   * This cannot revive carrier authority, start work, reconcile a pinned effect, or
+   * change the approved target. It only releases the exact idle stale lease and writes
+   * one durable cleanup receipt.
+   */
+  releaseRevokedIdleCutoverLeaseLocal(input: {
+    leaseId: string;
+    expectedLeaseVersion: number;
+    carrierId: string;
+    expectedCarrierVersion: number;
+    expectedValidityVersion: number;
+    expectedOperationId: string;
+    confirmLeaseId: string;
+  }) {
+    if(input.confirmLeaseId!==input.leaseId) deny("Idle lease cleanup confirmation must equal the exact lease id");
+    if(!Number.isSafeInteger(input.expectedLeaseVersion) || input.expectedLeaseVersion<1 ||
+       !Number.isSafeInteger(input.expectedCarrierVersion) || input.expectedCarrierVersion<2 ||
+       !Number.isSafeInteger(input.expectedValidityVersion) || input.expectedValidityVersion<1 ||
+       !/^op_[a-f0-9]{16}$/.test(input.expectedOperationId)) {
+      throw new ControlPlaneOwnershipError("CAS_CONFLICT","Idle lease cleanup identity is invalid");
+    }
+
+    return this.database.sqlite.transaction(()=>{
+      const replay=this.database.sqlite.prepare("select receipt_json from carrier_idle_lease_cleanup_receipts where lease_id=?").get(input.leaseId) as {receipt_json:string}|undefined;
+      if(replay) {
+        let receipt: {schema?:unknown;leaseId?:unknown;previousVersion?:unknown;newVersion?:unknown;carrierId?:unknown;carrierVersion?:unknown;validityVersion?:unknown;operationId?:unknown;resource?:unknown;baseRevision?:unknown;evidence?:unknown;createdAt?:unknown};
+        try { receipt=JSON.parse(replay.receipt_json); } catch { throw new ControlPlaneOwnershipError("MALFORMED","Idle lease cleanup receipt is malformed"); }
+        if(receipt.schema!=="devspace.carrier_idle_lease_cleanup.v1" || receipt.leaseId!==input.leaseId ||
+           receipt.previousVersion!==input.expectedLeaseVersion || receipt.newVersion!==input.expectedLeaseVersion+1 ||
+           receipt.carrierId!==input.carrierId || receipt.carrierVersion!==input.expectedCarrierVersion ||
+           receipt.validityVersion!==input.expectedValidityVersion || receipt.operationId!==input.expectedOperationId ||
+           typeof receipt.resource!=="string" || typeof receipt.baseRevision!=="string" ||
+           typeof receipt.createdAt!=="string" || !Number.isFinite(Date.parse(receipt.createdAt))) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT","Idle lease cleanup replay changed");
+        }
+        const lease=this.ownership.get(input.leaseId);
+        if(!lease || lease.terminalState!=="released" || lease.version!==input.expectedLeaseVersion+1 ||
+           lease.ownerThread!==input.carrierId || lease.operation!=="cutover_start" ||
+           lease.resource!==receipt.resource || lease.baseRevision!==receipt.baseRevision ||
+           lease.operationHandle!==undefined || lease.operationState!==undefined) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT","Idle lease cleanup replay lease changed");
+        }
+        return {lease,receipt,replayed:true};
+      }
+
+      const row=this.database.sqlite.prepare("select * from carrier_bindings where id=?").get(input.carrierId) as BindingRow|undefined;
+      if(!row || row.revoked!==1 || row.version!==input.expectedCarrierVersion || row.parent_id) {
+        deny("Idle lease cleanup requires the exact revoked root carrier");
+      }
+      const validity=this.readValidity(input.carrierId);
+      if(validity.version!==input.expectedValidityVersion || Date.parse(validity.expires_at)>this.now()) {
+        deny("Idle lease cleanup requires the exact expired carrier validity");
+      }
+      const contract=this.validateContract(JSON.parse(row.contract_json) as CarrierContract,false);
+      if(JSON.stringify(contract)!==row.contract_json || contract.role!=="controller" ||
+         contract.operations.length!==1 || contract.operations[0]!=="cutover_start" || !contract.cutover ||
+         Date.parse(contract.expiresAt)>this.now() || Date.parse(contract.cutover.expiresAt)>this.now()) {
+        deny("Idle lease cleanup requires canonical expired root cutover authority");
+      }
+      const approved=contract.cutover;
+      if(physical(approved.stateRoot)!==physical(this.stateDir)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Idle lease cleanup state root changed");
+      }
+      const plan=planCutoverStart(this.stateDir,approved);
+      if(plan.operationId!==input.expectedOperationId) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Idle lease cleanup operation identity changed");
+      }
+      const effect=this.database.sqlite.prepare("select subject_json,lease_id from carrier_effect_bindings where binding_id=? and operation_id=?").get(row.id,plan.operationId) as {subject_json:string;lease_id:string}|undefined;
+      if(!effect || effect.lease_id!==input.leaseId || effect.subject_json!==subjectJson(plan.subject)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Idle lease cleanup effect binding changed");
+      }
+      const durable=this.database.sqlite.prepare("select operation_id from durable_operations where operation_id=?").get(plan.operationId) as {operation_id:string}|undefined;
+      const terminal=this.database.sqlite.prepare("select operation_id from dependency_terminal_witnesses where operation_id=?").get(plan.operationId) as {operation_id:string}|undefined;
+      if(durable || terminal) deny("Idle lease cleanup refuses any durable or terminal effect evidence");
+      const currentCutover=new CutoverStateStore(this.stateDir,{now:this.now}).get();
+      if(currentCutover?.coordinationBinding &&
+         (currentCutover.coordinationBinding.leaseId===input.leaseId || currentCutover.coordinationBinding.operationHandle===plan.operationId)) {
+        deny("Idle lease cleanup refuses a lease referenced by durable cutover state");
+      }
+
+      const grant:GrantEvidenceReference={repository:contract.repository,goal:contract.goal,coordinatorThread:row.id,evidenceHash:digest(row.contract_json)};
+      const localContext=Object.freeze({});
+      const localOwnership=new ControlPlaneOwnershipStore(this.database.sqlite,{
+        now:this.now,
+        resolveOwnerContext: context=>context===localContext?{ownerThread:row.id}:undefined,
+        verifyGrantEvidence: (candidate,owner)=>owner.ownerThread===row.id && isDeepStrictEqual(candidate,grant),
+      });
+      const lease=localOwnership.get(input.leaseId);
+      if(!lease || lease.ownerThread!==row.id || lease.version!==input.expectedLeaseVersion || lease.terminalState!==undefined ||
+         lease.operation!=="cutover_start" || lease.baseRevision!==contract.baseRevision ||
+         lease.resource!==physical(this.stateDir) || lease.scope.length!==1 || lease.scope[0]!==physical(this.stateDir) ||
+         lease.operationHandle!==undefined || lease.operationState!==undefined || Date.parse(lease.expiresAt)>this.now()) {
+        deny("Idle lease cleanup requires the exact expired unpinned prepare-only lease");
+      }
+      const released=localOwnership.release(localContext,input.leaseId,input.expectedLeaseVersion);
+      if(released.terminalState!=="released" || released.version!==input.expectedLeaseVersion+1 ||
+         released.operationHandle!==undefined || released.operationState!==undefined) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Idle lease cleanup release readback changed");
+      }
+      const createdAt=new Date(this.now()).toISOString();
+      const receipt={
+        schema:"devspace.carrier_idle_lease_cleanup.v1" as const,
+        receiptId:`idle_cleanup_${randomUUID()}`,
+        leaseId:released.leaseId,
+        previousVersion:input.expectedLeaseVersion,
+        newVersion:released.version,
+        carrierId:row.id,
+        carrierVersion:row.version,
+        validityVersion:validity.version,
+        operationId:plan.operationId,
+        resource:released.resource,
+        baseRevision:released.baseRevision,
+        evidence:{carrierRevoked:true,carrierExpired:true,leaseExpired:true,operationHandleAbsent:true,durableOperationAbsent:true,terminalWitnessAbsent:true},
+        createdAt,
+      };
+      this.database.sqlite.prepare("insert into carrier_idle_lease_cleanup_receipts(lease_id,receipt_id,receipt_json,created_at) values(?,?,?,?)")
+        .run(released.leaseId,receipt.receiptId,JSON.stringify(receipt),createdAt);
+      const stored=this.database.sqlite.prepare("select receipt_json from carrier_idle_lease_cleanup_receipts where lease_id=?").get(released.leaseId) as {receipt_json:string}|undefined;
+      if(!stored || stored.receipt_json!==JSON.stringify(receipt) || !isDeepStrictEqual(this.ownership.get(released.leaseId),released)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Idle lease cleanup durable receipt readback changed");
+      }
+      return {lease:released,receipt,replayed:false};
+    }).immediate();
+  }
+
+  /**
    * Host-local terminal hygiene for one successfully closed coordination-bound cutover
    * whose original root carrier has already been revoked. This can only destroy the
    * stale lease. It never revives carrier authority, transfers ownership, changes the

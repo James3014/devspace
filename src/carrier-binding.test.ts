@@ -2268,3 +2268,46 @@ test("NAB-E2 Issue #287: 12 Mandatory Hostile Controls for recursive multi-hop d
     f.close();
   }
 });
+
+
+test("revoked expired prepare-only cutover lease cleanup requires exact no-effect evidence and is idempotent", () => {
+  const f=fixture();
+  try {
+    const context={clientId:"shared-oauth",sessionId:"idle-cleanup"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={
+      stateRoot:f.root,
+      attemptKey:"idle-cutover-canary",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expiresAt:new Date(f.clock()+30_000).toISOString(),
+      restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"prepare-only canary"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_idle",agentId:"agt_idle"},
+    };
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+60_000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const lease=f.store.prepareEffect(context,plan.subject);
+    assert.equal(f.db.sqlite.prepare("select operation_id from durable_operations where operation_id=?").get(plan.operationId),undefined);
+    assert.equal(new CutoverStateStore(f.root).get(),undefined);
+    assert.deepEqual(f.store.revokeLocal(approved.id,approved.version),{id:approved.id,version:2,revoked:true});
+    f.advance(120_000);
+    const input={leaseId:lease.leaseId,expectedLeaseVersion:lease.version,carrierId:approved.id,expectedCarrierVersion:2,expectedValidityVersion:1,expectedOperationId:plan.operationId,confirmLeaseId:lease.leaseId};
+    assert.throws(()=>f.store.releaseRevokedIdleCutoverLeaseLocal({...input,expectedOperationId:"op_0000000000000000"}),/operation identity changed/);
+    assert.throws(()=>f.store.releaseRevokedIdleCutoverLeaseLocal({...input,expectedLeaseVersion:lease.version+1}),/exact expired unpinned prepare-only lease/);
+    const result=f.store.releaseRevokedIdleCutoverLeaseLocal(input);
+    assert.equal(result.replayed,false);
+    assert.equal(result.lease.terminalState,"released");
+    assert.equal(result.lease.version,lease.version+1);
+    assert.equal(result.receipt.schema,"devspace.carrier_idle_lease_cleanup.v1");
+    assert.equal(result.receipt.operationId,plan.operationId);
+    assert.deepEqual(result.receipt.evidence,{carrierRevoked:true,carrierExpired:true,leaseExpired:true,operationHandleAbsent:true,durableOperationAbsent:true,terminalWitnessAbsent:true});
+    assert.equal((f.db.sqlite.prepare("select count(*) count from carrier_idle_lease_cleanup_receipts where lease_id=?").get(lease.leaseId) as {count:number}).count,1);
+    assert.equal(new CutoverStateStore(f.root).get(),undefined);
+    const replay=f.store.releaseRevokedIdleCutoverLeaseLocal(input);
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.receipt,result.receipt);
+    assert.deepEqual(replay.lease,result.lease);
+  } finally {f.close();}
+});
