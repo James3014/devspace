@@ -147,9 +147,7 @@ test("Issue #133: MultiRoleConvergence evaluates 7677 (dev2) and 7678 (dev-c) di
         manifestSha256: "manifest-latest",
         capabilities: [
           "agent_start.tool",
-          "agent_start.executionContract.authorityMode",
           "agent_start.executionContract.idleTimeoutMs",
-          "agent_start.executionContract.nexusGrant",
           "agent_start.executionContract.authorizedToolCeiling",
           "agent_start.executionContract.toolProjectionManifest",
         ],
@@ -174,9 +172,7 @@ test("Issue #133: MultiRoleConvergence evaluates 7677 (dev2) and 7678 (dev-c) di
         manifestSha256: "manifest-older",
         capabilities: [
           "agent_start.tool",
-          "agent_start.executionContract.authorityMode",
           "agent_start.executionContract.idleTimeoutMs",
-          "agent_start.executionContract.nexusGrant",
           "agent_start.executionContract.authorizedToolCeiling",
           "agent_start.executionContract.toolProjectionManifest",
         ],
