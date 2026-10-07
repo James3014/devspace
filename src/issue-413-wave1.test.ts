@@ -31,23 +31,39 @@ async function setupTestEnv(t: TestContext): Promise<TestEnv> {
   const stateDir = join(tempDir, "state");
   const worktreeRoot = join(tempDir, "worktrees");
   const agentDir = join(tempDir, "agents");
+  const configDir = join(tempDir, "config");
+  const globalProfileDir = join(configDir, "agents");
 
   await mkdir(allowedRoot, { recursive: true });
   await mkdir(stateDir, { recursive: true });
   await mkdir(worktreeRoot, { recursive: true });
   await mkdir(agentDir, { recursive: true });
+  await mkdir(globalProfileDir, { recursive: true });
+  await writeFile(
+    join(globalProfileDir, "mutator.md"),
+    "---\nname: mutator\ndescription: Wave 1 test mutator\nprovider: codex\nwrite_mode: allowed\n---\nBounded test worker\n",
+  );
 
   const closers: Array<() => Promise<void>> = [];
 
   const createClient = async (toolMode: "minimal" | "dispatch" | "codex" | "full" = "full", subagents = true) => {
-    const config = loadConfig({
+    const loadedConfig = loadConfig({
+      DEVSPACE_CONFIG_DIR: configDir,
       DEVSPACE_ALLOWED_ROOTS: allowedRoot,
       DEVSPACE_WORKTREE_ROOT: worktreeRoot,
       DEVSPACE_STATE_DIR: stateDir,
       DEVSPACE_AGENT_DIR: agentDir,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       DEVSPACE_TOOL_MODE: toolMode,
       DEVSPACE_CODEX_GOALS: toolMode === "codex" ? "1" : undefined,
     });
+    const config: ServerConfig = {
+      ...loadedConfig,
+      subagents: {
+        enabled: subagents,
+        providers: subagents ? [{ id: "codex", enabled: true }] : [],
+      },
+    };
 
     const store = new SqliteWorkspaceStore(stateDir);
     const workspaces = new WorkspaceRegistry(config, store);
@@ -237,14 +253,8 @@ test("Test 3: Agent attemptKey replay is idempotent for identical requests and f
   await mkdir(join(repo, ".nexus-core"), { recursive: true });
   await writeFile(join(repo, ".nexus-core", "config.toml"), "schema_version = 1\n");
 
-  // Add mutator agent profile
-  await mkdir(join(repo, ".devspace", "agents"), { recursive: true });
-  await writeFile(
-    join(repo, ".devspace", "agents", "mutator.md"),
-    "---\nname: mutator\ndescription: test mutator\nprovider: codex\n---\nPrompt mutator\n",
-  );
-  execFileSync("git", ["add", "."], { cwd: repo });
-  execFileSync("git", ["commit", "-m", "add mutator profile"], { cwd: repo });
+  execFileSync("git", ["add", ".nexus-core/config.toml"], { cwd: repo });
+  execFileSync("git", ["commit", "-m", "enroll nexus fixture"], { cwd: repo });
   const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo }).toString().trim();
 
   const openRes = await client.callTool({ name: "open_workspace", arguments: { path: repo, mode: "worktree" } });
@@ -292,13 +302,6 @@ test("Test 4: Lost ACK recovery via agent_status/agent_reconcile preserves attem
   const remote = join(env.tempDir, "remote-ack.git");
   initGitRepo(repo, remote);
 
-  await mkdir(join(repo, ".devspace", "agents"), { recursive: true });
-  await writeFile(
-    join(repo, ".devspace", "agents", "mutator.md"),
-    "---\nname: mutator\ndescription: test mutator\nprovider: codex\n---\nPrompt mutator\n",
-  );
-  execFileSync("git", ["add", "."], { cwd: repo });
-  execFileSync("git", ["commit", "-m", "add mutator profile"], { cwd: repo });
   const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo }).toString().trim();
 
   const openRes = await client.callTool({ name: "open_workspace", arguments: { path: repo, mode: "worktree" } });
@@ -425,13 +428,6 @@ test("Test 7: Worker write scope (writePaths) is enforced for direct workers", a
   const remote = join(env.tempDir, "remote-scope.git");
   initGitRepo(repo, remote);
 
-  await mkdir(join(repo, ".devspace", "agents"), { recursive: true });
-  await writeFile(
-    join(repo, ".devspace", "agents", "mutator.md"),
-    "---\nname: mutator\ndescription: test mutator\nprovider: codex\nwrite_mode: allowed\n---\nPrompt mutator\n",
-  );
-  execFileSync("git", ["add", "."], { cwd: repo });
-  execFileSync("git", ["commit", "-m", "add mutator profile"], { cwd: repo });
   const headSha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo }).toString().trim();
 
   const openRes = await client.callTool({ name: "open_workspace", arguments: { path: repo, mode: "worktree" } });
