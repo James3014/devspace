@@ -46,7 +46,6 @@ const executableDownloadHooks: Pick<ArtifactDownloadInput, "testHooks"> =
 try {
   testOneToolContract();
   testPlatformSupportContract();
-  await testCoreAdmissionPrecedesAdapterOpen(join(root, "core-admission"));
   if (!isArtifactDownloadSupportedPlatform()) {
     await testUnsupportedPlatform(join(root, "unsupported-platform"));
   }
@@ -92,7 +91,7 @@ function testOneToolContract(): void {
   assert.ok(descriptor);
   assert.deepEqual(descriptor._meta, { "openai/fileParams": ["file"] });
   assert.deepEqual(Object.keys(descriptor.inputSchema as object).sort(), ["file", "path", "workspaceId"]);
-  assert.deepEqual(Object.keys(descriptor.outputSchema as object).sort(), ["coreMutation", "path"]);
+  assert.deepEqual(Object.keys(descriptor.outputSchema as object).sort(), ["path"]);
   assert.equal((descriptor.annotations as { destructiveHint?: boolean }).destructiveHint, false);
 
   const fileSchema = (descriptor.inputSchema as z.ZodRawShape).file as z.ZodType;
@@ -114,54 +113,7 @@ function testOneToolContract(): void {
   assert.equal(JSON.stringify(rejected).includes(sensitiveExtraValue), false);
 }
 
-async function testCoreAdmissionPrecedesAdapterOpen(testRoot: string): Promise<void> {
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateDir = join(testRoot, "state");
-  await mkdir(workspaceRoot, { recursive: true });
-  let adapterOpenCount = 0;
-  let admittedPaths: readonly string[] | undefined;
-  let callback: ((input: Record<string, unknown>, extra: Record<string, unknown>) => Promise<unknown>) | undefined;
-  const server = {
-    registerTool(
-      _name: string,
-      _descriptor: Record<string, unknown>,
-      handler: (input: Record<string, unknown>, extra: Record<string, unknown>) => Promise<unknown>,
-    ) {
-      callback = handler;
-      return {};
-    },
-  };
-  const adapter: IncomingArtifactAdapter = {
-    id: "counting-adapter",
-    canHandle: () => true,
-    async open() {
-      adapterOpenCount += 1;
-      return { name: "blocked.txt", stream: Readable.from(["must not open"]) };
-    },
-  };
-  registerArtifactTools(server as never, {
-    config: { stateDir, artifactMaxFileBytes: 1024, logging: { toolCalls: false } } as never,
-    workspaces: {
-      getWorkspace: () => ({ id: "ws_unbound_artifact", root: workspaceRoot }),
-    } as never,
-    incomingArtifactAdapters: [adapter],
-    coreMutation: {
-      admit: async (request: { paths: readonly string[] }) => {
-        admittedPaths = request.paths;
-        throw new Error("[CORE_BOUND_SESSION_REQUIRED] binding required before download");
-      },
-    } as never,
-  });
-  assert.ok(callback);
-  await assert.rejects(
-    callback!({ workspaceId: "ws_unbound_artifact", file: { native: true }, path: "nested/./blocked.txt" }, {}),
-    /CORE_BOUND_SESSION_REQUIRED/,
-  );
-  assert.deepEqual(admittedPaths, ["nested/blocked.txt"]);
-  assert.equal(adapterOpenCount, 0, "unbound download must not open the source adapter");
-  assert.deepEqual(await readdir(workspaceRoot), [], "unbound download must not create destination bytes");
-  await assert.rejects(stat(stateDir), { code: "ENOENT" });
-}
+
 
 function downloadForTest(
   input: Omit<ArtifactDownloadInput, "testHooks">,

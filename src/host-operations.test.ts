@@ -79,7 +79,7 @@ test("host operation kills a TERM-resistant child at its deadline and reports fa
 });
 
 test("host operation enforces absolute wall time despite continuous stdout activity", macOnly, async () => {
-  const h = await harness("activity", { maxWallMs: 300, maxIdleMs: 80 });
+  const h = await harness("activity", { maxWallMs: 300, maxIdleMs: 150 });
   try { const startedAt = Date.now(); const started = await h.registrar.start(h.request, "owner-client"); assert.equal(started.status, "started"); const finished = await waitForStatus(h.registrar, started.operationId, "failed"); assert.equal(finished.status, "failed"); assert.equal(finished.errorCode, "TIMEOUT"); assert.ok(Date.now() - startedAt >= 250); } finally { await h.dispose(); }
 });
 

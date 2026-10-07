@@ -9,7 +9,6 @@ import {
   WorkResumeStore,
 } from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
-import { enforceNexusWriterAdmission } from "./nexus-mutation-admission.js";
 import { readFileSync } from "node:fs";
 import { access, lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -123,8 +122,6 @@ import {
   DurableOperationManager,
   planCutoverStart,
   DurableOperationError,
-  NEXUS_GATEWAY_RECOVERY_SCHEMA,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
   type DurableOperationRecord,
 } from "./durable-operations.js";
 import { ChatSwarmMigrationCoordinator, chatSwarmMigrationOperationId } from "./chat-swarm-migration.js";
@@ -148,25 +145,7 @@ import { ChatSwarmRuntimeStore } from "./chat-swarm-runtime.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
-import {
-  CoreMutationSessionStore,
-  type CoreMutationAdmission,
-  type CoreMutationPhysicalSnapshot,
-  type CoreMutationSessionRecord,
-} from "./core-mutation-session.js";
-import {
-  coreMutationAdmissionOutput,
-  coreMutationCandidateOutput,
-  CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
-  createCoreMutationGuard,
-  registerCoreMutationSessionTools,
-  type CoreMutationGuard,
-} from "./core-mutation-tools.js";
-import {
-  CoreCandidateAcquisitionObservationStore,
-  orchestrateCoreCandidateAcquisition,
-  validateCoreRuntimeConfigSync,
-} from "./core-candidate-acquisition.js";
+
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
   summarizeLocalAgentProfile,
@@ -234,13 +213,7 @@ import {
   TOOL_PROJECTION_MANIFEST_SCHEMA,
 } from "./execution-protocol.js";
 import { LOCAL_EFFECT_PROJECTION_SCHEMA } from "./local-effect-enforcement.js";
-import {
-  CAPABILITY_DISCOVERY_INDEX_PATH,
-  CAPABILITY_DISCOVERY_RECEIPT_SCHEMA,
-  NEXUS_CAPABILITY_REPOSITORY,
-  renderCapabilityDiscoveryForWorker,
-  verifyCapabilityDiscoveryReceipt,
-} from "./capability-discovery.js";
+
 import { runToolchainVerifier, resolveToolchainExecutable, listToolchainCatalog } from "./local-agent-toolchains.js";
 import {
   runRepositoryIntelligenceOperation,
@@ -475,7 +448,6 @@ const DIRECT_DISPATCH_TOOL_NAMES = new Set<string>([
   toolNames.openWorkspace,
   toolNames.read,
   "git_fetch_ref",
-  "work_resume_prepare",
   "agent_catalog",
   "agent_preflight",
   "agent_start",
@@ -509,7 +481,7 @@ function serverInstructions(config: ServerConfig): string {
   const directCodingMode = config.toolMode === "minimal";
   const directDispatchMode = config.toolMode === "dispatch";
   if (directDispatchMode) {
-    return "Use DevSpace only for direct worker dispatch. Call open_workspace once for the project checkout or isolated worktree, then reuse its workspaceId. If open_workspace reports GIT_BASE_REF_NOT_LOCAL, call git_fetch_ref explicitly from the checkout workspace and retry the worktree with the returned localRef. Use read only for bounded instruction or result inspection. Use agent_catalog when exact provider/model catalog membership matters, then agent_preflight before launch. For a write-capable worker in an enrolled repository, call work_resume_prepare first and pass its resumableWork pointer to agent_start with the exact same attemptKey in effectHandle. Start exactly one worker with agent_start using a stable attemptKey and authorityMode OWNER_DIRECT. For write-capable work, provide expectedHead when known, bounded writePaths, and maxFiles. Poll the same agent with agent_status. Use agent_continue only for one evidence-guided follow-up on that same agentId. After a timeout, disconnect, or ambiguous response, query the same agentId and use agent_reconcile; never redispatch the logical task under a new attemptKey until the original effect is reconciled. Use agent_list to recover durable sessions and agent_cancel only for the exact worker that must be stopped. This surface grants no acceptance, merge, release, or production authority.";
+    return "Use DevSpace only for direct worker dispatch. Call open_workspace once for the project checkout or isolated worktree, then reuse its workspaceId. If open_workspace reports GIT_BASE_REF_NOT_LOCAL, call git_fetch_ref explicitly from the checkout workspace and retry the worktree with the returned localRef. Use read only for bounded instruction or result inspection. Use agent_catalog when exact provider/model catalog membership matters, then agent_preflight before launch. Start exactly one worker with agent_start using a stable attemptKey. For write-capable work, provide expectedHead when known, bounded writePaths, and maxFiles. Poll the same agent with agent_status. Use agent_continue only for one evidence-guided follow-up on that same agentId. After a timeout, disconnect, or ambiguous response, query the same agentId and use agent_reconcile; never redispatch the logical task under a new attemptKey until the original effect is reconciled. Use agent_list to recover durable sessions and agent_cancel only for the exact worker that must be stopped. This surface grants no acceptance, merge, release, or production authority.";
   }
   const artifactInstruction = !directCodingMode && config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
     ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
@@ -1031,7 +1003,6 @@ function processOutputSchema(): z.ZodRawShape {
     processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
     wallTimeMs: z.number().nonnegative(),
     outputTruncated: z.boolean(),
-    coreMutation: z.record(z.string(), z.unknown()).optional(),
   });
 }
 
@@ -1040,7 +1011,6 @@ function processToolResponse(
   workspaceId: string,
   snapshot: ProcessSnapshot,
   summary: Record<string, unknown>,
-  coreMutation?: CoreMutationAdmission,
 ) {
   const result = processResult(snapshot);
   const content = [textBlock(result)];
@@ -1071,53 +1041,8 @@ function processToolResponse(
       processTreeState: snapshot.processTreeState,
       wallTimeMs: snapshot.wallTimeMs,
       outputTruncated: snapshot.outputTruncated,
-      ...(coreMutation?.bound ? { coreMutation: coreMutationAdmissionOutput(coreMutation) } : {}),
     },
   };
-}
-
-async function assertCoreProcessCompletion(
-  coreMutation: CoreMutationGuard | undefined,
-  workspaceId: string,
-  extra: Parameters<CoreMutationGuard["require"]>[0]["extra"],
-  snapshot: ProcessSnapshot,
-): Promise<void> {
-  if (!coreMutation || snapshot.running || !snapshot.coreMutation) return;
-  const pointer = { required: true, ...snapshot.coreMutation } as const;
-  coreMutation.require({ workspaceId, extra, pointer });
-  const physical = await coreMutation.snapshot({ workspaceId, extra, pointer });
-  if (physical.scopeEscapePaths.length > 0) {
-    throw new Error(
-      `[CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE] PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN: shell changed paths outside AcceptanceContract: ${physical.scopeEscapePaths.join(", ")}. No trusted completion claim is available.`,
-    );
-  }
-  if (physical.deletionViolation) {
-    throw new Error(
-      `[CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN] PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN: shell deleted paths forbidden by AcceptanceContract: ${physical.deletedPaths.join(", ")}. No trusted completion claim is available.`,
-    );
-  }
-}
-
-async function assertCoreGoalCompletion(
-  coreMutation: CoreMutationGuard | undefined,
-  workspaceId: string,
-  extra: Parameters<CoreMutationGuard["require"]>[0]["extra"],
-  state: CodexGoalState,
-): Promise<void> {
-  if (!coreMutation || !state.terminal || !state.coreMutation) return;
-  const pointer = { required: true, ...state.coreMutation } as const;
-  coreMutation.require({ workspaceId, extra, pointer });
-  const physical = await coreMutation.snapshot({ workspaceId, extra, pointer });
-  if (physical.scopeEscapePaths.length > 0) {
-    throw new Error(
-      `[CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE] PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN: Codex goal changed paths outside AcceptanceContract: ${physical.scopeEscapePaths.join(", ")}. No trusted completion claim is available.`,
-    );
-  }
-  if (physical.deletionViolation) {
-    throw new Error(
-      `[CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN] PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN: Codex goal deleted paths forbidden by AcceptanceContract: ${physical.deletedPaths.join(", ")}. No trusted completion claim is available.`,
-    );
-  }
 }
 
 function registerCodexProcessTools(
@@ -1125,7 +1050,6 @@ function registerCodexProcessTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
-  coreMutation?: CoreMutationGuard,
   workResumeStore?: WorkResumeStore,
   carrierBindings?: CarrierBindingStore,
 ): void {
@@ -1189,18 +1113,6 @@ function registerCodexProcessTools(
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
-      if (mutationCapable) {
-        enforceNexusWriterAdmission({
-          workspaceRoot: workspace.root,
-          pointer: p0Pointer,
-          store: workResumeStore,
-          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-          operation: "exec_command",
-        });
-      }
-      const coreAdmission = mutationCapable && coreMutation
-        ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
-        : undefined;
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
       const snapshot = await processSessions.start({
         workspaceId,
@@ -1214,11 +1126,7 @@ function registerCodexProcessTools(
         maxOutputTokens,
         attemptKey,
         timeoutSeconds: timeout,
-        ...(coreAdmission?.bound
-          ? { coreMutation: { sessionId: coreAdmission.sessionId!, bindingHash: coreAdmission.bindingHash! } }
-          : {}),
       });
-      await assertCoreProcessCompletion(coreMutation, workspaceId, extra, snapshot);
 
       logToolCall(config, {
         tool: "exec_command",
@@ -1236,7 +1144,7 @@ function registerCodexProcessTools(
         running: snapshot.running,
         exitCode: snapshot.exitCode,
         wallTimeMs: snapshot.wallTimeMs,
-      }, coreAdmission);
+      });
     },
   );
 
@@ -1272,26 +1180,9 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }, extra) => {
+    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       workspaces.getWorkspace(workspaceId);
-      let coreAdmission: CoreMutationAdmission | undefined;
-      if (chars && chars.length > 0 && coreMutation) {
-        const active = coreMutation.active(workspaceId);
-        const original = processSessions.getCoreMutationBinding(workspaceId, sessionId);
-        if (active && !original) {
-          throw new Error("[CORE_BOUND_SESSION_REQUIRED] Historical unbound process input cannot receive retroactive Core provenance.");
-        }
-        if (original) {
-          coreAdmission = await coreMutation.admit({
-            workspaceId,
-            extra,
-            pointer: { required: true, ...original },
-            pathContainment: "NOT_PROVEN",
-            writerDomain: "PROCESS",
-          });
-        }
-      }
       const snapshot = await processSessions.write({
         workspaceId,
         sessionId,
@@ -1301,7 +1192,6 @@ function registerCodexProcessTools(
         yieldTimeMs,
         maxOutputTokens,
       });
-      await assertCoreProcessCompletion(coreMutation, workspaceId, extra, snapshot);
 
       logToolCall(config, {
         tool: "write_stdin",
@@ -1316,12 +1206,12 @@ function registerCodexProcessTools(
         running: snapshot.running,
         exitCode: snapshot.exitCode,
         wallTimeMs: snapshot.wallTimeMs,
-      }, coreAdmission);
+      });
     },
   );
 }
 
-function codexGoalStateStructured(state: CodexGoalState, coreMutation?: CoreMutationAdmission): Record<string, unknown> {
+function codexGoalStateStructured(state: CodexGoalState): Record<string, unknown> {
   return {
     goalId: state.goalId,
     workspaceId: state.workspaceId,
@@ -1339,21 +1229,6 @@ function codexGoalStateStructured(state: CodexGoalState, coreMutation?: CoreMuta
     terminalReason: state.terminalReason,
     error: state.error,
     processTreeState: state.processTreeState,
-    ...(coreMutation?.bound
-      ? { coreMutation: coreMutationAdmissionOutput(coreMutation) }
-      : state.coreMutation
-        ? {
-            coreMutation: {
-              bound: true,
-              claim: "CORE_BOUND_SESSION",
-              sessionId: state.coreMutation.sessionId,
-              bindingHash: state.coreMutation.bindingHash,
-              pathContainment: "NOT_PROVEN",
-              pathContainmentEvidence: "PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN",
-              trustedEngineeringCompletion: false,
-            },
-          }
-        : {}),
   };
 }
 
@@ -1378,9 +1253,6 @@ function registerCodexGoalTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   goals: CodexGoalSessionManager,
-  coreMutation?: CoreMutationGuard,
-  workResumeStore?: WorkResumeStore,
-  carrierBindings?: CarrierBindingStore,
 ): void {
   const GOAL_START_ANNOTATIONS = {
     readOnlyHint: false,
@@ -1414,7 +1286,7 @@ function registerCodexGoalTools(
           .optional()
           .describe("Exact 40-character Git HEAD the workspace must be at before launch. Required for Git workspaces; start fails closed when missing or mismatched."),
         resumableWork: resumableWorkSchema().optional().describe(
-          "Nexus writer-admission pointer. Required in enrolled repositories before Codex Goal can mutate.",
+          "Nexus writer-admission pointer. Kept for protocol compatibility.",
         ),
       },
       outputSchema: {
@@ -1439,20 +1311,10 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
     },
-    async ({ workspaceId, goal, model, reasoningEffort, expectedHead, resumableWork: p0Pointer }, extra) => {
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
-      enforceNexusWriterAdmission({
-        workspaceRoot: workspace.root,
-        pointer: p0Pointer,
-        store: workResumeStore,
-        ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-        operation: "codex_goal_start",
-      });
-      const coreAdmission = coreMutation
-        ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
-        : undefined;
       let state: CodexGoalState;
       try {
         state = await goals.startPrompt({
@@ -1462,9 +1324,6 @@ function registerCodexGoalTools(
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
           ...(expectedHead ? { expectedHead } : {}),
-          ...(coreAdmission?.bound
-            ? { coreMutation: { sessionId: coreAdmission.sessionId!, bindingHash: coreAdmission.bindingHash! } }
-            : {}),
         });
       } catch (error) {
         logFailedToolResponse(config, {
@@ -1481,7 +1340,7 @@ function registerCodexGoalTools(
       });
       return {
         content: [textBlock(codexGoalResultText("started", state))],
-        structuredContent: codexGoalStateStructured(state, coreAdmission),
+        structuredContent: codexGoalStateStructured(state),
       };
     },
   );
@@ -1520,10 +1379,9 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: { readOnlyHint: true },
     },
-    async ({ workspaceId, goalId, waitMs }, extra) => {
+    async ({ workspaceId, goalId, waitMs }) => {
       workspaces.getWorkspace(workspaceId);
       const state = await goals.status(workspaceId, goalId, { waitMs });
-      await assertCoreGoalCompletion(coreMutation, workspaceId, extra, state);
       return {
         content: [textBlock(codexGoalResultText("status", state))],
         structuredContent: codexGoalStateStructured(state),
@@ -1543,7 +1401,7 @@ function registerCodexGoalTools(
         goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
         message: z.string().min(1).max(20_000).describe("Follow-up message for the active goal."),
         resumableWork: resumableWorkSchema().optional().describe(
-          "Nexus writer-admission pointer. Required in enrolled repositories before continuing a mutating Codex Goal.",
+          "Nexus writer-admission pointer. Kept for protocol compatibility.",
         ),
       },
       outputSchema: {
@@ -1573,35 +1431,10 @@ function registerCodexGoalTools(
         openWorldHint: true,
       },
     },
-    async ({ workspaceId, goalId, message, resumableWork: p0Pointer }, extra) => {
+    async ({ workspaceId, goalId, message }, extra) => {
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-      const workspace = workspaces.getWorkspace(workspaceId);
-      enforceNexusWriterAdmission({
-        workspaceRoot: workspace.root,
-        pointer: p0Pointer,
-        store: workResumeStore,
-        ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-        operation: "codex_goal_continue",
-      });
-      let coreAdmission: CoreMutationAdmission | undefined;
-      if (coreMutation) {
-        const active = coreMutation.active(workspaceId);
-        const original = goals.getCoreMutationBinding(workspaceId, goalId);
-        if (active && !original) {
-          throw new Error("[CORE_BOUND_SESSION_REQUIRED] Historical unbound Codex goal cannot receive retroactive Core provenance.");
-        }
-        if (original) {
-          coreAdmission = await coreMutation.admit({
-            workspaceId,
-            extra,
-            pointer: { required: true, ...original },
-            pathContainment: "NOT_PROVEN",
-            writerDomain: "PROCESS",
-          });
-        }
-      }
+      workspaces.getWorkspace(workspaceId);
       const state = await goals.continue(workspaceId, goalId, message);
-      await assertCoreGoalCompletion(coreMutation, workspaceId, extra, state);
       logToolCall(config, {
         tool: "codex_goal_continue",
         workspaceId,
@@ -1610,7 +1443,7 @@ function registerCodexGoalTools(
       });
       return {
         content: [textBlock(codexGoalResultText("continued", state))],
-        structuredContent: codexGoalStateStructured(state, coreAdmission),
+        structuredContent: codexGoalStateStructured(state),
       };
     },
   );
@@ -3090,23 +2923,7 @@ function createAgentStartInputSchema() {
     authorityPath: z.string().startsWith("tasks/"),
     authoritySha256: z.string().regex(/^[0-9a-f]{64}$/),
   }).strict();
-  const capabilityDiscovery = z.object({
-    schema: z.literal(CAPABILITY_DISCOVERY_RECEIPT_SCHEMA),
-    repository: z.literal(NEXUS_CAPABILITY_REPOSITORY),
-    indexRevision: z.string().regex(/^[0-9a-f]{40}$/),
-    indexPath: z.literal(CAPABILITY_DISCOVERY_INDEX_PATH),
-    indexSha256: z.string().regex(/^[0-9a-f]{64}$/),
-    intent: z.string().min(1),
-    disposition: z.enum(["REUSE_EXISTING", "EXTEND_EXISTING", "WRAP_EXISTING", "NEW_CAPABILITY_JUSTIFIED", "BLOCKED_UNKNOWN"]),
-    matchedCapabilityIds: z.array(z.string().min(1)),
-    evidence: z.object({
-      architecture: z.array(z.string().min(1)).min(1),
-      source: z.array(z.string().min(1)).min(1),
-      history: z.array(z.string().min(1)).min(1),
-      runtime: z.array(z.string().min(1)).min(1),
-    }).strict(),
-    newCapabilityJustification: z.string().min(1).optional(),
-  }).strict();
+  const capabilityDiscovery = z.record(z.string(), z.unknown()).optional();
   const toolIntentId = z.enum(TOOL_INTENT_IDS);
   const toolProjectionManifest = z.object({
     schema: z.literal(TOOL_PROJECTION_MANIFEST_SCHEMA),
@@ -3142,7 +2959,7 @@ function createAgentStartInputSchema() {
       "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
     ),
     capabilityDiscovery: capabilityDiscovery.describe(
-      "Reuse-before-invention discovery receipt bound to current canonical Nexus main and the exact capability discovery index bytes. Required for write-capable delegated workers; this is navigation evidence, not routing or mutation authority.",
+      "Capability discovery context. Kept for protocol compatibility.",
     ),
     authorizedToolCeiling: z.array(toolIntentId).describe(
       "Durable transport-neutral tool authority ceiling for this execution. Provider adapters may only narrow it.",
@@ -3156,7 +2973,7 @@ function createAgentStartInputSchema() {
     coreMutation: z.object({
       sessionId: z.string().regex(/^cms_[0-9a-f]{32}$/),
       bindingHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
-    }).strict().describe(
+    }).strict().optional().describe(
       "Exact pointer to an already-open Core-bound mutation session. Carries provenance only; it grants no route, acceptance, merge, or release authority.",
     ),
     resumableWork: resumableWorkSchema().describe(
@@ -3422,23 +3239,6 @@ function samePathSet(left: readonly string[], right: readonly string[]): boolean
   return a.every((value, index) => value === b[index]);
 }
 
-function synchronousGitViolation(
-  snapshot: CoreMutationPhysicalSnapshot,
-  sink: "commit" | "push",
-): Error | undefined {
-  if (snapshot.scopeEscapePaths.length > 0) {
-    return new Error(
-      `[CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE] PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN: Git ${sink} hook changed paths outside AcceptanceContract: ${snapshot.scopeEscapePaths.join(", ")}.`,
-    );
-  }
-  if (snapshot.deletionViolation) {
-    return new Error(
-      `[CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN] PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN: Git ${sink} hook deleted forbidden paths: ${snapshot.deletedPaths.join(", ")}.`,
-    );
-  }
-  return undefined;
-}
-
 function gitFailureEvidenceText(error: GitCandidateError): string {
   if (!error.effect) return "effect=EFFECT_UNKNOWN; retryAllowed=false; reconciliationRequired=true";
   return [
@@ -3451,28 +3251,6 @@ function gitFailureEvidenceText(error: GitCandidateError): string {
     `reconciliationRequired=${error.effect.reconciliationRequired}`,
     error.effect.guidance,
   ].filter(Boolean).join("; ");
-}
-
-function requireCoreCandidateProvenance(
-  coreMutation: CoreMutationGuard,
-  readiness: IntegrationReadiness,
-) {
-  const head = readiness.canonicalHead;
-  const base = readiness.canonicalBase;
-  const tree = readiness.candidateTreeId;
-  if (!head || !base || !tree) throw new Error("[CORE_CANDIDATE_PROVENANCE_UNVERIFIABLE] Candidate identity is incomplete after readiness checks.");
-  const provenance = coreMutation.candidate(head);
-  if (!provenance) throw new Error(`[CORE_CANDIDATE_PROVENANCE_REQUIRED] Candidate ${head} has no durable Core-bound provenance.`);
-  if (
-    provenance.candidateHead !== head ||
-    provenance.candidateTree !== tree ||
-    provenance.sourceHead !== base ||
-    !samePathSet(provenance.changedPaths, readiness.candidateChangedPaths) ||
-    !samePathSet(provenance.deletedPaths, readiness.candidateDeletedPaths)
-  ) {
-    throw new Error(`[CORE_CANDIDATE_PROVENANCE_CONFLICT] Candidate ${head} physical readiness does not match durable Core provenance.`);
-  }
-  return provenance;
 }
 
 export function createMcpServer(
@@ -3496,8 +3274,8 @@ export function createMcpServer(
   controlPlaneInventoryOverride?: ControlPlaneInventory,
   /** Production-only reread of the exact configured manifest path. */
   controlPlaneInventoryReader?: () => ControlPlaneInventory,
-  coreMutationSessions?: CoreMutationSessionStore,
-  coreMutationTestOnlyBypass?: typeof CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
+  coreMutationSessions?: unknown,
+  coreMutationTestOnlyBypass?: unknown,
   /**
    * P0 WorkResumeStore.  When supplied, write-capable tool handlers that
    * carry a resumableWork pointer call centralAdmissionCheck before any
@@ -3771,48 +3549,6 @@ export function createMcpServer(
       };
     },
   );
-  const coreMutationGuard = createCoreMutationGuard(workspaces, coreMutationSessions, coreMutationTestOnlyBypass);
-  const inspectCoreWriterDomain = (
-    session: CoreMutationSessionRecord,
-    domain: "PROCESS" | "AGENT",
-  ): "CLEAR" | "ACTIVE" | "UNKNOWN" => {
-    if (domain === "PROCESS") {
-      return processSessions.inspectCoreMutationWriters(session.id, session.bindingHash);
-    }
-    const matchingAgents = agentSessionManager?.listAllAgentRecords().filter((record) =>
-      record.executionContract?.coreMutation?.sessionId === session.id &&
-      record.executionContract.coreMutation.bindingHash === session.bindingHash,
-    ) ?? [];
-    return matchingAgents.some((record) =>
-      record.status === "starting" || record.status === "running" || Boolean(record.lifecycleState?.terminationPending),
-    )
-      ? "ACTIVE"
-      : matchingAgents.length > 0 ? "CLEAR" : "UNKNOWN";
-  };
-  registerCoreMutationSessionTools(server, workspaces, coreMutationSessions, inspectCoreWriterDomain, {
-    recoveryOwnerClientId: config.coreMutationRecoveryOwnerClientId,
-    readDurableAgentRecord: agentSessionManager
-      ? (agentId: string) => {
-          const record = agentSessionManager.getRecordByPrefixOrId(agentId);
-          return record?.id === agentId ? record : undefined;
-        }
-      : undefined,
-    onCallerRebound: runtimeBuildIdentityContext?.onCoreCallerRebound,
-  });
-
-  // REQ-4/REQ-5: Core candidate acquisition durable projection plus a
-  // synchronously bound runtime identity. Physical executable bytes are
-  // re-read and hashed inside each acquisition only after its durable intent
-  // and observation exist, so there is no worker-return restart window.
-  const coreObservationStore = new CoreCandidateAcquisitionObservationStore(config.stateDir);
-  const coreRuntimeValidationConfig = {
-    coreAcquisitionExecutable: config.coreAcquisitionExecutable,
-    coreAcquisitionExpectedSourceRevision: config.coreAcquisitionExpectedSourceRevision,
-    coreAcquisitionRuntimeDigest: config.coreAcquisitionRuntimeDigest,
-  };
-  const coreRuntimeBinding = validateCoreRuntimeConfigSync(coreRuntimeValidationConfig);
-  const coreReceiptDirectory = join(config.stateDir, "core-candidate-acquisition-receipts");
-
   registerRepositoryIntelligenceTools(server, config, workspaces);
   registerHostCapabilitySnapshotTool(server, {
     stateDir: config.stateDir,
@@ -4190,7 +3926,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "git_push", "dependency_sync", "nexus_gateway_recover", "nexus_gateway_recovery_preflight", "nexus_gateway_recovery_materialize", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
+      kind: z.enum(["workspace_clone", "git_push", "dependency_sync", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -4240,230 +3976,6 @@ export function createMcpServer(
       registerAppTool(server, "host_operation_reconcile", { title: "Reconcile host operation", description: "Reconcile one exact host operation after timeout, disconnect, or restart.", inputSchema: { operationId: z.string().min(1) }, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false } }, async ({ operationId }, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.reconcile(operationId, owner.clientId)); });
       registerAppTool(server, "host_operation_cancel", { title: "Cancel host operation", description: "Cancel only the exact owned process for one host operation.", inputSchema: { operationId: z.string().min(1) }, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } }, async ({ operationId }, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.cancel(operationId, owner.clientId)); });
     }
-
-    const nexusSafeId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
-    const nexusHash = z.string().regex(/^[0-9a-f]{64}$/);
-    const nexusDeploymentId = z.string().regex(/^r1-[0-9a-f]{40}$/);
-    const nexusGatewayRecoveryRequestSchema = z.object({
-      request_id: nexusSafeId,
-      idempotency_fence: nexusSafeId,
-      operation: z.literal("gateway-recover"),
-      effect_class: z.literal("GATEWAY_DURABLE_RECOVERY"),
-      recovery_authority_id: nexusSafeId,
-      recovery_authority_hash: nexusHash,
-      desired_manifest_id: nexusDeploymentId,
-      desired_manifest_hash: nexusHash,
-      predecessor_manifest_id: nexusDeploymentId,
-      predecessor_manifest_hash: nexusHash,
-      request_hash: nexusHash,
-      schema: z.literal(NEXUS_GATEWAY_RECOVERY_SCHEMA),
-    }).strict();
-    const nexusGatewayRecoveryMaterializationRequestSchema = z.object({
-      request_id: nexusSafeId,
-      idempotency_fence: nexusSafeId,
-      operation: z.literal("gateway-recovery-materialize"),
-      effect_class: z.literal("GATEWAY_RECOVERY_MATERIALIZATION"),
-      recovery_authority_id: nexusSafeId,
-      recovery_authority_hash: nexusHash,
-      request_hash: nexusHash,
-      schema: z.literal(NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA),
-    }).strict();
-
-    registerAppTool(
-      server,
-      "nexus_gateway_recover",
-      {
-        title: "Recover Nexus Gateway",
-        description:
-          "Run one fixed Nexus #526 Gateway recovery request through the repository-owned stable manager. The caller supplies only the exact durable attempt identity and schema-bound Nexus recovery request; executable, service, PID, launchd label, plist, source root, manager path, environment, command, and timeout are fixed server-side. The Nexus recovery authority receipt remains the semantic authority. Timeout or uncertain effect must be reconciled through operation_reconcile with the same stored request.",
-        inputSchema: {
-          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
-            .describe("Stable DevSpace transport attempt identity. Conflicting reuse fails closed."),
-          request: nexusGatewayRecoveryRequestSchema,
-        },
-        outputSchema: durableOperationOutputSchema,
-        _meta: {},
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: true,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ attemptKey, request }) => {
-        try {
-          return operationResponse(await durableOperations.nexusGatewayRecover({ attemptKey, request }));
-        } catch (error) {
-          if (error instanceof DurableOperationError && error.operation) {
-            return {
-              content: [textBlock(`${error.code}: ${error.message}`)],
-              isError: true,
-              structuredContent: error.operation as unknown as Record<string, unknown>,
-            };
-          }
-          throw error;
-        }
-      },
-    );
-
-    registerAppTool(
-      server,
-      "nexus_gateway_recovery_preflight_start",
-      {
-        title: "Start durable Nexus Gateway recovery preflight",
-        description:
-          "Start one effect-free Nexus #526 Gateway recovery preflight as a durable background operation so long manager verification can outlive a single MCP request. Returns the stable operation immediately; use operation_status for readback and operation_reconcile only after restart or uncertain transport. It never starts Gateway recovery effects.",
-        inputSchema: {
-          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
-            .describe("Stable durable preflight identity. Exact replay returns the same operation; conflicting reuse fails closed."),
-          request: nexusGatewayRecoveryRequestSchema,
-        },
-        outputSchema: durableOperationOutputSchema,
-        _meta: {},
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ attemptKey, request }) => {
-        try {
-          return operationResponse(
-            await durableOperations.nexusGatewayRecoveryPreflightStart({
-              attemptKey,
-              request,
-            }),
-          );
-        } catch (error) {
-          if (error instanceof DurableOperationError && error.operation) {
-            return {
-              content: [textBlock(`${error.code}: ${error.message}`)],
-              isError: true,
-              structuredContent: error.operation as unknown as Record<string, unknown>,
-            };
-          }
-          throw error;
-        }
-      },
-    );
-
-    registerAppTool(
-      server,
-      "nexus_gateway_recovery_preflight",
-      {
-        title: "Nexus Gateway Recovery Preflight",
-        description:
-          "Effect-free preflight checkpoint for a Nexus Gateway recovery request. Validates authority, request binding, manifest integrity, and source bundle through the manager-owned gateway_recover() function without starting any launchd, plist, or process host effects. Returns readiness=[TARGET_READY,ROLLBACK_READY] and effect_started=false when the preflight passes. A BLOCKED result is the expected positive outcome — it means the effect-free checkpoint was reached without authorizing host recovery.",
-        inputSchema: {
-          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
-            .describe("Stable DevSpace transport attempt identity for preflight. Conflicting reuse fails closed."),
-          request: nexusGatewayRecoveryRequestSchema,
-        },
-        outputSchema: {
-          status: z.enum(["passed", "error"]),
-          effectStarted: z.boolean(),
-          readiness: z.array(z.string()),
-          outcome: z.record(z.string(), z.unknown()).optional(),
-          errorMessage: z.string().optional(),
-        },
-        _meta: {},
-        annotations: {
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ attemptKey, request }) => {
-        const result = await durableOperations.nexusGatewayRecoveryPreflight({ attemptKey, request });
-        return {
-          content: [textBlock(
-            `Preflight ${result.status}: effect_started=${String(result.effectStarted)}, readiness=[${result.readiness.join(",")}].`,
-          )],
-          isError: result.status === "error",
-          structuredContent: result as unknown as Record<string, unknown>,
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      "nexus_gateway_recovery_materialize",
-      {
-        title: "Materialize Nexus Gateway Recovery Authority",
-        description:
-          "Durably materialize one exact merged Nexus Gateway recovery authority into the fixed manager-owned host store. The caller supplies only the bounded materialization identity; repository, tracked authority path, authority mirror, fixed state paths, predecessor artifact location, interpreter, and manager are fixed server-side. This operation starts no Gateway, launchd, plist, or process effect. Timeout or uncertain acknowledgement must reconcile the same durable operation before any replay.",
-        inputSchema: {
-          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
-            .describe("Stable materialization attempt identity. Exact replay returns the same terminal operation; conflicting reuse fails closed."),
-          request: nexusGatewayRecoveryMaterializationRequestSchema,
-        },
-        outputSchema: durableOperationOutputSchema,
-        _meta: {},
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: true,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ attemptKey, request }) => {
-        try {
-          return operationResponse(
-            await durableOperations.nexusGatewayRecoveryMaterialize({
-              attemptKey,
-              request,
-            }),
-          );
-        } catch (error) {
-          if (error instanceof DurableOperationError && error.operation) {
-            return {
-              content: [textBlock(`${error.code}: ${error.message}`)],
-              isError: true,
-              structuredContent: error.operation as unknown as Record<string, unknown>,
-            };
-          }
-          throw error;
-        }
-      },
-    );
-
-    registerAppTool(
-      server,
-      "nexus_gateway_recovery_materialization_reconcile",
-      {
-        title: "Reconcile Nexus Gateway Recovery Materialization",
-        description:
-          "Reconcile only one exact existing Nexus Gateway recovery materialization operation after timeout or lost acknowledgement. The operation must already be nexus_gateway_recovery_materialize; the stored request and idempotency fence are reused exactly. This action cannot enter Gateway recovery, process, launchd, retry, failover, or caller-selected host-control paths.",
-        inputSchema: { operationId: z.string().min(1) },
-        outputSchema: durableOperationOutputSchema,
-        _meta: {},
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ operationId }) => {
-        const record = durableOperations.store.getByOperationId(operationId);
-        if (!record) {
-          throw new DurableOperationError(
-            "RECONCILIATION_REQUIRED",
-            `Unknown durable operation: ${operationId}`,
-          );
-        }
-        if (record.kind !== "nexus_gateway_recovery_materialize") {
-          throw new DurableOperationError(
-            "RECONCILIATION_REQUIRED",
-            `Materialization-only reconcile refuses durable operation kind ${record.kind}.`,
-            record,
-          );
-        }
-        return operationResponse(await durableOperations.reconcile(operationId, undefined));
-      },
-    );
 
     registerAppTool(
       server,
@@ -4516,177 +4028,7 @@ export function createMcpServer(
       },
     );
 
-    if (carrierBindings) {
-      const contractSchema=z.object({repository:z.string(),goal:z.string(),role:z.enum(["controller","worker"]),scope:z.array(z.string()),baseRevision:z.string(),operations:z.array(z.enum(["dependency_sync","worktree_write"])),expiresAt:z.string()}).strict();
-      const registration={annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},_meta:{}};
-      const result=(value:unknown)=>({content:[textBlock(JSON.stringify(value))]});
-      registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request local Owner approval for new bounded authority. Save the returned pendingId; once approved locally by the Owner via CLI, resume the carrier using coordination_resume with the pendingId.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
-      registerAppTool(server,"coordination_recovery_request",{...registration,title:"Request existing-carrier recovery",description:"Create a pending recovery verifier for this MCP session. This does not create a carrier or grant authority. A host Owner must bind this pendingId to one exact existing carrier with `devspace carrier recover <pendingId> --carrier <carrierId> --version <version> --validity-version <validityVersion> --confirm <carrierId>` before coordination_resume can succeed.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
-      registerAppTool(server,"coordination_resume",{...registration,title:"Resume a paired carrier",description:"Resume a paired or recovered carrier on the current authenticated MCP session using an Owner-approved pendingId, or verification token.",inputSchema:{pendingId:z.string().optional().describe("The pendingId returned from coordination_pair or coordination_recovery_request once approved by the Owner"),token:z.string().optional().describe("Optional pairing verification token"),credential:z.string().optional().describe("Legacy pairing verification token")}},async(args,extra)=>{
-        try {
-          const res = carrierBindings.redeem(dependencyConsumerContext(extra), args);
-          return result(res);
-        } catch (error) {
-          if (error instanceof ControlPlaneOwnershipError) {
-            return {
-              content: [textBlock(`${error.code}: ${error.message}`)],
-              isError: true,
-              structuredContent: { code: error.code, message: error.message },
-            };
-          }
-          throw error;
-        }
-      });
-      registerAppTool(server,"coordination_carrier_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read paired carrier",description:"Read current bounded authority, including parent revocation. A fresh MCP session may present the existing carrier credential inline; this rebinds only that exact carrier and returns no credential.",inputSchema:{carrierCredential:z.string().optional()}},async({carrierCredential},extra)=>{
-        const context=dependencyConsumerContext(extra);
-        if(carrierCredential!==undefined) carrierBindings.redeem(context,carrierCredential);
-        return result(carrierBindings.status(context));
-      });
-      registerAppTool(server,"coordination_lease_read",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read an owned resource lease",description:"Read the exact owned lease version, expiry and operation pin. A fresh MCP session may present the existing carrier credential inline. Does not renew or release it.",inputSchema:{leaseId:z.string(),carrierCredential:z.string().optional()}},async({leaseId,carrierCredential},extra)=>{
-        const context=dependencyConsumerContext(extra);
-        if(carrierCredential!==undefined) carrierBindings.redeem(context,carrierCredential);
-        return result(carrierBindings.readLease(context,leaseId));
-      });
-      registerAppTool(server,"coordination_lease_release",{...registration,title:"Release an unpinned owned lease",description:"Explicitly release an owned lease by exact version. Active or unknown operation pins must be reconciled first.",inputSchema:{leaseId:z.string(),expectedVersion:z.number().int().positive()}},async({leaseId,expectedVersion},extra)=>result(carrierBindings.releaseLease(dependencyConsumerContext(extra),leaseId,expectedVersion)));
-      registerAppTool(server,"coordination_delegate",{...registration,title:"Delegate bounded work",description:"Approve a worker's pending pairing within the current controller's scope and expiry. Cannot create controller authority.",inputSchema:{pendingId:z.string(),contract:contractSchema}},async({pendingId,contract},extra)=>result(carrierBindings.delegate(dependencyConsumerContext(extra),pendingId,contract)));
-      registerAppTool(server,"coordination_revoke_worker",{...registration,title:"Revoke delegated worker",description:"Revoke an exact child authority version. Existing unknown effects remain pinned and require reconciliation.",inputSchema:{carrierId:z.string(),expectedVersion:z.number().int().positive()}},async({carrierId,expectedVersion},extra)=>result(carrierBindings.revokeDelegation(dependencyConsumerContext(extra),carrierId,expectedVersion)));
-      registerAppTool(server,"coordination_prepare_dependencies",{...registration,title:"Prepare bounded dependency operation",description:"Bind a frozen dependency recipe to the paired carrier and acquire its existing resource lease. Does not execute the recipe. Use the same inputs with dependency_sync.",inputSchema:{workspaceId:z.string(),attemptKey:z.string(),recipe:z.enum(["npm_ci","pnpm_frozen","uv_frozen"])}},async(args,extra)=>{
-        const context=dependencyConsumerContext(extra);
-        carrierBindings.status(context);
-        await workspaces.assertConversationMutationAllowed(args.workspaceId,openAiConversationScopeId(extra._meta));
-        const workspace=workspaces.getWorkspace(args.workspaceId);
-        const plan=await durableOperations.planDependencySync({...args,workspaceRoot:workspace.root});
-        return result({subject:plan.subject,lease:carrierBindings.prepareEffect(context,plan.subject)});
-      });
-      if(cutoverControl) registerAppTool(server,"coordination_prepare_cutover",{...registration,title:"Prepare an approved cutover",description:"Bind the exact locally approved cutover request to this paired controller and the running server. Acquires the resource lease without starting or restarting. Use these same explicit inputs with cutover_start.",inputSchema:{
-        attemptKey:z.string().min(1),expectedSourceCommit:z.string().regex(/^[a-f0-9]{40}$/),expectedBuildId:z.string().min(1),expectedCapabilityManifestSha256:z.string().regex(/^[a-f0-9]{64}$/),expiresAt:z.string(),carrierCredential:z.string().optional().describe("Optional approved carrier credential for this exact operation when reconnecting on a fresh MCP session."),
-      }},async(args,extra)=>{
-        const context=dependencyConsumerContext(extra);
-        if(args.carrierCredential !== undefined) carrierBindings.redeem(context,args.carrierCredential);
-        carrierBindings.status(context);
-        const plan=planCutoverStart(config.stateDir,{attemptKey:args.attemptKey,currentIdentity:cutoverControl.controller.currentIdentity,
-          expectedIdentity:{sourceCommit:args.expectedSourceCommit,buildId:args.expectedBuildId,capabilityManifestSha256:args.expectedCapabilityManifestSha256},expiresAt:args.expiresAt});
-        return result({subject:plan.subject,lease:carrierBindings.prepareEffect(context,plan.subject)});
-      });
-    }
 
-    registerAppTool(server,"coordination_completion_read",{
-      title:"Read current delivery evidence",
-      description:"Project the complete trusted contract and revision-bound evidence. Missing native, CI or other required evidence remains a gap. This read grants no authority and never unlocks or retries work.",
-      inputSchema:{goal:z.string().min(1),candidate:z.string().min(1),subject:z.string().min(1)},
-      annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},_meta:{},
-    },async(selection,extra)=>{
-      const projection=durableOperations.readCompletion(selection,dependencyConsumerContext(extra));
-      return {content:[textBlock(JSON.stringify(projection))],structuredContent:{projection}};
-    });
-
-    const handoffGrantSchema=z.object({repository:z.string().min(1),goal:z.string().min(1),coordinatorThread:z.string().min(1),evidenceHash:z.string().min(1)}).strict();
-    registerAppTool(server,"coordination_handoff",{
-      title:"Transfer existing resource ownership",
-      description:"Atomically transfer one existing lease using exact CAS and a fixed handoff receipt. Recipient handle must resolve through the trusted host to a previously authenticated recipient. Does not create grants, widen scope, start work or clear an in-flight operation.",
-      inputSchema:{leaseId:z.string().min(1),expectedVersion:z.number().int().positive(),recipientHandle:z.string().min(1).max(160),receipt:z.object({
-        resource:z.string().min(1),baseRevision:z.string().min(1),scope:z.array(z.string().min(1)),candidateRevision:z.string().min(1),liveOperation:z.string().min(1),liveHandle:z.string(),checkpoint:z.string().min(1),
-        grantDependency:handoffGrantSchema,grantVersion:z.number().int().positive(),recipientGrant:handoffGrantSchema,recipientGrantVersion:z.number().int().positive(),forbiddenOverlap:z.array(z.string()),tests:z.array(z.string()),evidence:z.array(z.string()).min(1),remainingGap:z.string(),nextGate:z.string().min(1),expiresAt:z.string(),
-      }).strict()},
-      outputSchema:{receipt:z.record(z.string(),z.unknown())},_meta:{},annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
-    },async({leaseId,expectedVersion,recipientHandle,receipt},extra)=>{
-      const transferred=durableOperations.handoff(leaseId,expectedVersion,recipientHandle,receipt,dependencyConsumerContext(extra));
-      return {content:[textBlock(`Transferred existing lease ${leaseId}; version=${transferred.newVersion}.`)],structuredContent:{receipt:transferred as unknown as Record<string,unknown>}};
-    });
-
-    registerAppTool(
-      server,
-      "coordination_handoff_readback",
-      {
-        title: "Read handoff receipt",
-        description: "Recover one existing handoff receipt under current authenticated recipient and lease-version checks. Returns historical receipt and current lease separately. This read does not transfer ownership, renew a lease, or authorize execution.",
-        inputSchema: {leaseId:z.string().min(1),previousVersion:z.number().int().positive(),expectedCurrentVersion:z.number().int().positive(),carrierCredential:z.string().optional()},
-        annotations: {readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
-        _meta: {},
-      },
-      async ({leaseId,previousVersion,expectedCurrentVersion,carrierCredential}, extra) => {
-        const context=dependencyConsumerContext(extra);
-        if(carrierCredential!==undefined) carrierBindings?.redeem(context,carrierCredential);
-        const result = durableOperations.readHandoff(leaseId, previousVersion, expectedCurrentVersion, context);
-        return {content:[textBlock(JSON.stringify(result))],structuredContent:result};
-      },
-    );
-
-    registerAppTool(
-      server,
-      "coordination_continuation_latest",
-      {
-        title: "Discover latest unfinished continuation",
-        description: "Discover the latest eligible continuation for context rollover. A fresh MCP session may present the existing carrier credential inline. Returns structured status (TAKEOVER_ELIGIBLE, NO_CONTINUATION, etc.).",
-        inputSchema: { carrierCredential: z.string().optional() },
-        outputSchema: { status: z.string(), message: z.string().optional() },
-        _meta: {},
-        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      },
-      async ({ carrierCredential }, extra) => {
-        const context=dependencyConsumerContext(extra);
-        if(carrierCredential!==undefined) carrierBindings?.redeem(context,carrierCredential);
-        const result = durableOperations.latestContinuation(context);
-        return { content: [textBlock(JSON.stringify(result, null, 2))], structuredContent: result as unknown as Record<string, unknown> };
-      },
-    );
-
-    registerAppTool(
-      server,
-      "coordination_continuation_takeover",
-      {
-        title: "Take over an unfinished continuation",
-        description: "Atomically take over an eligible continuation from an abandoned controller session using lease CAS.",
-        inputSchema: {
-          leaseId: z.string().min(1),
-          expectedVersion: z.number().int().positive(),
-          takeoverReason: z.string().min(1),
-          checkpoint: z.string().optional(),
-          candidateRevision: z.string().optional(),
-          tests: z.array(z.string()).optional(),
-          evidence: z.array(z.string()).optional(),
-          remainingGap: z.string().optional(),
-          nextGate: z.string().optional(),
-          reconciledEffects: z.array(z.string()).optional(),
-        },
-        outputSchema: { receipt: z.record(z.string(), z.unknown()) },
-        _meta: {},
-        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
-      },
-      async ({ leaseId, expectedVersion, takeoverReason, checkpoint, candidateRevision, tests, evidence, remainingGap, nextGate, reconciledEffects }, extra) => {
-        const receipt = durableOperations.takeover(
-          leaseId,
-          expectedVersion,
-          { takeoverReason, checkpoint, candidateRevision, tests, evidence, remainingGap, nextGate, reconciledEffects },
-          dependencyConsumerContext(extra),
-        );
-        return {
-          content: [textBlock(`Took over continuation for lease ${leaseId}; newVersion=${receipt.newVersion}.`)],
-          structuredContent: { receipt: receipt as unknown as Record<string, unknown> },
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      "coordination_continuation_readback",
-      {
-        title: "Read takeover receipt",
-        description: "Recover an existing takeover receipt under current authenticated owner and lease-version checks.",
-        inputSchema: {
-          leaseId: z.string().min(1),
-          previousVersion: z.number().int().positive(),
-          expectedCurrentVersion: z.number().int().positive(),
-        },
-        outputSchema: { receipt: z.record(z.string(), z.unknown()) },
-        _meta: {},
-        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-      },
-      async ({ leaseId, previousVersion, expectedCurrentVersion }, extra) => {
-        const result = durableOperations.readTakeover(leaseId, previousVersion, expectedCurrentVersion, dependencyConsumerContext(extra));
-        return { content: [textBlock(JSON.stringify(result))], structuredContent: result as unknown as Record<string, unknown> };
-      },
-    );
 
     registerAppTool(
       server,
@@ -4715,17 +4057,10 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, attemptKey, recipe, authorityMode, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, attemptKey, recipe, authorityMode }, extra) => {
         const { _meta } = extra;
         const safety = await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
-        enforceNexusWriterAdmission({
-          workspaceRoot: workspace.root,
-          pointer: p0Pointer,
-          store: workResumeStore,
-          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(_meta),
-          operation: "dependency_sync",
-        });
         const ownerDirectIsolated =
           authorityMode === "OWNER_DIRECT" &&
           workspace.mode === "worktree" &&
@@ -4975,11 +4310,11 @@ export function createMcpServer(
           "P0 resumable-work pointer.  When supplied, the write is admitted only if the exact lease is currently held by the caller.",
         ),
       },
-      outputSchema: resultOutputSchema({ coreMutation: z.record(z.string(), z.unknown()).optional() }),
+      outputSchema: resultOutputSchema({}),
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, resumableWork: p0Pointer, ...input }, extra) => {
+    async ({ workspaceId, resumableWork: _p0Pointer, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4995,17 +4330,6 @@ export function createMcpServer(
           ].join("\n"))],
         };
       }
-      // Nexus-enrolled repositories fail closed without canonical admission.
-      enforceNexusWriterAdmission({
-        workspaceRoot: workspace.root,
-        pointer: p0Pointer,
-        store: workResumeStore,
-        ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-        operation: "write",
-      });
-      const coreAdmission = coreMutationGuard
-        ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
-        : undefined;
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -5052,7 +4376,6 @@ export function createMcpServer(
         },
         structuredContent: {
           result: contentText(response.content),
-          ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
         },
       };
     },
@@ -5090,12 +4413,11 @@ export function createMcpServer(
       },
       outputSchema: resultOutputSchema({
         status: z.literal("applied"),
-        coreMutation: z.record(z.string(), z.unknown()).optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, resumableWork: p0Pointer, ...input }, extra) => {
+    async ({ workspaceId, resumableWork: _p0Pointer, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -5111,17 +4433,6 @@ export function createMcpServer(
           ].join("\n"))],
         };
       }
-      // Nexus-enrolled repositories fail closed without canonical admission.
-      enforceNexusWriterAdmission({
-        workspaceRoot: workspace.root,
-        pointer: p0Pointer,
-        store: workResumeStore,
-        ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-        operation: "edit",
-      });
-      const coreAdmission = coreMutationGuard
-        ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
-        : undefined;
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -5176,7 +4487,6 @@ export function createMcpServer(
         structuredContent: {
           status: "applied",
           result: contentText(editContent),
-          ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
         },
       };
     },
@@ -5212,22 +4522,14 @@ export function createMcpServer(
               operation: z.enum(["add", "update", "delete", "move"]),
             }),
           ),
-          coreMutation: z.record(z.string(), z.unknown()).optional(),
         }),
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, patch }, extra) => {
         const startedAt = performance.now();
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
         const workspace = workspaces.getWorkspace(workspaceId);
-        enforceNexusWriterAdmission({
-          workspaceRoot: workspace.root,
-          pointer: p0Pointer,
-          store: workResumeStore,
-          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-          operation: "apply_patch",
-        });
         const actions = parsePatch(patch);
         const mutationPaths = actions.flatMap((action) => action.kind === "update" && action.moveTo ? [action.path, action.moveTo] : [action.path]);
         const deletedPaths = actions.flatMap((action) => action.kind === "delete" || (action.kind === "update" && action.moveTo) ? [action.path] : []);
@@ -5248,9 +4550,6 @@ export function createMcpServer(
             ].join("\n"))],
           };
         }
-        const coreAdmission = coreMutationGuard
-          ? await coreMutationGuard.admit({ workspaceId, extra, paths: mutationPaths, deletedPaths, pathContainment: "STRUCTURED_SINK_ENFORCED" })
-          : undefined;
         const applied = await applyPatch(workspace.root, patch);
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
@@ -5290,7 +4589,6 @@ export function createMcpServer(
             additions: applied.additions,
             removals: applied.removals,
             files: applied.files,
-            ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
           },
         };
       },
@@ -5627,32 +4925,13 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens, resumableWork: p0Pointer }, extra) => {
+    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens }, extra) => {
       const startedAt = performance.now();
       const mutationCapable = !isRepositoryReadOnlyShellCommand(command);
       if (mutationCapable) {
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
-      // Checked only for write-capable commands; read-only commands skip.
-      if (mutationCapable) {
-        try {
-          enforceNexusWriterAdmission({
-            workspaceRoot: workspace.root,
-            pointer: p0Pointer,
-            store: workResumeStore,
-            ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-            operation: "shell",
-          });
-        } catch (err) {
-          throw new Error(
-            `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-      }
-      const coreAdmission = mutationCapable && coreMutationGuard
-        ? await coreMutationGuard.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
-        : undefined;
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
         workingDirectory,
@@ -5666,11 +4945,7 @@ export function createMcpServer(
         timeoutSeconds: timeout ?? 30,
         attemptKey,
         maxOutputTokens,
-        ...(coreAdmission?.bound
-          ? { coreMutation: { sessionId: coreAdmission.sessionId!, bindingHash: coreAdmission.bindingHash! } }
-          : {}),
       });
-      await assertCoreProcessCompletion(coreMutationGuard, workspaceId, extra, snapshot);
 
       const summary = {
         command,
@@ -5691,7 +4966,7 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
-      return processToolResponse(toolNames.shell, workspaceId, snapshot, summary, coreAdmission);
+      return processToolResponse(toolNames.shell, workspaceId, snapshot, summary);
     },
   );
   }
@@ -5735,7 +5010,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: COMMAND_STATUS_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, attemptKey, sessionId, yieldTimeMs, maxOutputTokens }, extra) => {
+    async ({ workspaceId, attemptKey, sessionId, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const snapshot = await processSessions.getStatus({
@@ -5746,7 +5021,6 @@ export function createMcpServer(
         yieldTimeMs: yieldTimeMs ?? 5_000,
         maxOutputTokens,
       });
-      await assertCoreProcessCompletion(coreMutationGuard, workspaceId, extra, snapshot);
 
       logToolCall(config, {
         tool: "command_status",
@@ -5769,14 +5043,14 @@ export function createMcpServer(
   );
 
   if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions, coreMutationGuard, workResumeStore, carrierBindings);
+    registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
   // Narrow opt-in Codex Goal capability. Available in every tool mode, but it
   // exposes only special-purpose goal actions; generic exec_command/write_stdin
   // stay hidden outside codex mode.
   if (config.codexGoalsEnabled && codexGoals) {
-    registerCodexGoalTools(server, config, workspaces, codexGoals, coreMutationGuard, workResumeStore, carrierBindings);
+    registerCodexGoalTools(server, config, workspaces, codexGoals);
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
@@ -5784,7 +5058,6 @@ export function createMcpServer(
       config,
       workspaces,
       incomingArtifactAdapters,
-      coreMutation: coreMutationGuard,
     });
   }
 
@@ -5995,7 +5268,6 @@ export function createMcpServer(
           updatedAt: z.string(),
           executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
           runtime: AGENT_RUNTIME_OUTPUT_SCHEMA.optional(),
-          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
@@ -6026,75 +5298,13 @@ export function createMcpServer(
         assertDirectClineCatalogSelection({ profile, provider, model, effort, cliProviderId }, profileCatalog);
         const profiles = selection.profiles;
         const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
-        let coreAdmission: CoreMutationAdmission | undefined;
-        let discoveryContext: string | undefined;
         if (selectedProfile?.write_mode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-          const authorityMode = contract?.authorityMode ?? "OWNER_DIRECT";
-          const coreBound = contract?.coreMutation !== undefined;
-          const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
-
-          if (ownerDirect) {
-            if (config.toolMode === "dispatch" && (!contract?.writePaths || contract.writePaths.length === 0)) {
-              throw new AgentSessionError(
-                "INVALID_EXECUTION_CONTRACT",
-                "DIRECT_DISPATCH_WRITE_SCOPE_REQUIRED: write-capable direct dispatch requires bounded executionContract.writePaths.",
-              );
-            }
-            if (coreMutationGuard?.active(workspaceId)) {
-              throw new AgentSessionError(
-                "INVALID_EXECUTION_CONTRACT",
-                "CORE_ACTIVE_SESSION_CONFLICT: OWNER_DIRECT write-capable dispatch cannot bypass an active Core mutation session.",
-              );
-            }
-            if (contract?.capabilityDiscovery) {
-              try {
-                const verifiedDiscovery = await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery);
-                discoveryContext = renderCapabilityDiscoveryForWorker(verifiedDiscovery);
-              } catch (error) {
-                throw new AgentSessionError(
-                  "INVALID_EXECUTION_CONTRACT",
-                  error instanceof Error ? error.message : String(error),
-                );
-              }
-            }
-          } else {
-            if (coreMutationGuard && (!contract?.coreMutation || !contract.writePaths || contract.writePaths.length === 0)) {
-              throw new AgentSessionError(
-                "INVALID_EXECUTION_CONTRACT",
-                "CORE_MUTATION_POINTER_REQUIRED: write-capable governed agent_start requires exact executionContract.coreMutation sessionId/bindingHash and writePaths before provider launch.",
-              );
-            }
-            if (!contract?.capabilityDiscovery) {
-              throw new AgentSessionError(
-                "INVALID_EXECUTION_CONTRACT",
-                "CAPABILITY_DISCOVERY_REQUIRED: write-capable governed execution requires a current Nexus capability discovery receipt before worker launch.",
-              );
-            }
-            try {
-              const verifiedDiscovery = await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery);
-              discoveryContext = renderCapabilityDiscoveryForWorker(verifiedDiscovery);
-              if (coreMutationGuard) {
-                const corePointer = contract.coreMutation;
-                if (!corePointer) {
-                  throw new Error("CORE_MUTATION_POINTER_REQUIRED: write-capable governed execution lost its Core pointer before admission.");
-                }
-                coreMutationGuard.assertDiscovery(workspaceId, verifiedDiscovery.receipt);
-                coreAdmission = await coreMutationGuard.admit({
-                  workspaceId,
-                  extra,
-                  pointer: { required: true, sessionId: corePointer.sessionId, bindingHash: corePointer.bindingHash },
-                  paths: contract.writePaths,
-                  pathContainment: "NOT_PROVEN",
-                  writerDomain: "AGENT",
-                });
-              }
-            } catch (error) {
-              throw new AgentSessionError(
-                "INVALID_EXECUTION_CONTRACT",
-                error instanceof Error ? error.message : String(error),
-              );
-            }
+          if (config.toolMode === "dispatch" && (!contract?.writePaths || contract.writePaths.length === 0)) {
+            throw new AgentSessionError(
+              "INVALID_EXECUTION_CONTRACT",
+              "DIRECT_DISPATCH_WRITE_SCOPE_REQUIRED: write-capable direct dispatch requires bounded executionContract.writePaths.",
+            );
           }
         }
         const boundContractBase = selection.directSelection
@@ -6106,48 +5316,33 @@ export function createMcpServer(
             ? { catalogReceipt: catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog) }
             : {}),
         };
-        // Must happen BEFORE provider launch for every write-capable worker in
-        // an enrolled repository. Non-enrolled repositories preserve legacy behavior.
         if (selectedProfile?.write_mode !== "read_only") {
-          try {
-            const pointer = contract?.resumableWork;
-            if (pointer?.effectHandle !== undefined && pointer.effectHandle !== attemptKey) {
-              throw new Error(
-                "P0 agent_start requires resumableWork.effectHandle to exactly equal attemptKey.",
-              );
-            }
-            enforceNexusWriterAdmission({
-              workspaceRoot: workspace.root,
-              pointer,
-              store: workResumeStore,
-              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              operation: "agent_start",
-            });
-            if (pointer && workResumeStore) {
-              workResumeStore.bindEffectIdentity({
-                workKey: pointer.workKey,
-                leaseId: pointer.leaseId,
-                effectKind: "agent",
-                effectKey: attemptKey,
-                lineage: (contract?.role || contract?.parentEffectKey || contract?.supersedes) ? {
-                  role: contract?.role,
-                  parentEffectKey: contract?.parentEffectKey,
-                  supersedes: contract?.supersedes,
-                } : undefined,
-              });
-            }
-          } catch (err) {
+          const pointer = contract?.resumableWork;
+          if (pointer?.effectHandle !== undefined && pointer.effectHandle !== attemptKey) {
             throw new AgentSessionError(
               "INVALID_EXECUTION_CONTRACT",
-              `P0_WRITER_ADMISSION_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+              "P0 agent_start requires resumableWork.effectHandle to exactly equal attemptKey.",
             );
+          }
+          if (pointer && workResumeStore) {
+            workResumeStore.bindEffectIdentity({
+              workKey: pointer.workKey,
+              leaseId: pointer.leaseId,
+              effectKind: "agent",
+              effectKey: attemptKey,
+              lineage: (contract?.role || contract?.parentEffectKey || contract?.supersedes) ? {
+                role: contract?.role,
+                parentEffectKey: contract?.parentEffectKey,
+                supersedes: contract?.supersedes,
+              } : undefined,
+            });
           }
         }
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           profileName: selection.profileName,
-          prompt: discoveryContext ? `${discoveryContext}\n\n${prompt}` : prompt,
+          prompt,
           profiles,
           profileCatalog,
           attemptKey,
@@ -6171,7 +5366,6 @@ export function createMcpServer(
           content: [textBlock(`Started agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
           structuredContent: {
             ...(output as unknown as Record<string, unknown>),
-            ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
           },
         };
       },
@@ -6210,7 +5404,6 @@ export function createMcpServer(
           executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
           runtime: AGENT_RUNTIME_OUTPUT_SCHEMA.optional(),
           continued: z.boolean(),
-          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
@@ -6224,60 +5417,8 @@ export function createMcpServer(
           : undefined;
         const currentWriteMode = currentProfile?.write_mode
           ?? currentAgent?.executionContract?.directSelection?.writeMode;
-        let coreAdmission: CoreMutationAdmission | undefined;
         if (currentWriteMode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-          const contract = currentAgent?.executionContract;
-          const authorityMode = contract?.authorityMode ?? "OWNER_DIRECT";
-          const coreBound = contract?.coreMutation !== undefined;
-          const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
-
-          if (ownerDirect) {
-            if (coreMutationGuard?.active(workspaceId)) {
-              throw new AgentSessionError(
-                "INVALID_EXECUTION_CONTRACT",
-                "CORE_ACTIVE_SESSION_CONFLICT: OWNER_DIRECT write-capable continuation cannot bypass an active Core mutation session.",
-              );
-            }
-          } else if (coreMutationGuard) {
-            const active = coreMutationGuard.active(workspaceId);
-            if (contract?.coreMutation) {
-              if (!contract.writePaths || contract.writePaths.length === 0) {
-                throw new AgentSessionError("INVALID_EXECUTION_CONTRACT", "CORE_MUTATION_POINTER_REQUIRED: persisted Core-bound execution is missing writePaths.");
-              }
-              coreAdmission = await coreMutationGuard.admit({
-                workspaceId,
-                extra,
-                pointer: { required: true, sessionId: contract.coreMutation.sessionId, bindingHash: contract.coreMutation.bindingHash },
-                paths: contract.writePaths,
-                pathContainment: "NOT_PROVEN",
-                writerDomain: "AGENT",
-              });
-            } else {
-              throw new AgentSessionError(
-                "INVALID_EXECUTION_CONTRACT",
-                `CORE_BOUND_SESSION_REQUIRED: governed agent cannot continue${active ? " inside a newer active Core mutation session" : " without its persisted Core binding"}.`,
-              );
-            }
-          }
-        }
-        // Revalidate the persisted admission before every write-capable continuation.
-        const resumableWorkForContinue = currentAgent?.executionContract?.resumableWork;
-        if (currentWriteMode !== "read_only") {
-          try {
-            enforceNexusWriterAdmission({
-              workspaceRoot: workspace.root,
-              pointer: resumableWorkForContinue,
-              store: workResumeStore,
-              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              operation: "agent_continue",
-            });
-          } catch (err) {
-            throw new AgentSessionError(
-              "INVALID_EXECUTION_CONTRACT",
-              `P0_WRITER_ADMISSION_FAILED: ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
         }
         const output = await agentSessionManager.continueAgent({
           workspaceId,
@@ -6301,7 +5442,6 @@ export function createMcpServer(
           content: [textBlock(`Continuing agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
           structuredContent: {
             ...(output as unknown as Record<string, unknown>),
-            ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
           },
         };
       },
@@ -7291,13 +6431,6 @@ export function createMcpServer(
         );
         const sourceWorkspace = workspaces.getWorkspace(sourceWorkspaceId);
         const destinationWorkspace = workspaces.getWorkspace(destinationWorkspaceId);
-        enforceNexusWriterAdmission({
-          workspaceRoot: destinationWorkspace.root,
-          pointer: p0Pointer,
-          store: workResumeStore,
-          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-          operation: "workspace_copy_file",
-        });
 
         const resolvedSource = workspaces.resolveReadPath(sourceWorkspace, sourcePath);
         if (resolvedSource.nestedInstructionRebindRequired) {
@@ -7561,46 +6694,12 @@ export function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply, resumableWork: p0Pointer }, extra) => {
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }, extra) => {
       if (confirmApply) {
         await workspaces.assertConversationMutationAllowed(destinationWorkspaceId, openAiConversationScopeId(extra._meta));
       }
       const source = workspaces.getWorkspace(sourceWorkspaceId);
       const destination = workspaces.getWorkspace(destinationWorkspaceId);
-      if (confirmApply) {
-        enforceNexusWriterAdmission({
-          workspaceRoot: destination.root,
-          pointer: p0Pointer,
-          store: workResumeStore,
-          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-          operation: "candidate_integrate",
-        });
-      }
-      let coreAdmission: CoreMutationAdmission | undefined;
-      let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
-      const destinationCore = confirmApply && coreMutationGuard
-        ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
-        : undefined;
-      if (confirmApply && coreMutationGuard && destinationCore) {
-        const readiness = await inspectIntegrationReadiness({
-          sourceWorkspaceRoot: source.root,
-          candidateBase,
-          candidateHead,
-          destinationWorkspaceRoot: destination.root,
-          expectedDestinationHead,
-          dirtyPolicy,
-        });
-        if (!readiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_INTEGRATION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
-        coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
-        coreAdmission = await coreMutationGuard.admit({
-          workspaceId: destinationWorkspaceId,
-          extra,
-          pointer: { required: true, sessionId: destinationCore.id, bindingHash: destinationCore.bindingHash },
-          paths: readiness.candidateChangedPaths,
-          deletedPaths: readiness.candidateDeletedPaths,
-          pathContainment: "STRUCTURED_SINK_ENFORCED",
-        });
-      }
       const output = await integrateCandidate({
         sourceWorkspaceRoot: source.root,
         candidateBase,
@@ -7615,7 +6714,6 @@ export function createMcpServer(
         content: [textBlock(summary)],
         structuredContent: {
           ...(output as unknown as Record<string, unknown>),
-          ...(coreAdmission?.bound && coreCandidate ? { coreMutation: { sourceCandidate: coreMutationCandidateOutput(coreCandidate), destinationAdmission: coreMutationAdmissionOutput(coreAdmission) } } : {}),
         },
       };
     },
@@ -7723,43 +6821,9 @@ export function createMcpServer(
         expectedBuildId,
         expectedCapabilityManifestSha256,
         confirmPromote,
-        resumableWork: p0Pointer,
       }, extra) => {
         const source = workspaces.getWorkspace(sourceWorkspaceId);
         const destination = workspaces.getWorkspace(destinationWorkspaceId);
-        if (confirmPromote) {
-          try {
-            enforceNexusWriterAdmission({
-              workspaceRoot: destination.root,
-              pointer: p0Pointer,
-              store: workResumeStore,
-              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              operation: "git_promote_candidate",
-            });
-          } catch (err) {
-            throw new Error(
-              `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
-        }
-        let coreAdmission: CoreMutationAdmission | undefined;
-        let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
-        const destinationCore = confirmPromote && coreMutationGuard
-          ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
-          : undefined;
-        if (confirmPromote && coreMutationGuard && destinationCore) {
-          const readiness = await inspectIntegrationReadiness({ sourceWorkspaceRoot: source.root, candidateBase, candidateHead, destinationWorkspaceRoot: destination.root, expectedDestinationHead, dirtyPolicy: "pristine" });
-          if (!readiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_PROMOTION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
-          coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
-          coreAdmission = await coreMutationGuard.admit({
-            workspaceId: destinationWorkspaceId,
-            extra,
-            pointer: { required: true, sessionId: destinationCore.id, bindingHash: destinationCore.bindingHash },
-            paths: readiness.candidateChangedPaths,
-            deletedPaths: readiness.candidateDeletedPaths,
-            pathContainment: "STRUCTURED_SINK_ENFORCED",
-          });
-        }
         const output = await promoteCandidate({
           sourceWorkspaceRoot: source.root,
           candidateBase,
@@ -7788,7 +6852,6 @@ export function createMcpServer(
           content: [textBlock(summary)],
           structuredContent: {
             ...(output as unknown as Record<string, unknown>),
-            ...(coreAdmission?.bound && coreCandidate ? { coreMutation: { sourceCandidate: coreMutationCandidateOutput(coreCandidate), destinationAdmission: coreMutationAdmissionOutput(coreAdmission) } } : {}),
           },
         };
       },
@@ -7826,7 +6889,6 @@ export function createMcpServer(
           paths: z.array(z.string()),
           detached: z.boolean(),
           created: z.literal(true),
-          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: {
@@ -7836,71 +6898,14 @@ export function createMcpServer(
           openWorldHint: false,
         },
       },
-      async ({ workspaceId, expectedHead, message, paths, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, expectedHead, message, paths }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
         }
-        // Nexus-enrolled repositories cannot form Candidates without admission.
         try {
-          enforceNexusWriterAdmission({
-            workspaceRoot: workspace.root,
-            pointer: p0Pointer,
-            store: workResumeStore,
-            ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-            operation: "git_commit",
-          });
-        } catch (err) {
-          throw new Error(
-            `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
-        let committed: Awaited<ReturnType<typeof commitCandidate>> | undefined;
-        let coreAdmission: CoreMutationAdmission | undefined;
-        try {
-          const activeCore = coreMutationGuard?.active(workspaceId);
-          if (activeCore && coreMutationGuard) {
-            const before = await coreMutationGuard.snapshot({
-              workspaceId,
-              extra,
-              pointer: { required: true, sessionId: activeCore.id, bindingHash: activeCore.bindingHash },
-            });
-            if (before.scopeEscapePaths.length > 0) {
-              throw new Error(`[CORE_MUTATION_SCOPE_ESCAPE] Untrusted paths exist before Candidate formation: ${before.scopeEscapePaths.join(", ")}`);
-            }
-            if (before.deletionViolation) {
-              throw new Error(`[CORE_MUTATION_DELETION_FORBIDDEN] AcceptanceContract forbids deletion: ${before.deletedPaths.join(", ")}`);
-            }
-            const requested = new Set(paths);
-            const omitted = before.changedPaths.filter((path) => !requested.has(path));
-            if (omitted.length > 0) {
-              throw new Error(`[CORE_CANDIDATE_PATH_SET_INCOMPLETE] Candidate paths omit Core-bound workspace changes: ${omitted.join(", ")}`);
-            }
-            try {
-              coreAdmission = await coreMutationGuard.admit({
-                workspaceId,
-                extra,
-                pointer: { required: true, sessionId: activeCore.id, bindingHash: activeCore.bindingHash },
-                paths,
-                pathContainment: "NOT_PROVEN",
-                synchronousPostEffectCheck: true,
-              });
-            } catch (admitErr: any) {
-              if (/CORE_MUTATION_RECONCILE_REQUIRED/.test(String(admitErr?.message))) {
-                await coreMutationGuard.reconcileSynchronousEffect({
-                  workspaceId,
-                  extra,
-                  pointer: { sessionId: activeCore.id, bindingHash: activeCore.bindingHash },
-                });
-                throw new Error(
-                  "[CORE_MUTATION_RECONCILED_RETRY_REQUIRED] Prior unresolved synchronous Git effect was physically reconciled; retry the exact git_commit request.",
-                );
-              }
-              throw admitErr;
-            }
-          }
           const result = await commitCandidate({
             workspaceId,
             workspaceRoot: workspace.root,
@@ -7908,70 +6913,6 @@ export function createMcpServer(
             message,
             paths,
           });
-          committed = result;
-          if (coreAdmission?.bound && coreMutationGuard) {
-            await coreMutationGuard.reconcileSynchronousEffect({
-              workspaceId,
-              extra,
-              pointer: { sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
-            });
-          }
-          const coreCandidate = coreAdmission?.bound && coreMutationGuard
-            ? await coreMutationGuard.recordCandidate({ workspaceId, extra, candidateHead: result.commitSha, candidateTree: result.treeSha })
-            : undefined;
-
-          // REQ-4: After recordCandidate() succeeds, launch Core candidate acquisition asynchronously.
-          // (A) The durable operation + pending observation are created synchronously before git_commit returns.
-          // (B) Core CLI is not awaited — launched as a background fire-and-forget (void).
-          // (D) Core verdict is NEVER included in the worker-facing git_commit response (shadow evidence only).
-          if (coreCandidate && coreAdmission?.bound && durableOperations) {
-            const candidateSession = coreMutationSessions?.getById(coreAdmission.sessionId);
-            if (candidateSession) {
-              const binding = candidateSession.binding;
-              const verificationProfileBinding = binding.core.verification_profile;
-              // Build CoreVerificationProfile from binding if present
-              const coreProfile = verificationProfileBinding
-                ? {
-                    profile_id: verificationProfileBinding.profile_id,
-                    verifier_id_command_pairs: verificationProfileBinding.verifier_ids.map((id, i) => ({
-                      verifier_id: id,
-                      argv: verificationProfileBinding.verifier_commands[i] ?? [],
-                    })),
-                    timeout_seconds: verificationProfileBinding.timeout_seconds,
-                    profile_hash: verificationProfileBinding.profile_hash,
-                  }
-                : null;
-              // REQ-4-A: direct invocation executes synchronously until the
-              // orchestrator's first await, creating the durable operation and
-              // observation before this git_commit handler can return. Physical
-              // executable hashing and the Core CLI remain background work.
-              void orchestrateCoreCandidateAcquisition({
-                stateDir: config.stateDir,
-                durableStore: durableOperations.store,
-                sessionId: candidateSession.id,
-                candidateHead: coreCandidate.candidateHead,
-                candidateTree: coreCandidate.candidateTree,
-                sourceRevision: binding.repository.source_revision,
-                bindingHash: coreCandidate.bindingHash,
-                acceptanceContract: binding.core.acceptance_contract as unknown as Record<string, unknown>,
-                acceptanceContractHash: coreCandidate.acceptanceContractHash,
-                changeSetHash: coreCandidate.changeSetHash,
-                changeManifestHash: coreCandidate.changeManifestHash,
-                changedPaths: coreCandidate.changedPaths,
-                deletedPaths: coreCandidate.deletedPaths,
-                profile: coreProfile,
-                coreRuntime: coreRuntimeBinding,
-                coreRuntimeValidationConfig,
-                scopeRoot: workspace.root,
-                receiptDirectory: coreReceiptDirectory,
-                observationStore: coreObservationStore,
-              }).catch(() => {
-                // Shadow observer failures never convert an already-recorded
-                // Candidate into a worker-facing mutation failure.
-              });
-            }
-          }
-
           return {
             content: [textBlock(`Successfully created Candidate commit ${result.commitSha}`)],
             structuredContent: {
@@ -7983,42 +6924,9 @@ export function createMcpServer(
               paths: result.paths,
               detached: result.detached,
               created: true as const,
-              ...(coreCandidate
-                ? { coreMutation: { ...coreMutationCandidateOutput(coreCandidate), pathContainment: "NOT_PROVEN", pathContainmentEvidence: "PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN", trustedEngineeringCompletion: false } }
-                : coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
             },
           };
-
         } catch (err: any) {
-          if (committed && /CORE_MUTATION_POST_EFFECT_(?:SCOPE_ESCAPE|DELETION_FORBIDDEN)/.test(String(err?.message))) {
-            throw new Error(`${err.message} PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN. Commit ${committed.commitSha} already exists at HEAD; reconcile the exact Core session and do not retry or create a replacement attempt.`);
-          }
-          if (coreAdmission?.bound && coreMutationGuard && err instanceof GitCandidateError) {
-            const evidence = gitFailureEvidenceText(err);
-            try {
-              if (err.effect?.state === "EFFECT_UNKNOWN" || !err.effect) {
-                const physical = await coreMutationGuard.snapshot({
-                  workspaceId,
-                  extra,
-                  pointer: { required: true, sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
-                });
-                const violation = synchronousGitViolation(physical, "commit");
-                if (violation) throw violation;
-                throw new Error(`[${err.code}] ${err.message} ${evidence}`);
-              }
-              await coreMutationGuard.reconcileSynchronousEffect({
-                workspaceId,
-                extra,
-                pointer: { sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
-              });
-            } catch (coreError) {
-              if (/CORE_MUTATION_POST_EFFECT_(?:SCOPE_ESCAPE|DELETION_FORBIDDEN)/.test(String((coreError as Error)?.message))) {
-                throw new Error(`${(coreError as Error).message} Original Git failure preserved: ${err.message}; ${evidence}`);
-              }
-              throw coreError;
-            }
-            throw new Error(`[${err.code}] ${err.message} ${evidence}`);
-          }
           if (err instanceof GitCandidateError) {
             throw new Error(`[${err.code}] ${err.message}`);
           }
@@ -8058,7 +6966,6 @@ export function createMcpServer(
           pushedSha: z.string(),
           operationId: z.string(),
           attemptKey: z.string(),
-          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: {
@@ -8068,7 +6975,7 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, attemptKey, expectedHead, remote, branch, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, attemptKey, expectedHead, remote, branch }, extra) => {
         if (!durableOperations) {
           throw new Error("[DURABLE_OPERATION_STORE_REQUIRED] git_push requires the durable operation ledger.");
         }
@@ -8078,59 +6985,9 @@ export function createMcpServer(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
         }
-        // Nexus-enrolled repositories cannot publish Candidates without admission.
-        try {
-          enforceNexusWriterAdmission({
-            workspaceRoot: workspace.root,
-            pointer: p0Pointer,
-            store: workResumeStore,
-            ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-            operation: "git_push",
-          });
-        } catch (err) {
-          throw new Error(
-            `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
         let pushed: Awaited<ReturnType<typeof pushCandidate>> | undefined;
         let publication: DurableOperationRecord | undefined;
-        let coreAdmission: CoreMutationAdmission | undefined;
-        let coreCandidate: ReturnType<CoreMutationGuard["candidate"]> | undefined;
-        let publicationContinuity: "PRODUCER_SESSION" | "TERMINAL_CANDIDATE_HANDOFF" | undefined;
         try {
-          const activeCore = coreMutationGuard?.active(workspaceId);
-          if (activeCore && coreMutationGuard) {
-            coreCandidate = coreMutationGuard.candidate(expectedHead.toLowerCase());
-            if (!coreCandidate) throw new Error("[CORE_CANDIDATE_PROVENANCE_REQUIRED] Core-bound workspace cannot publish an unbound Candidate HEAD.");
-
-            const sameProducerSession =
-              coreCandidate.bindingHash === activeCore.bindingHash &&
-              coreCandidate.sessionId === activeCore.id;
-            if (sameProducerSession) {
-              publicationContinuity = "PRODUCER_SESSION";
-            } else {
-              const producerSession = coreMutationSessions?.getById(coreCandidate.sessionId);
-              const publicationSession = coreMutationSessions?.getById(activeCore.id);
-              const exactTerminalCandidateHandoff =
-                producerSession?.status === "COMPLETED" &&
-                coreCandidate.workspaceSessionId === workspaceId &&
-                publicationSession?.workspaceSessionId === workspaceId &&
-                publicationSession.sourceHead === coreCandidate.candidateHead &&
-                publicationSession.sourceTree === coreCandidate.candidateTree;
-              if (!exactTerminalCandidateHandoff) {
-                throw new Error("[CORE_CANDIDATE_PROVENANCE_CONFLICT] Candidate provenance does not match the active Core publication binding.");
-              }
-              publicationContinuity = "TERMINAL_CANDIDATE_HANDOFF";
-            }
-
-            coreAdmission = await coreMutationGuard.admit({
-              workspaceId,
-              extra,
-              pointer: { required: true, sessionId: activeCore.id, bindingHash: activeCore.bindingHash },
-              pathContainment: "NOT_PROVEN",
-              synchronousPostEffectCheck: true,
-            });
-          }
           publication = await durableOperations.gitPush({
             attemptKey,
             workspaceId,
@@ -8145,27 +7002,6 @@ export function createMcpServer(
               branch,
               pushedSha: String(publication.receipt?.pushedSha ?? expectedHead),
             };
-          }
-          if (coreAdmission?.bound && coreMutationGuard) {
-            if (publication.status === "outcome_unknown") {
-              const physical = await coreMutationGuard.snapshot({
-                workspaceId,
-                extra,
-                pointer: { required: true, sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
-              });
-              const violation = synchronousGitViolation(physical, "push");
-              if (violation) {
-                throw new Error(
-                  `${violation.message} Git publication ${publication.operationId} remains outcome_unknown; reconcile both the Core session and the same publication operation before any retry.`,
-                );
-              }
-            } else {
-              await coreMutationGuard.reconcileSynchronousEffect({
-                workspaceId,
-                extra,
-                pointer: { sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
-              });
-            }
           }
           if (publication.status !== "succeeded") {
             return {
@@ -8187,55 +7023,9 @@ export function createMcpServer(
               pushedSha: result.pushedSha,
               operationId: publication.operationId,
               attemptKey: publication.attemptKey,
-              ...(coreCandidate
-                ? {
-                    coreMutation: {
-                      ...coreMutationCandidateOutput(coreCandidate),
-                      ...(activeCore
-                        ? {
-                            publicationSessionId: activeCore.id,
-                            publicationBindingHash: activeCore.bindingHash,
-                            publicationContinuity,
-                          }
-                        : {}),
-                      pathContainment: "NOT_PROVEN",
-                      pathContainmentEvidence: "PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN",
-                      trustedEngineeringCompletion: false,
-                    },
-                  }
-                : coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
             },
           };
         } catch (err: any) {
-          if (pushed && /CORE_MUTATION_POST_EFFECT_(?:SCOPE_ESCAPE|DELETION_FORBIDDEN)/.test(String(err?.message))) {
-            throw new Error(`${err.message} PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN. Push ${pushed.pushedSha} is confirmed at ${pushed.remote}/${pushed.branch}; reconcile the exact Core session and do not retry or create a replacement attempt.`);
-          }
-          if (coreAdmission?.bound && coreMutationGuard && err instanceof GitCandidateError) {
-            const evidence = gitFailureEvidenceText(err);
-            try {
-              if (err.effect?.state === "EFFECT_UNKNOWN" || !err.effect) {
-                const physical = await coreMutationGuard.snapshot({
-                  workspaceId,
-                  extra,
-                  pointer: { required: true, sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
-                });
-                const violation = synchronousGitViolation(physical, "push");
-                if (violation) throw violation;
-                throw new Error(`[${err.code}] ${err.message} ${evidence}`);
-              }
-              await coreMutationGuard.reconcileSynchronousEffect({
-                workspaceId,
-                extra,
-                pointer: { sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
-              });
-            } catch (coreError) {
-              if (/CORE_MUTATION_POST_EFFECT_(?:SCOPE_ESCAPE|DELETION_FORBIDDEN)/.test(String((coreError as Error)?.message))) {
-                throw new Error(`${(coreError as Error).message} Original Git failure preserved: ${err.message}; ${evidence}`);
-              }
-              throw coreError;
-            }
-            throw new Error(`[${err.code}] ${err.message} ${evidence}`);
-          }
           const code = err instanceof GitCandidateError ? err.code : "GIT_EXECUTION_ERROR";
           if (err instanceof DurableOperationError && err.operation) {
             return {
@@ -8558,8 +7348,6 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   initializationCleanups.push(() => processSessions.shutdown());
-  const coreMutationSessions = new CoreMutationSessionStore(config.stateDir);
-  initializationCleanups.push(() => coreMutationSessions.close());
   const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir, options.carrierClock, options.completionBindings);
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
   const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination ?? carrierBindings?.readers);
@@ -9322,7 +8110,7 @@ export function createServer(
     hostOperations,
     options.controlPlaneInventory,
     controlPlaneInventoryReader,
-    coreMutationSessions,
+    undefined, // coreMutationSessions
     undefined, // coreMutationTestOnlyBypass — production never set
     workResumeStore,
   );
