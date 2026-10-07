@@ -1,30 +1,22 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   EXECUTION_PROTOCOL_VERSION,
-  NEXUS_TOOL_AUTHORITY_SCHEMA,
   TOOL_INTENT_NAMESPACE,
   TOOL_PROJECTION_MANIFEST_SCHEMA,
   ExecutionProtocolError,
-  assertExecutionAuthority,
   assertExecutionBindingToolManifest,
   assertToolManifestRef,
   assertSameExecutionGeneration,
-  assertNexusGrantAuthorizesExecution,
   buildExecutionGenerationBinding,
   buildHostGenerationBinding,
   hashDispatchIntent,
   hashExecutionBinding,
-  hashNexusExecutionGrant,
   hashToolProjectionManifest,
   parseDispatchIntent,
-  parseNexusExecutionGrant,
-  parseNexusExecutionGrantRef,
   parseToolProjectionManifest,
   renderDispatchIntentForWorker,
   toolProjectionManifestRef,
-  validateResolvedNexusExecutionGrant,
   DIRECT_CANDIDATE_EXECUTION_SCHEMA,
   computeDirectCandidateEvidenceId,
   computeDispatchIntentHash,
@@ -33,7 +25,6 @@ import {
   type DispatchIntent,
   type DirectCandidateExecutionEvidence,
   type ExecutionBinding,
-  type NexusExecutionGrant,
 } from "./execution-protocol.js";
 
 function controllerIntent(): DispatchIntent {
@@ -53,34 +44,6 @@ function controllerIntent(): DispatchIntent {
     expectedEvidence: ["focused tests"],
     claimCeiling: "CANDIDATE_READY",
   };
-}
-
-function sha256(value: string): string {
-  return createHash("sha256").update(value).digest("hex");
-}
-
-function nexusGrant(intent: DispatchIntent): NexusExecutionGrant {
-  const payload = {
-    schema: "nexus.devspace.execution_grant.v1" as const,
-    grantId: "g10-pilot-grant",
-    issuer: "nexus" as const,
-    taskId: intent.taskId,
-    attemptId: intent.attemptId,
-    devspaceBaseRevision: "a".repeat(40),
-    dispatchIntentHash: hashDispatchIntent(intent),
-    profile: "codex-implement",
-    writeScope: [...(intent.writeScope ?? [])],
-    effectCeiling: "CANDIDATE" as const,
-    claimCeiling: "CANDIDATE_READY" as const,
-    authorityPath: "tasks/g10/00-pilot.md",
-    authoritySha256: "b".repeat(64),
-    issuedAt: "2026-09-02T05:00:00.000Z",
-    expiresAt: "2026-09-02T07:00:00.000Z",
-    revocationState: "NOT_REVOKED" as const,
-    revokedAt: null,
-    revocationReason: null,
-  };
-  return { ...payload, grantHash: hashNexusExecutionGrant(payload as any) };
 }
 
 function ownerBinding(): ExecutionBinding {
@@ -129,111 +92,18 @@ test("controller DispatchIntent is deterministic, model-neutral, and cannot expr
   );
 });
 
-test("OWNER_DIRECT binding hashes deterministically and requires trusted owner evidence", () => {
+test("OWNER_DIRECT binding hashes deterministically and rejects retired authority shapes", () => {
   const binding = ownerBinding();
   const first = hashExecutionBinding(binding);
   const second = hashExecutionBinding({ ...binding, identity: { ...binding.identity } });
   assert.match(first, /^[a-f0-9]{64}$/);
   assert.equal(first, second);
-  assert.doesNotThrow(() => assertExecutionAuthority(binding.authority, { kind: "OWNER_DIRECT" }));
   assert.throws(
-    () => assertExecutionAuthority(binding.authority),
-    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "AUTHORITY_EVIDENCE_MISMATCH",
-  );
-});
-
-test("NEXUS_GOVERNED cannot self-validate or silently accept mismatched grant evidence", () => {
-  const authority = {
-    mode: "NEXUS_GOVERNED" as const,
-    issuer: "nexus" as const,
-    grantId: "grant-1",
-    grantHash: "abc123",
-  };
-  assert.throws(
-    () => assertExecutionAuthority(authority),
-    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "NEXUS_AUTHORITY_NOT_VALIDATED",
-  );
-  assert.throws(
-    () => assertExecutionAuthority(authority, { kind: "NEXUS_VALIDATED", grantId: "grant-2", grantHash: "abc123" }),
-    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "AUTHORITY_EVIDENCE_MISMATCH",
-  );
-  assert.doesNotThrow(() => assertExecutionAuthority(authority, {
-    kind: "NEXUS_VALIDATED",
-    grantId: "grant-1",
-    grantHash: "abc123",
-  }));
-});
-
-test("canonical Nexus grant bytes are revision/hash/task-card bound before semantic authorization", () => {
-  const intent = controllerIntent();
-  const grant = nexusGrant(intent);
-  const grantRaw = JSON.stringify(grant);
-  const authorityRaw = "# G10 pilot authority\n";
-  const ref = parseNexusExecutionGrantRef({
-    repository: "James3014/Nexus-new",
-    revision: "c".repeat(40),
-    grantPath: "tasks/g10/grant.json",
-    grantSha256: sha256(grantRaw),
-    authorityPath: grant.authorityPath,
-    authoritySha256: sha256(authorityRaw),
-  });
-  const reboundGrant = { ...grant, authoritySha256: ref.authoritySha256 };
-  reboundGrant.grantHash = hashNexusExecutionGrant(reboundGrant);
-  const reboundRaw = JSON.stringify(reboundGrant);
-  ref.grantSha256 = sha256(reboundRaw);
-
-  const resolved = validateResolvedNexusExecutionGrant(ref, reboundRaw, authorityRaw, ref.revision);
-  assert.equal(resolved.grantId, grant.grantId);
-  assert.throws(
-    () => validateResolvedNexusExecutionGrant(ref, reboundRaw, authorityRaw, "d".repeat(40)),
-    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "NEXUS_AUTHORITY_NOT_VALIDATED",
-  );
-  assert.throws(
-    () => validateResolvedNexusExecutionGrant({ ...ref, grantSha256: "e".repeat(64) }, reboundRaw, authorityRaw, ref.revision),
-    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "NEXUS_AUTHORITY_NOT_VALIDATED",
-  );
-  assert.throws(
-    () => validateResolvedNexusExecutionGrant({ ...ref, authoritySha256: "f".repeat(64) }, reboundRaw, authorityRaw, ref.revision),
-    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "NEXUS_AUTHORITY_NOT_VALIDATED",
-  );
-});
-
-test("Nexus grant narrows task, attempt, base, profile, scope, claim, time, and revocation authority", () => {
-  const intent = controllerIntent();
-  const grant = nexusGrant(intent);
-  const baseInput = {
-    grant,
-    dispatchIntent: intent,
-    expectedHead: grant.devspaceBaseRevision,
-    profile: grant.profile,
-    writePaths: [...(intent.writeScope ?? [])],
-    now: new Date("2026-09-02T06:00:00.000Z"),
-  };
-  assert.deepEqual(assertNexusGrantAuthorizesExecution(baseInput), {
-    kind: "NEXUS_VALIDATED",
-    grantId: grant.grantId,
-    grantHash: grant.grantHash,
-  });
-
-  for (const mutated of [
-    { ...baseInput, dispatchIntent: { ...intent, taskId: "wrong-task" } },
-    { ...baseInput, dispatchIntent: { ...intent, attemptId: "wrong-attempt" } },
-    { ...baseInput, expectedHead: "f".repeat(40) },
-    { ...baseInput, profile: "other-profile" },
-    { ...baseInput, writePaths: ["src/outside.ts"] },
-    { ...baseInput, now: new Date("2026-09-02T08:00:00.000Z") },
-  ]) {
-    assert.throws(
-      () => assertNexusGrantAuthorizesExecution(mutated as any),
-      (error: unknown) => error instanceof ExecutionProtocolError && ["AUTHORITY_EVIDENCE_MISMATCH", "NEXUS_AUTHORITY_NOT_VALIDATED"].includes(error.code),
-    );
-  }
-
-  const revoked = { ...grant, revocationState: "REVOKED" as const, revokedAt: "2026-09-02T05:30:00.000Z", revocationReason: "owner revoked" };
-  revoked.grantHash = hashNexusExecutionGrant(revoked);
-  assert.throws(
-    () => assertNexusGrantAuthorizesExecution({ ...baseInput, grant: revoked }),
-    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "NEXUS_AUTHORITY_NOT_VALIDATED",
+    () => hashExecutionBinding({
+      ...binding,
+      authority: { mode: "NEXUS_GOVERNED", issuer: "nexus" },
+    } as unknown as ExecutionBinding),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "INVALID_EXECUTION_BINDING",
   );
 });
 
@@ -399,134 +269,6 @@ test("ExecutionBinding tool manifest reference is content, identity, and authori
   );
 });
 
-
-test("Wave B governed tool authority is grant-hash bound and projection validation fails closed", () => {
-  const intent: DispatchIntent = {
-    ...controllerIntent(),
-    taskId: "issue-982-wave-b",
-    attemptId: "wave-b-attempt-1",
-    writeScope: [],
-    exclusiveOwnership: false,
-    claimCeiling: "RESULT_RETURNED",
-  };
-  const historicalGrant = nexusGrant(intent);
-  const baseInput = {
-    dispatchIntent: intent,
-    expectedHead: historicalGrant.devspaceBaseRevision,
-    profile: historicalGrant.profile,
-    writePaths: [],
-    now: new Date("2026-09-02T06:00:00.000Z"),
-  };
-  assert.doesNotThrow(() => assertNexusGrantAuthorizesExecution({ ...baseInput, grant: historicalGrant }));
-
-  const toolAuthority = {
-    schema: NEXUS_TOOL_AUTHORITY_SCHEMA,
-    namespace: TOOL_INTENT_NAMESPACE,
-    plannerDecisionHash: "1".repeat(64),
-    plannerPlanHash: "2".repeat(64),
-    policyHash: "3".repeat(64),
-    authorizedToolCeiling: [
-      "workspace.read",
-      "workspace.search_text",
-      "workspace.search_paths",
-      "workspace.list",
-    ],
-  } as const;
-  const grantWithAuthority = {
-    ...historicalGrant,
-    toolAuthority: {
-      ...toolAuthority,
-      authorizedToolCeiling: [...toolAuthority.authorizedToolCeiling],
-    },
-  };
-  grantWithAuthority.grantHash = hashNexusExecutionGrant(grantWithAuthority);
-
-  const manifest = {
-    schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
-    namespace: TOOL_INTENT_NAMESPACE,
-    identity: { taskId: intent.taskId, attemptId: intent.attemptId },
-    authority: { mode: "NEXUS_GOVERNED" as const, issuer: "nexus" as const },
-    authorizedToolCeiling: [...toolAuthority.authorizedToolCeiling],
-    candidateTools: [...toolAuthority.authorizedToolCeiling],
-    selectedTools: ["workspace.read" as const],
-    orderingMode: "ORDER_INDEPENDENT" as const,
-  };
-
-
-  assert.doesNotThrow(() => assertNexusGrantAuthorizesExecution({
-    ...baseInput,
-    grant: grantWithAuthority,
-    authorizedToolCeiling: [...toolAuthority.authorizedToolCeiling],
-    toolProjectionManifest: manifest,
-  }));
-
-  assert.throws(
-    () => assertNexusGrantAuthorizesExecution({
-      ...baseInput,
-      grant: historicalGrant,
-      authorizedToolCeiling: [...toolAuthority.authorizedToolCeiling],
-      toolProjectionManifest: manifest,
-    }),
-    (error: unknown) => error instanceof ExecutionProtocolError
-      && error.code === "AUTHORITY_EVIDENCE_MISMATCH"
-      && /requires tracked Nexus grant toolAuthority/.test(error.message),
-  );
-
-  const widenedCeiling = [...toolAuthority.authorizedToolCeiling, "workspace.mutate" as const];
-  assert.throws(
-    () => assertNexusGrantAuthorizesExecution({
-      ...baseInput,
-      grant: grantWithAuthority,
-      authorizedToolCeiling: widenedCeiling,
-      toolProjectionManifest: { ...manifest, authorizedToolCeiling: widenedCeiling },
-    }),
-    (error: unknown) => error instanceof ExecutionProtocolError
-      && error.code === "AUTHORITY_EVIDENCE_MISMATCH"
-      && /does not match tracked Nexus grant toolAuthority/.test(error.message),
-  );
-
-
-  const tampered = {
-    ...grantWithAuthority,
-    toolAuthority: {
-      ...grantWithAuthority.toolAuthority,
-      authorizedToolCeiling: ["workspace.read" as const],
-    },
-  };
-  assert.throws(
-    () => assertNexusGrantAuthorizesExecution({ ...baseInput, grant: tampered }),
-    (error: unknown) => error instanceof ExecutionProtocolError
-      && error.code === "INVALID_NEXUS_EXECUTION_GRANT"
-      && /grant hash mismatch/.test(error.message),
-  );
-
-  const badHashAuthority = {
-    ...grantWithAuthority,
-    toolAuthority: {
-      ...grantWithAuthority.toolAuthority,
-      plannerDecisionHash: "bad",
-    },
-  };
-  badHashAuthority.grantHash = hashNexusExecutionGrant(badHashAuthority as any);
-  assert.throws(
-    () => assertNexusGrantAuthorizesExecution({ ...baseInput, grant: badHashAuthority as any }),
-    (error: unknown) => error instanceof ExecutionProtocolError
-      && error.code === "INVALID_NEXUS_EXECUTION_GRANT",
-  );
-
-  assert.throws(
-    () => parseNexusExecutionGrant({
-      ...historicalGrant,
-      toolAuthority: {
-        schema: NEXUS_TOOL_AUTHORITY_SCHEMA,
-        namespace: TOOL_INTENT_NAMESPACE,
-      },
-    }),
-    (error: unknown) => error instanceof ExecutionProtocolError
-      && error.code === "INVALID_NEXUS_EXECUTION_GRANT"
-      && /exact governed tool-authority fields/.test(error.message),
-  );
-});
 
 function sampleDirectEvidence(): DirectCandidateExecutionEvidence {
   const intent = controllerIntent();
