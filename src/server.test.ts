@@ -1074,21 +1074,24 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
     }
     const drainTool = tools.tools.find((tool) => tool.name === "cutover_drain");
     assert.ok(drainTool);
-    assert.ok(
+    assert.equal(
       (drainTool.inputSchema as { properties?: Record<string, unknown> }).properties?.carrierCredential,
-      "cutover_drain must expose inline carrierCredential for fresh-session rebind",
+      undefined,
+      "cutover_drain must not expose governance credentials",
     );
     const restartTool = tools.tools.find((tool) => tool.name === "cutover_restart_self");
     assert.ok(restartTool);
-    assert.ok(
+    assert.equal(
       (restartTool.inputSchema as { properties?: Record<string, unknown> }).properties?.carrierCredential,
-      "cutover_restart_self must expose inline carrierCredential for fresh-session rebind",
+      undefined,
+      "cutover_restart_self must not expose governance credentials",
     );
     const reconcileTool = tools.tools.find((tool) => tool.name === "cutover_reconcile");
     assert.ok(reconcileTool);
-    assert.ok(
+    assert.equal(
       (reconcileTool.inputSchema as { properties?: Record<string, unknown> }).properties?.carrierCredential,
-      "cutover_reconcile must expose inline carrierCredential for fresh-session rebind",
+      undefined,
+      "cutover_reconcile must not expose governance credentials",
     );
 
     const deniedStart = await client.callTool({
@@ -1829,7 +1832,7 @@ test("fresh direct workspace can edit and test without Core mutation session", a
       profile: "mutator",
       prompt: "launch bounded direct worker",
       attemptKey: "core-unbound-agent-start",
-      executionContract: { authorityMode: "OWNER_DIRECT", writePaths: ["AGENTS.md"] },
+      executionContract: { writePaths: ["AGENTS.md"] },
     },
     _meta: conversation,
   });
@@ -2475,7 +2478,6 @@ test("subagents: OWNER_DIRECT write-capable start does not require Core or capab
       prompt: "perform one bounded owner-direct change",
       attemptKey: "issue350-owner-direct-start",
       executionContract: {
-        authorityMode: "OWNER_DIRECT",
         writePaths: ["src"],
       },
     },
@@ -2504,7 +2506,6 @@ test("subagents: OWNER_DIRECT write-capable continuation does not require Core b
       prompt: "perform one bounded owner-direct change",
       attemptKey: "issue350-owner-direct-continue",
       executionContract: {
-        authorityMode: "OWNER_DIRECT",
         writePaths: ["src"],
       },
     },
@@ -2546,69 +2547,34 @@ test("subagents: OWNER_DIRECT write-capable continuation does not require Core b
   assert.equal(structuredContent(continued).coreMutation, undefined);
 });
 
-test("subagents: NEXUS_GOVERNED fails closed at the MCP boundary without complete canonical grant evidence", async (t) => {
+test("subagents: agent_start public contract rejects retired Nexus governance fields", async (t) => {
   const context = await fixture(t, { git: true, subagents: true });
-  const openResult = await callOpen(context.client, context.project, "chat-nexus-governed-missing-grant");
-  const workspaceId = structuredContent(openResult).workspaceId as string;
-  const head = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project });
-  const intent = {
-    taskId: "task-server-g9",
-    attemptId: "attempt-server-g9",
-    objective: "Perform one bounded governed change.",
-    roleIntent: "DEEP_ENGINEERING",
-    readScope: ["src"],
-    writeScope: ["src"],
-    exclusiveOwnership: true,
-    forbiddenChanges: ["Do not fall back to OWNER_DIRECT."],
-    acceptanceCriteria: ["Reject missing Nexus authority before launch."],
-    verificationRequired: true,
-    expectedEvidence: ["typed rejection"],
-    claimCeiling: "CANDIDATE_READY",
-  };
+  const tools = await context.client.listTools();
+  const startTool = tools.tools.find((tool) => tool.name === "agent_start");
+  assert.ok(startTool);
+  const schema = JSON.stringify(startTool.inputSchema);
+  assert.doesNotMatch(
+    schema,
+    /NEXUS_GOVERNED|nexusGrant|capabilityDiscovery|coreMutation|resumableWork|carrierCredential|authorityMode/,
+  );
 
-  const missingGrant = await context.client.callTool({
+  const openResult = await callOpen(context.client, context.project, "chat-retired-governance-field");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  const rejected = await context.client.callTool({
     name: "agent_start",
     arguments: {
       workspaceId,
       profile: "reviewer",
-      prompt: "must not launch",
-      attemptKey: intent.attemptId,
+      prompt: "must reject retired governance input",
+      attemptKey: "retired-governance-field",
       executionContract: {
         authorityMode: "NEXUS_GOVERNED",
-        dispatchIntent: intent,
-        expectedHead: head.stdout.trim(),
         writePaths: ["src"],
       },
     },
   });
-  assert.equal(missingGrant.isError, true);
-  assert.match(responseText(missingGrant), /NEXUS_GOVERNED.*requires nexusGrant/i);
-
-  const directWithSyntheticGrant = await context.client.callTool({
-    name: "agent_start",
-    arguments: {
-      workspaceId,
-      profile: "reviewer",
-      prompt: "must not launch",
-      attemptKey: "attempt-server-g9-direct",
-      executionContract: {
-        authorityMode: "OWNER_DIRECT",
-        nexusGrant: {
-          repository: "James3014/Nexus-new",
-          revision: "a".repeat(40),
-          grantPath: "tasks/g9/grant.json",
-          grantSha256: "b".repeat(64),
-          authorityPath: "tasks/g9/00-task.md",
-          authoritySha256: "c".repeat(64),
-        },
-        dispatchIntent: { ...intent, attemptId: "attempt-server-g9-direct" },
-        expectedHead: head.stdout.trim(),
-        writePaths: ["src"],
-      },
-    },
-  });
-  assert.equal(directWithSyntheticGrant.isError, true);
-  assert.match(responseText(directWithSyntheticGrant), /OWNER_DIRECT.*must not carry Nexus grant/i);
+  assert.equal(rejected.isError, true);
+  assert.match(responseText(rejected), /unrecognized|authorityMode/i);
 });
 
 test("subagents: agent_start executionContract expectedHead mismatch fails closed", async (t) => {
@@ -2883,7 +2849,7 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
 
 
 
-test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabilities", async (t) => {
+test("agent_start schema preserves direct execution safety capabilities", async (t) => {
   const context = await fixture(t, { subagents: true });
   const tools = await context.client.listTools();
   const start = tools.tools.find((tool) => tool.name === "agent_start");
@@ -2892,9 +2858,9 @@ test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabiliti
   const contract = props.executionContract;
   const contractProps = contract.anyOf?.find((entry: any) => entry.type === "object")?.properties
     ?? contract.properties;
-  assert.ok(contractProps.authorityMode);
-  assert.ok(contractProps.nexusGrant);
-  assert.ok(contractProps.coreMutation, "write-capable agent_start must expose the exact durable Core pointer");
+  assert.equal(contractProps.authorityMode, undefined);
+  assert.equal(contractProps.nexusGrant, undefined);
+  assert.equal(contractProps.coreMutation, undefined);
   assert.ok(contractProps.idleTimeoutMs);
   assert.match(contractProps.idleTimeoutMs.description, /terminated.*no provider activity/i);
   assert.ok(contractProps.authorizedToolCeiling, "agent_start must expose the durable tool authority ceiling");
@@ -2946,7 +2912,6 @@ test("agent_start MCP transports durable tool authority and projection into the 
       prompt: "transport the bounded tool projection",
       attemptKey: "tool-projection-start",
       executionContract: {
-        authorityMode: "OWNER_DIRECT",
         authorizedToolCeiling: ["workspace.search_text", "workspace.read"],
         toolProjectionManifest: manifest,
         effectProjection: {
@@ -3202,7 +3167,6 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
       attemptKey: "server-clone-1",
       remote: context.project,
       destination,
-      authorityMode: "OWNER_DIRECT",
     },
   });
   assert.equal(clone.isError, undefined);
@@ -3216,7 +3180,6 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
       attemptKey: "server-clone-1",
       remote: context.project,
       destination,
-      authorityMode: "OWNER_DIRECT",
     },
   });
   assert.equal(structuredContent(replay).operationId, cloneRecord.operationId);
@@ -3229,7 +3192,6 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
       attemptKey: "server-clone-outside",
       remote: context.project,
       destination: join(outside, "clone"),
-      authorityMode: "OWNER_DIRECT",
     },
   });
   assert.equal(denied.isError, true);
@@ -3252,7 +3214,6 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
       workspaceId,
       attemptKey: "server-deps-1",
       recipe: "npm_ci",
-      authorityMode: "OWNER_DIRECT",
     },
   });
   assert.equal(sync.isError, true);
@@ -3266,16 +3227,6 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
   });
   assert.equal(structuredContent(status).status, "succeeded");
 
-  const nexusBlocked = await context.client.callTool({
-    name: "workspace_clone",
-    arguments: {
-      attemptKey: "server-nexus-unvalidated",
-      remote: context.project,
-      destination: join(context.project, "..", "nexus-unvalidated"),
-      authorityMode: "NEXUS_GOVERNED",
-    },
-  });
-  assert.equal(nexusBlocked.isError, true);
 });
 
 test("OWNER_DIRECT dependency_sync bypasses carrier only for a managed isolated worktree", async (t) => {
@@ -3299,7 +3250,6 @@ test("OWNER_DIRECT dependency_sync bypasses carrier only for a managed isolated 
       workspaceId: isolatedWorkspaceId,
       attemptKey: "isolated-owner-direct-deps",
       recipe: "npm_ci",
-      authorityMode: "OWNER_DIRECT",
     },
     _meta: { "openai/session": "isolated-dependency-sync" },
   });
@@ -3318,7 +3268,6 @@ test("OWNER_DIRECT dependency_sync bypasses carrier only for a managed isolated 
       workspaceId: checkoutWorkspaceId,
       attemptKey: "checkout-owner-direct-deps",
       recipe: "npm_ci",
-      authorityMode: "OWNER_DIRECT",
     },
     _meta: { "openai/session": "checkout-dependency-sync" },
   });
@@ -3422,7 +3371,7 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
   assert.match(agentStartSchema, /attemptKey/);
   assert.match(agentStartSchema, /expectedHead/);
   assert.match(agentStartSchema, /writePaths/);
-  assert.match(agentStartSchema, /resumableWork/);
+  assert.doesNotMatch(agentStartSchema, /resumableWork|authorityMode|NEXUS_GOVERNED/);
   assert.doesNotMatch(
     agentStartSchema,
     /nexusGrant|coreMutation|capabilityDiscovery|authorizedToolCeiling|toolProjectionManifest|effectProjection/,
@@ -3551,7 +3500,6 @@ test("dispatch mode ignores Nexus enrollment and admits bounded direct agent_sta
         prompt: "perform one bounded direct change",
         attemptKey,
         executionContract: {
-          authorityMode: "OWNER_DIRECT",
           expectedHead: head,
           writePaths: ["README.md"],
           maxFiles: 1,
@@ -3606,7 +3554,6 @@ test("dispatch mode requires bounded write scope and launches OWNER_DIRECT witho
       prompt: "perform one bounded direct change",
       attemptKey: "issue350-dispatch-bounded",
       executionContract: {
-        authorityMode: "OWNER_DIRECT",
         expectedHead: head,
         writePaths: ["src"],
         maxFiles: 2,

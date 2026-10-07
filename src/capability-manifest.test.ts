@@ -12,9 +12,6 @@ function agentStartInput(idleDescription = "heartbeat-backed idle supervision"):
   return {
     workspaceId: z.string(),
     executionContract: z.object({
-      authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional(),
-      nexusGrant: z.object({ revision: z.string() }).optional(),
-      capabilityDiscovery: z.object({ schema: z.string() }).optional(),
       authorizedToolCeiling: z.array(z.string()).optional(),
       toolProjectionManifest: z.object({ schema: z.string() }).optional(),
       idleTimeoutMs: z.number().describe(idleDescription).optional(),
@@ -45,11 +42,8 @@ test("loaded capability manifest is deterministic and derived from the registere
   assert.equal(first.schema, CAPABILITY_MANIFEST_SCHEMA);
   assert.deepEqual(first.missing, []);
   assert.deepEqual(first.capabilities, [
-    "agent_start.executionContract.authorityMode",
     "agent_start.executionContract.authorizedToolCeiling",
-    "agent_start.executionContract.capabilityDiscovery",
     "agent_start.executionContract.idleTimeoutMs",
-    "agent_start.executionContract.nexusGrant",
     "agent_start.executionContract.toolProjectionManifest",
     "agent_start.tool",
   ]);
@@ -81,10 +75,7 @@ test("loaded capability manifest detects removal from the actual registered sche
 
   const manifest = deriveLoadedCapabilityManifest({ agent_start: regressed });
   assert.deepEqual(manifest.missing, [
-    "agent_start.executionContract.authorityMode",
     "agent_start.executionContract.authorizedToolCeiling",
-    "agent_start.executionContract.capabilityDiscovery",
-    "agent_start.executionContract.nexusGrant",
     "agent_start.executionContract.toolProjectionManifest",
   ]);
 });

@@ -267,7 +267,6 @@ test("Test 3: Agent attemptKey replay is idempotent for identical requests and f
     prompt: "First execution prompt",
     attemptKey,
     executionContract: {
-      authorityMode: "OWNER_DIRECT",
       expectedHead: headSha,
       writePaths: ["file.txt"],
     },
@@ -314,7 +313,6 @@ test("Test 4: Lost ACK recovery via agent_status/agent_reconcile preserves attem
     prompt: "Worker execution prompt",
     attemptKey,
     executionContract: {
-      authorityMode: "OWNER_DIRECT",
       expectedHead: headSha,
       writePaths: ["output.txt"],
     },
@@ -442,7 +440,6 @@ test("Test 7: Worker write scope (writePaths) is enforced for direct workers", a
       prompt: "unbounded worker",
       attemptKey: "scope-test-1",
       executionContract: {
-        authorityMode: "OWNER_DIRECT",
         expectedHead: headSha,
         // no writePaths supplied
       },
@@ -465,6 +462,10 @@ test("Test 8: Tool modes (minimal, dispatch, codex, full) surface separation is 
   const codex = await env.createClient("codex");
   const codexTools = (await codex.client.listTools()).tools.map((t) => t.name);
 
+  const full = await env.createClient("full");
+  const fullToolList = await full.client.listTools();
+  const fullTools = fullToolList.tools.map((t) => t.name);
+
   // Minimal mode has direct coding tools, but NO agent tools
   assert.ok(minimalTools.includes("read"));
   assert.ok(minimalTools.includes("write"));
@@ -478,7 +479,20 @@ test("Test 8: Tool modes (minimal, dispatch, codex, full) surface separation is 
   assert.ok(dispatchTools.includes("agent_status"));
   assert.ok(dispatchTools.includes("agent_reconcile"));
   assert.ok(dispatchTools.includes("agent_cancel"));
-  assert.equal(dispatchTools.includes("work_resume_prepare"), false, "dispatch mode must not expose carrier-backed governance choreography");
+  assert.equal(dispatchTools.some((name) => name.startsWith("work_resume_")), false, "dispatch mode must not expose retired resumable-work choreography");
+  assert.equal(fullTools.some((name) => name.startsWith("work_resume_")), false, "full mode must not expose retired resumable-work choreography");
+
+  const fullAgentStart = fullToolList.tools.find((tool) => tool.name === "agent_start");
+  assert.ok(fullAgentStart);
+  const fullAgentStartSchema = JSON.stringify(fullAgentStart.inputSchema);
+  assert.match(fullAgentStartSchema, /attemptKey/);
+  assert.match(fullAgentStartSchema, /expectedHead/);
+  assert.match(fullAgentStartSchema, /writePaths/);
+  assert.match(fullAgentStartSchema, /maxFiles/);
+  assert.doesNotMatch(
+    fullAgentStartSchema,
+    /NEXUS_GOVERNED|nexusGrant|capabilityDiscovery|coreMutation|resumableWork|carrierCredential|authorityMode/,
+  );
   assert.equal(dispatchTools.includes("write"), false, "dispatch mode must not include write");
   assert.equal(dispatchTools.includes("edit"), false, "dispatch mode must not include edit");
   assert.equal(dispatchTools.includes("bash"), false, "dispatch mode must not include bash");

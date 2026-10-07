@@ -2,10 +2,7 @@ import { CarrierBindingStore, type CarrierCompletionBinding } from "./carrier-bi
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
 import {
-  computeWorkKey,
-  computeWorkRequestHash,
   createWorkResumeStore,
-  resolveCanonicalPath,
   WorkResumeStore,
 } from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -288,17 +285,6 @@ const REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS = {
   idempotentHint: true,
   openWorldHint: false,
 };
-
-/** Zod schema for the P0 resumable-work pointer carried by write-capable tool inputs. */
-function resumableWorkSchema() {
-  return z.object({
-    workKey: z.string().regex(/^wk_[0-9a-f]{32}$/),
-    leaseId: z.string().min(1),
-    expectedLeaseVersion: z.number().int().positive(),
-    baseRevisionSha: z.string().regex(/^[0-9a-f]{40}$/),
-    effectHandle: z.string().optional(),
-  });
-}
 
 type AgentSelector = {
   profile?: string;
@@ -1098,15 +1084,12 @@ function registerCodexProcessTools(
           .max(300)
           .optional()
           .describe("Command execution deadline in seconds. Defaults to unbounded if omitted."),
-        resumableWork: resumableWorkSchema().optional().describe(
-          "Nexus writer-admission pointer. Required for write-capable commands in enrolled repositories.",
-        ),
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout, resumableWork: p0Pointer }, extra) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout }, extra) => {
       const startedAt = performance.now();
       const mutationCapable = !isRepositoryReadOnlyShellCommand(cmd);
       if (mutationCapable) {
@@ -1285,9 +1268,6 @@ function registerCodexGoalTools(
           .regex(/^[0-9a-fA-F]{40}$/, "expectedHead must be a valid 40-character commit SHA.")
           .optional()
           .describe("Exact 40-character Git HEAD the workspace must be at before launch. Required for Git workspaces; start fails closed when missing or mismatched."),
-        resumableWork: resumableWorkSchema().optional().describe(
-          "Nexus writer-admission pointer. Kept for protocol compatibility.",
-        ),
       },
       outputSchema: {
         goalId: z.string(),
@@ -1306,7 +1286,6 @@ function registerCodexGoalTools(
         terminalReason: z.string().optional(),
         error: z.string().optional(),
         processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
-        coreMutation: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
@@ -1374,7 +1353,6 @@ function registerCodexGoalTools(
         terminalReason: z.string().optional(),
         error: z.string().optional(),
         processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
-        coreMutation: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: true },
@@ -1400,9 +1378,6 @@ function registerCodexGoalTools(
         workspaceId: z.string().describe("Workspace identifier used to start the goal."),
         goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
         message: z.string().min(1).max(20_000).describe("Follow-up message for the active goal."),
-        resumableWork: resumableWorkSchema().optional().describe(
-          "Nexus writer-admission pointer. Kept for protocol compatibility.",
-        ),
       },
       outputSchema: {
         goalId: z.string(),
@@ -1421,7 +1396,6 @@ function registerCodexGoalTools(
         terminalReason: z.string().optional(),
         error: z.string().optional(),
         processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
-        coreMutation: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: {},
       annotations: {
@@ -1769,7 +1743,6 @@ function registerCutoverMcpTools(
 
   const bindExactCutoverCarrier = (
     extra: { authInfo?: { clientId: string; scopes: string[] }; sessionId?: string },
-    carrierCredential?: string,
   ): void => {
     const record = control.controller.record();
     if (!record?.coordinationBinding) return;
@@ -1780,7 +1753,6 @@ function registerCutoverMcpTools(
       );
     }
     const context = dependencyConsumerContext(extra);
-    if (carrierCredential !== undefined) carrierBindings.redeem(context, carrierCredential);
     const carrier = carrierBindings.status(context);
     const approved = carrier.contract.cutover;
     if (
@@ -2057,7 +2029,6 @@ function registerCutoverMcpTools(
         "Derive the single valid next physical step from durable cutover state and execute it with fail-closed semantics. Returns either TERMINAL (closed) or exactly one typed blocker / external decision (AWAITING_EXTERNAL_DRAIN, AWAITING_RESTART_DECISION, AWAITING_RECONNECT, BUILD_NOT_READY, RECONCILIATION_REQUIRED). Survives transport reconnects and caller rebinds.",
       inputSchema: {
         dryRun: z.boolean().optional().describe("Rehearse the next step without scheduling a restart or mutating state."),
-        carrierCredential: z.string().optional().describe("Optional approved carrier credential when reconnecting on a fresh MCP session."),
       },
       outputSchema: {
         outcome: z.string(),
@@ -2081,8 +2052,8 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ dryRun, carrierCredential }, extra) => {
-      bindExactCutoverCarrier(extra, carrierCredential);
+    async ({ dryRun }, extra) => {
+      bindExactCutoverCarrier(extra);
       if (control.controller.record()?.coordinationBinding) {
         throw new ControlPlaneOwnershipError(
           "AUTHORITY_REQUIRED",
@@ -2145,7 +2116,6 @@ function registerCutoverMcpTools(
         expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
         expiresAt: z.string().optional(),
         attemptKey: z.string().min(1).optional().describe("Stable attempt identity; defaults to a digest of runtime, resolved target and expiry."),
-        carrierCredential: z.string().optional().describe("Optional approved carrier credential for this exact operation when reconnecting on a fresh MCP session."),
       },
       outputSchema: {
         cutover: cutoverRecordSchema,
@@ -2155,10 +2125,9 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt, attemptKey, carrierCredential }, extra) => {
+    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt, attemptKey }, extra) => {
       const context = dependencyConsumerContext(extra);
       if (!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host coordination");
-      if (carrierCredential !== undefined && carrierBindings) carrierBindings.redeem(context, carrierCredential);
       if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
         const probe = await control.probeBuildReady({
           sourceCommit: expectedSourceCommit,
@@ -2202,7 +2171,6 @@ function registerCutoverMcpTools(
         "Record aggregate transport drain evidence for one exact cutover lease. Consequential MCP starts remain blocked while the lease is active.",
       inputSchema: {
         cutoverId: z.string().min(1),
-        carrierCredential: z.string().optional().describe("Optional approved carrier credential for this exact drain when reconnecting on a fresh MCP session."),
       },
       outputSchema: {
         cutover: cutoverRecordSchema,
@@ -2211,12 +2179,12 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ cutoverId, carrierCredential }, extra) => {
+    async ({ cutoverId }, extra) => {
       const existing=control.controller.record();
       // Legacy unbound generations retain their existing runtime fence only.
       // Malformed bindings throw from record(); they never enter this branch.
       const record = existing?.coordinationBinding
-        ? (()=>{if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover drain requires trusted coordination");const context=dependencyConsumerContext(extra);if(carrierCredential!==undefined && carrierBindings) carrierBindings.redeem(context,carrierCredential);return durableOperations.drainCutover(cutoverId,control.controller.currentIdentity,control.transportEvidence,context);})()
+        ? (()=>{if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover drain requires trusted coordination");const context=dependencyConsumerContext(extra);return durableOperations.drainCutover(cutoverId,control.controller.currentIdentity,control.transportEvidence,context);})()
         : control.controller.recordDrain(cutoverId, control.transportEvidence());
       const mode = control.controller.mode();
       return {
@@ -2243,7 +2211,6 @@ function registerCutoverMcpTools(
             verifiedAt: z.string().refine((value) => Number.isFinite(Date.parse(value))),
             evidence: z.string().optional(),
           }),
-          carrierCredential: z.string().optional().describe("Optional approved carrier credential for this exact restart when reconnecting on a fresh MCP session."),
         },
         outputSchema: {
           cutover: cutoverRecordSchema,
@@ -2260,7 +2227,7 @@ function registerCutoverMcpTools(
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
-      async ({ cutoverId, buildReady, carrierCredential }, extra) => {
+      async ({ cutoverId, buildReady }, extra) => {
         if(!control.ensureActivationBound) {
           throw new CutoverStateError(
             "Cutover restart is unavailable without a canonical activation-binding owner.",
@@ -2270,7 +2237,7 @@ function registerCutoverMcpTools(
         if(control.controller.record()?.coordinationBinding) {
           if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted coordination");
           const context=dependencyConsumerContext(extra);
-          if(carrierCredential!==undefined && carrierBindings) carrierBindings.redeem(context,carrierCredential);
+
           const actuator=control.restartSelf!;
           const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,context,activationBinding);
           return {content:[textBlock("Restart scheduling intent is recorded; execution remains unconfirmed and must not be replayed.")],structuredContent:{cutover:outcome.record as unknown as Record<string,unknown>,mode:control.controller.mode(),restart:{scheduled:outcome.scheduled,alreadyRequested:!outcome.scheduled,scheduleBlocked:false,actuator:"launchd-self" as const,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget}}};
@@ -2443,7 +2410,6 @@ function registerCutoverMcpTools(
         cutoverId: z.string().min(1),
         workspaceId: z.string().min(1),
         agentId: z.string().min(1),
-        carrierCredential: z.string().optional().describe("Optional approved carrier credential for this exact terminal finish when reconnecting on a fresh MCP session."),
       },
       outputSchema: {
         cutover: cutoverRecordSchema,
@@ -2452,12 +2418,12 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ cutoverId, workspaceId, agentId, carrierCredential }, extra) => {
+    async ({ cutoverId, workspaceId, agentId }, extra) => {
       const activeRecord = control.controller.record();
       if(activeRecord?.coordinationBinding) {
         if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover finish requires trusted coordination");
         const context=dependencyConsumerContext(extra);
-        if(carrierCredential!==undefined && carrierBindings) carrierBindings.redeem(context,carrierCredential);
+
         const record=await durableOperations.finishCutover(cutoverId,control.controller.currentIdentity,{workspaceId,agentId},()=>control.reconcileDurableState({workspaceId,agentId}),context);
         const mode=control.controller.mode();
         return {content:[textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],structuredContent:{cutover:record as unknown as Record<string,unknown>,mode}};
@@ -2633,9 +2599,6 @@ function registerCutoverMcpTools(
         description:
           "Drive exactly one fail-closed cutover step: schedule a verified restart on the old instance exactly once, or close the cutover on the replacement instance only after a fully positive durable reconciliation witness. Never drains automatically and never re-schedules an already-scheduled restart.",
         inputSchema: {
-          carrierCredential: z.string().optional().describe(
-            "Optional approved carrier credential for this exact reconciliation when reconnecting on a fresh MCP session.",
-          ),
         },
         outputSchema: {
           outcome: z.record(z.string(), z.unknown()),
@@ -2643,8 +2606,8 @@ function registerCutoverMcpTools(
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
-      async ({ carrierCredential }, extra) => {
-        bindExactCutoverCarrier(extra, carrierCredential);
+      async (_, extra) => {
+        bindExactCutoverCarrier(extra);
         const boundDisposition = coordinationBoundReconcileDisposition();
         if (boundDisposition) {
           return {
@@ -2915,15 +2878,6 @@ function createAgentStartInputSchema() {
     expectedEvidence: z.array(z.string()).optional(),
     claimCeiling: z.enum(["RESULT_RETURNED", "IMPLEMENTED", "CANDIDATE_READY"]),
   }).strict();
-  const nexusGrant = z.object({
-    repository: z.literal("James3014/Nexus-new"),
-    revision: z.string().regex(/^[0-9a-f]{40}$/),
-    grantPath: z.string().startsWith("tasks/"),
-    grantSha256: z.string().regex(/^[0-9a-f]{64}$/),
-    authorityPath: z.string().startsWith("tasks/"),
-    authoritySha256: z.string().regex(/^[0-9a-f]{64}$/),
-  }).strict();
-  const capabilityDiscovery = z.record(z.string(), z.unknown()).optional();
   const toolIntentId = z.enum(TOOL_INTENT_IDS);
   const toolProjectionManifest = z.object({
     schema: z.literal(TOOL_PROJECTION_MANIFEST_SCHEMA),
@@ -2933,8 +2887,8 @@ function createAgentStartInputSchema() {
       attemptId: z.string().min(1),
     }).strict(),
     authority: z.object({
-      mode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
-      issuer: z.enum(["owner", "nexus"]),
+      mode: z.literal("OWNER_DIRECT"),
+      issuer: z.literal("owner"),
     }).strict(),
     authorizedToolCeiling: z.array(toolIntentId),
     candidateTools: z.array(toolIntentId),
@@ -2949,17 +2903,8 @@ function createAgentStartInputSchema() {
     git: z.object({ mode: z.literal("DENY") }).strict(),
   }).strict();
   const executionContract = z.object({
-    authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
-      "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
-    ),
-    nexusGrant: nexusGrant.optional().describe(
-      "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
-    ),
     dispatchIntent: dispatchIntent.describe(
       "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
-    ),
-    capabilityDiscovery: capabilityDiscovery.describe(
-      "Capability discovery context. Kept for protocol compatibility.",
     ),
     authorizedToolCeiling: z.array(toolIntentId).describe(
       "Durable transport-neutral tool authority ceiling for this execution. Provider adapters may only narrow it.",
@@ -2969,15 +2914,6 @@ function createAgentStartInputSchema() {
     ),
     effectProjection: effectProjection.describe(
       "Derived local-effect restriction consumed by enforceable provider adapters. Filesystem write scope remains exclusively in writePaths. v1 denies process execution, worker-tool network egress, and Git effects because DevSpace has no proven OS sandbox seam for them; unenforceable combinations fail closed.",
-    ),
-    coreMutation: z.object({
-      sessionId: z.string().regex(/^cms_[0-9a-f]{32}$/),
-      bindingHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
-    }).strict().optional().describe(
-      "Exact pointer to an already-open Core-bound mutation session. Carries provenance only; it grants no route, acceptance, merge, or release authority.",
-    ),
-    resumableWork: resumableWorkSchema().describe(
-      "P0 resumable-work pointer. For agent_start, effectHandle must exactly equal attemptKey so reconnect/replay can recover the same durable agent effect.",
     ),
     expectedHead: z.string().describe(
       "40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches.",
@@ -3011,8 +2947,8 @@ function createAgentStartInputSchema() {
     supersedes: z.string().describe(
       "Exact effect key or agentId superseded by this turn.",
     ),
-  }).partial().optional().describe(
-    "Optional structured execution contract. Records and enforces where/how the worker may run.",
+  }).partial().strict().optional().describe(
+    "Optional structured direct-execution contract. Records and enforces where/how the worker may run.",
   );
   const selectorShape = agentSelectorShape();
   return {
@@ -3028,17 +2964,11 @@ function createAgentStartInputSchema() {
 
 function createDirectDispatchAgentStartInputSchema() {
   const executionContract = z.object({
-    authorityMode: z.literal("OWNER_DIRECT").optional().describe(
-      "Optional explicit direct-execution lane. Omit it to use OWNER_DIRECT.",
-    ),
     expectedHead: z.string().regex(/^[0-9a-f]{40}$/).optional().describe(
       "Optional exact repository HEAD fence. The worker is not launched if the workspace HEAD differs.",
     ),
     writePaths: z.array(z.string().min(1)).min(1).optional().describe(
       "Required for write-capable workers. Canonical writable path scope relative to the workspace root.",
-    ),
-    resumableWork: resumableWorkSchema().optional().describe(
-      "Lightweight writer-admission pointer. Required for write-capable workers when repository enrollment requires resumable-work admission.",
     ),
     maxFiles: z.number().int().min(1).optional().describe(
       "Optional maximum number of files the worker may change.",
@@ -3213,7 +3143,6 @@ export const candidateIntegrateOutputSchema = z.object({
   ]),
   reconciliationRequired: z.boolean(),
   affectedTrackedPaths: z.array(z.string()),
-  coreMutation: z.record(z.string(), z.unknown()).optional(),
 });
 
 export function formatCandidateIntegrateSummary(output: IntegrationApplyResult): string {
@@ -3276,12 +3205,7 @@ export function createMcpServer(
   controlPlaneInventoryReader?: () => ControlPlaneInventory,
   coreMutationSessions?: unknown,
   coreMutationTestOnlyBypass?: unknown,
-  /**
-   * P0 WorkResumeStore.  When supplied, write-capable tool handlers that
-   * carry a resumableWork pointer call centralAdmissionCheck before any
-   * provider launch, file write, git mutation, or process spawn.
-   * Legacy callers without a resumableWork pointer are unaffected.
-   */
+  /** Legacy internal work-resume store retained only for persisted-state compatibility until Wave 3. */
   workResumeStore?: WorkResumeStore,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
@@ -3927,7 +3851,6 @@ export function createMcpServer(
       attemptKey: z.string(),
       requestHash: z.string(),
       kind: z.enum(["workspace_clone", "git_push", "dependency_sync", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
-      authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
       status: z.enum(["started", "succeeded", "failed", "outcome_unknown"]),
@@ -3939,12 +3862,15 @@ export function createMcpServer(
       createdAt: z.string(),
       updatedAt: z.string(),
     };
-    const operationResponse = (operation: DurableOperationRecord) => ({
-      content: [textBlock(
-        `${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`,
-      )],
-      structuredContent: operation as unknown as Record<string, unknown>,
-    });
+    const operationResponse = (operation: DurableOperationRecord) => {
+      const { authorityMode: _internalAuthorityMode, ...publicOperation } = operation;
+      return {
+        content: [textBlock(
+          `${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`,
+        )],
+        structuredContent: publicOperation as unknown as Record<string, unknown>,
+      };
+    };
 
     if (hostOperations) {
       const hostInput = {
@@ -3990,11 +3916,6 @@ export function createMcpServer(
           remote: z.string().min(1).describe("Credential-free Git remote URL or local repository path."),
           destination: z.string().min(1).describe("Absolute destination path under a configured allowed root."),
           ref: z.string().min(1).optional().describe("Optional branch or tag to clone as a single branch."),
-          authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
-            .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
-          resumableWork: resumableWorkSchema().optional().describe(
-            "Nexus writer-admission pointer. Required for dependency effects in enrolled repositories.",
-          ),
         },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -4005,14 +3926,14 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ attemptKey, remote, destination, ref, authorityMode }) => {
+      async ({ attemptKey, remote, destination, ref }) => {
         try {
           const operation = await durableOperations.workspaceClone({
             attemptKey,
             remote,
             destination,
             ref,
-            authorityMode,
+            authorityMode: "OWNER_DIRECT",
           });
           return operationResponse(operation);
         } catch (error) {
@@ -4042,11 +3963,6 @@ export function createMcpServer(
           attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
             .describe("Stable operation identity. Exact replay returns the existing operation; conflicting reuse fails closed."),
           recipe: z.enum(["npm_ci", "pnpm_frozen", "uv_frozen"]),
-          authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
-            .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
-          resumableWork: resumableWorkSchema().optional().describe(
-            "Nexus writer-admission pointer. Required for dependency effects in enrolled repositories.",
-          ),
         },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -4057,12 +3973,11 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, attemptKey, recipe, authorityMode }, extra) => {
+      async ({ workspaceId, attemptKey, recipe }, extra) => {
         const { _meta } = extra;
         const safety = await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
         const ownerDirectIsolated =
-          authorityMode === "OWNER_DIRECT" &&
           workspace.mode === "worktree" &&
           workspace.worktree?.managed === true &&
           safety.state === "ISOLATED_WORKTREE";
@@ -4073,7 +3988,7 @@ export function createMcpServer(
             workspaceRoot: workspace.root,
             attemptKey,
             recipe,
-            authorityMode,
+            authorityMode: "OWNER_DIRECT",
             ownerDirectIsolated,
           }, consumerContext);
           return operationResponse(operation);
@@ -4306,15 +4221,12 @@ export function createMcpServer(
           .string()
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
-        resumableWork: resumableWorkSchema().optional().describe(
-          "P0 resumable-work pointer.  When supplied, the write is admitted only if the exact lease is currently held by the caller.",
-        ),
       },
       outputSchema: resultOutputSchema({}),
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, resumableWork: _p0Pointer, ...input }, extra) => {
+    async ({ workspaceId, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4407,9 +4319,6 @@ export function createMcpServer(
             }),
           )
           .min(1),
-        resumableWork: resumableWorkSchema().optional().describe(
-          "P0 resumable-work pointer.  When supplied, the edit is admitted only if the exact lease is currently held by the caller.",
-        ),
       },
       outputSchema: resultOutputSchema({
         status: z.literal("applied"),
@@ -4417,7 +4326,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, resumableWork: _p0Pointer, ...input }, extra) => {
+    async ({ workspaceId, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4508,9 +4417,6 @@ export function createMcpServer(
           patch: z
             .string()
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
-          resumableWork: resumableWorkSchema().optional().describe(
-            "Nexus writer-admission pointer. Required for patches in enrolled repositories.",
-          ),
         },
           outputSchema: resultOutputSchema({
           additions: z.number(),
@@ -4917,9 +4823,6 @@ export function createMcpServer(
           .max(100_000)
           .optional()
           .describe("Approximate output token budget. Defaults to 10000."),
-        resumableWork: resumableWorkSchema().optional().describe(
-          "P0 resumable-work pointer.  When supplied and the command is write-capable, the spawn is admitted only if the exact lease is currently held by the caller.  Read-only commands ignore this field.",
-        ),
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
@@ -5316,28 +5219,6 @@ export function createMcpServer(
             ? { catalogReceipt: catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog) }
             : {}),
         };
-        if (selectedProfile?.write_mode !== "read_only") {
-          const pointer = contract?.resumableWork;
-          if (pointer?.effectHandle !== undefined && pointer.effectHandle !== attemptKey) {
-            throw new AgentSessionError(
-              "INVALID_EXECUTION_CONTRACT",
-              "P0 agent_start requires resumableWork.effectHandle to exactly equal attemptKey.",
-            );
-          }
-          if (pointer && workResumeStore) {
-            workResumeStore.bindEffectIdentity({
-              workKey: pointer.workKey,
-              leaseId: pointer.leaseId,
-              effectKind: "agent",
-              effectKey: attemptKey,
-              lineage: (contract?.role || contract?.parentEffectKey || contract?.supersedes) ? {
-                role: contract?.role,
-                parentEffectKey: contract?.parentEffectKey,
-                supersedes: contract?.supersedes,
-              } : undefined,
-            });
-          }
-        }
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
@@ -5348,14 +5229,6 @@ export function createMcpServer(
           attemptKey,
           executionContract: boundContract,
         });
-        if (contract?.resumableWork && workResumeStore) {
-          workResumeStore.bindEffectHandle({
-            workKey: contract.resumableWork.workKey,
-            effectKind: "agent",
-            effectKey: attemptKey,
-            effectHandle: output.agentId,
-          });
-        }
         logToolCall(config, {
           tool: "agent_start",
           workspaceId,
@@ -5442,361 +5315,6 @@ export function createMcpServer(
           content: [textBlock(`Continuing agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
           structuredContent: {
             ...(output as unknown as Record<string, unknown>),
-          },
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      "work_resume_prepare",
-      {
-        title: "Prepare resumable work",
-        description:
-          "Create or exactly replay one durable work identity and exclusive writer lease using the current authenticated mutation authority. Repository, base SHA, scope and expiry come from that authority; this prepares ownership only and starts no effect.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          contractPurpose: z.string().min(1).max(512).describe(
-            "Stable purpose identity within the already-approved work authority. Repository, goal, base SHA, scope and expiry come only from that authority.",
-          ),
-          carrierCredential: z.string().optional().describe(
-            "Optional previously approved writer credential for reconnecting on a fresh MCP session.",
-          ),
-        },
-        outputSchema: {
-          schema: z.literal("devspace.work_resume.v1"),
-          workKey: z.string(),
-          leaseId: z.string(),
-          leaseVersion: z.number().int(),
-          disposition: z.enum(["RUNNING", "TERMINAL", "RECONCILE_REQUIRED", "NO_EXISTING_ATTEMPT"]),
-          baseRevisionSha: z.string(),
-          worktreeRealpath: z.string(),
-          writeScope: z.array(z.string()),
-          expiresAt: z.string(),
-          resumableWork: resumableWorkSchema(),
-        },
-        _meta: {},
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ workspaceId, contractPurpose, carrierCredential }, extra) => {
-        if (!workResumeStore || !carrierBindings) {
-          throw new AgentSessionError(
-            "INVALID_EXECUTION_CONTRACT",
-            "Work-resume preparation requires the configured mutation ownership authority.",
-          );
-        }
-        const context = dependencyConsumerContext(extra);
-        if (carrierCredential !== undefined) carrierBindings.redeem(context, carrierCredential);
-        const carrier = carrierBindings.status(context);
-        if (!carrier.contract.operations.includes("worktree_write")) {
-          throw new AgentSessionError(
-            "INVALID_EXECUTION_CONTRACT",
-            "Current write authority does not authorize worktree_write.",
-          );
-        }
-
-        const conversationScope = openAiConversationScopeId(extra._meta);
-        await workspaces.assertConversationMutationAllowed(workspaceId, conversationScope);
-        const workspace = workspaces.getWorkspace(workspaceId);
-        const canonicalRoot = resolveCanonicalPath(workspace.root);
-        const currentHead = (await runGit(canonicalRoot, ["rev-parse", "HEAD"])).stdout.trim().toLowerCase();
-        if (currentHead !== carrier.contract.baseRevision) {
-          throw new AgentSessionError(
-            "STALE_WORKSPACE",
-            `Approved writer base ${carrier.contract.baseRevision} does not match current workspace HEAD ${currentHead}.`,
-          );
-        }
-
-        const material = {
-          repositoryKey: carrier.contract.repository,
-          ownerIssueId: carrier.contract.goal,
-          baseRevisionSha: currentHead,
-          worktreeRealpath: canonicalRoot,
-          writeScope: [canonicalRoot],
-          contractPurpose,
-        };
-        const workKey = computeWorkKey(material);
-        const subject = {
-          operationId: `wresume:${workKey}`,
-          requestHash: computeWorkRequestHash(material),
-          workspaceRoot: canonicalRoot,
-          baseRevision: currentHead,
-          operation: "worktree_write" as const,
-        };
-        const lease = carrierBindings.prepareEffect(context, subject);
-        const prepared = workResumeStore.prepare({ material, lease });
-        const resumableWork = {
-          workKey: prepared.workKey,
-          leaseId: prepared.lease.leaseId,
-          expectedLeaseVersion: prepared.lease.version,
-          baseRevisionSha: prepared.material.baseRevisionSha,
-        };
-        return {
-          content: [textBlock(
-            `Prepared resumable work ${prepared.workKey} on lease ${prepared.lease.leaseId} v${prepared.lease.version}. Before agent_start, set resumableWork.effectHandle to that exact attemptKey.`,
-          )],
-          structuredContent: {
-            schema: "devspace.work_resume.v1" as const,
-            workKey: prepared.workKey,
-            leaseId: prepared.lease.leaseId,
-            leaseVersion: prepared.lease.version,
-            disposition: prepared.status.disposition,
-            baseRevisionSha: prepared.material.baseRevisionSha,
-            worktreeRealpath: prepared.material.worktreeRealpath,
-            writeScope: [...prepared.material.writeScope],
-            expiresAt: prepared.lease.expiresAt,
-            resumableWork,
-          },
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      "work_resume_status",
-      {
-        title: "Work resume status",
-        description:
-          "Read one P0 durable work identity before dispatch. Returns the exact lease/effect identity and, when bound to an agent, its durable agent handle/status. This is read-only and never starts or retries work.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          workKey: z.string().regex(/^wk_[0-9a-f]{32}$/).describe("Stable P0 work key."),
-        },
-        outputSchema: {
-          schema: z.literal("devspace.work_resume.v1"),
-          workKey: z.string(),
-          disposition: z.enum(["RUNNING", "TERMINAL", "RECONCILE_REQUIRED", "NO_EXISTING_ATTEMPT"]),
-          leaseId: z.string().optional(),
-          leaseVersion: z.number().int().optional(),
-          operationHandle: z.string().optional(),
-          operationStatus: z.string().optional(),
-          baseRevisionSha: z.string().optional(),
-          worktreeRealpath: z.string().optional(),
-          idempotencyKey: z.string().optional(),
-          effectKind: z.string().optional(),
-          effectKey: z.string().optional(),
-          effectHandle: z.string().optional(),
-          lineage: z.object({
-            role: z.string().optional(),
-            parentEffectKey: z.string().optional(),
-            supersedes: z.string().optional(),
-          }).optional(),
-          automatedVerifierResult: z.record(z.string(), z.unknown()).optional(),
-          automatedVerifierEffects: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
-          automatedVerifierPlans: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
-          terminalReceipt: z.record(z.string(), z.unknown()).optional(),
-          agent: z.object({
-            agentId: z.string(),
-            status: z.string(),
-            terminal: z.boolean(),
-            updatedAt: z.string(),
-          }).optional(),
-          message: z.string(),
-        },
-        _meta: {},
-        annotations: {
-          readOnlyHint: true,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ workspaceId, workKey }) => {
-        if (!workResumeStore) {
-          throw new AgentSessionError(
-            "INVALID_EXECUTION_CONTRACT",
-            "P0 work-resume store is unavailable on this server generation.",
-          );
-        }
-        const workspace = workspaces.getWorkspace(workspaceId);
-        const status = workResumeStore.disposition(workKey);
-        if (status.worktreeRealpath) {
-          const canonicalWorkspace = await realpath(workspace.root);
-          if (canonicalWorkspace !== status.worktreeRealpath) {
-            throw new AgentSessionError(
-              "INVALID_EXECUTION_CONTRACT",
-              "P0 work key belongs to a different physical worktree.",
-            );
-          }
-        }
-
-        let agent: { agentId: string; status: string; terminal: boolean; updatedAt: string } | undefined;
-        if (status.effectKind === "agent" && status.effectHandle) {
-          try {
-            const agentStatus = await agentSessionManager.getAgentStatus({
-              workspaceId,
-              workspaceRoot: workspace.root,
-              agentId: status.effectHandle,
-              waitMs: 0,
-            });
-            agent = {
-              agentId: agentStatus.agentId,
-              status: agentStatus.status,
-              terminal: agentStatus.terminal,
-              updatedAt: agentStatus.updatedAt,
-            };
-          } catch {
-            // The durable effect handle remains useful even if the agent-status
-            // projection is temporarily unavailable; never invent absence.
-          }
-        }
-
-        const structuredContent = {
-          ...status,
-          ...(agent ? { agent } : {}),
-        };
-        return {
-          content: [textBlock(
-            `Work ${workKey}: ${status.disposition}${status.effectHandle ? ` (handle ${status.effectHandle})` : ""}.`,
-          )],
-          structuredContent,
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      "work_resume_reconcile_agent",
-      {
-        title: "Reconcile terminal resumable agent",
-        description:
-          "Close one P0 worktree writer lease only after the exact bound agent is durably terminal and physical agent reconciliation succeeds. Never retries or starts an agent.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          workKey: z.string().regex(/^wk_[0-9a-f]{32}$/),
-          agentId: z.string().min(1),
-        },
-        outputSchema: {
-          schema: z.literal("devspace.work_resume.v1"),
-          workKey: z.string(),
-          disposition: z.enum(["RUNNING", "TERMINAL", "RECONCILE_REQUIRED", "NO_EXISTING_ATTEMPT"]),
-          leaseId: z.string().optional(),
-          leaseVersion: z.number().int().optional(),
-          operationHandle: z.string().optional(),
-          operationStatus: z.string().optional(),
-          baseRevisionSha: z.string().optional(),
-          worktreeRealpath: z.string().optional(),
-          effectKind: z.string().optional(),
-          effectKey: z.string().optional(),
-          effectHandle: z.string().optional(),
-          released: z.boolean(),
-          agent: z.object({
-            agentId: z.string(),
-            status: z.string(),
-            terminal: z.boolean(),
-            updatedAt: z.string(),
-          }),
-          message: z.string(),
-        },
-        _meta: {},
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: false,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({ workspaceId, workKey, agentId }, extra) => {
-        if (!workResumeStore) {
-          throw new AgentSessionError(
-            "INVALID_EXECUTION_CONTRACT",
-            "P0 work-resume store is unavailable on this server generation.",
-          );
-        }
-        const workspace = workspaces.getWorkspace(workspaceId);
-        const before = workResumeStore.disposition(workKey);
-        if (
-          before.effectKind !== "agent" ||
-          !before.effectKey ||
-          before.effectHandle !== agentId ||
-          !before.leaseId
-        ) {
-          throw new AgentSessionError(
-            "INVALID_EXECUTION_CONTRACT",
-            "P0 work identity is not bound to the requested durable agent.",
-          );
-        }
-        if (before.worktreeRealpath && resolveCanonicalPath(workspace.root) !== before.worktreeRealpath) {
-          throw new AgentSessionError(
-            "INVALID_EXECUTION_CONTRACT",
-            "P0 work key belongs to a different physical worktree.",
-          );
-        }
-
-        const record = agentSessionManager.getRecordByPrefixOrId(agentId);
-        if (
-          !record ||
-          record.workspaceId !== workspaceId ||
-          record.startReplay?.key !== before.effectKey ||
-          record.executionContract?.resumableWork?.workKey !== workKey
-        ) {
-          throw new AgentSessionError(
-            "ATTEMPT_REPLAY_CONFLICT",
-            "Durable agent record does not match the P0 work/effect binding.",
-          );
-        }
-
-        const agentStatus = await agentSessionManager.getAgentStatus({
-          workspaceId,
-          workspaceRoot: workspace.root,
-          agentId,
-          waitMs: 0,
-        });
-        const agent = {
-          agentId: agentStatus.agentId,
-          status: agentStatus.status,
-          terminal: agentStatus.terminal,
-          updatedAt: agentStatus.updatedAt,
-        };
-        if (!agentStatus.terminal) {
-          return {
-            content: [textBlock(
-              `Work ${workKey} remains RUNNING; agent ${agentId} is not terminal.`,
-            )],
-            structuredContent: {
-              ...before,
-              released: false,
-              agent,
-              message: "Exact agent is still non-terminal; lease remains pinned.",
-            },
-          };
-        }
-
-        const physical = await agentSessionManager.reconcileAgent({
-          workspaceId,
-          workspaceRoot: workspace.root,
-          isolated: workspace.mode === "worktree",
-          agentId,
-        });
-        if (physical.agentId !== agentId) {
-          throw new AgentSessionError(
-            "ATTEMPT_REPLAY_CONFLICT",
-            "Physical agent reconciliation returned a different durable agent.",
-          );
-        }
-
-        const after = before.disposition === "TERMINAL"
-          ? before
-          : workResumeStore.completeBoundEffect(
-              carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              workKey,
-              "agent",
-              agentId,
-            );
-        return {
-          content: [textBlock(
-            `Work ${workKey}: ${after.disposition}; terminal agent ${agentId} reconciled without replay.`,
-          )],
-          structuredContent: {
-            ...after,
-            released: before.disposition !== "TERMINAL",
-            agent,
-            message: "Exact terminal agent reconciled; no provider effect was replayed.",
           },
         };
       },
@@ -6396,9 +5914,6 @@ export function createMcpServer(
             .boolean()
             .default(false)
             .describe("Whether to overwrite an existing destination file. Defaults to false."),
-          resumableWork: resumableWorkSchema().optional().describe(
-            "Nexus writer-admission pointer. Required when the destination repository is enrolled.",
-          ),
         },
         outputSchema: resultOutputSchema({
           sourcePath: z.string(),
@@ -6420,7 +5935,6 @@ export function createMcpServer(
           expectedDestinationSha256,
           expectedDestinationAbsent,
           overwrite,
-          resumableWork: p0Pointer,
         },
         extra,
       ) => {
@@ -6681,9 +6195,6 @@ export function createMcpServer(
         confirmApply: z
           .boolean()
           .describe("Must be true to apply. Without it the operation stays read-only preparation."),
-        resumableWork: resumableWorkSchema().optional().describe(
-          "Nexus writer-admission pointer for the destination. Required when applying into an enrolled repository.",
-        ),
       },
       outputSchema: candidateIntegrateOutputSchema,
       _meta: {},
@@ -6780,9 +6291,6 @@ export function createMcpServer(
           expectedBuildId: z.string().min(1),
           expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
           confirmPromote: z.boolean(),
-          resumableWork: resumableWorkSchema().optional().describe(
-            "P0 resumable-work pointer for the destination worktree. When supplied, promotion is admitted only if the exact writer lease is held.",
-          ),
         },
         outputSchema: {
           success: z.boolean(),
@@ -6798,7 +6306,6 @@ export function createMcpServer(
           canonicalHead: z.string().optional(),
           acceptanceStatus: z.literal("external_not_granted_here"),
           blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
-          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: {
@@ -6876,9 +6383,6 @@ export function createMcpServer(
             .min(1)
             .max(100)
             .describe("Workspace-relative file paths to stage and commit."),
-          resumableWork: resumableWorkSchema().optional().describe(
-            "P0 resumable-work pointer.  When supplied, the commit is admitted only if the exact lease is currently held by the caller.",
-          ),
         },
         outputSchema: {
           workspaceId: z.string(),
@@ -6956,9 +6460,6 @@ export function createMcpServer(
             .describe("Exact 40-character Git commit hash expected at current HEAD."),
           remote: z.string().describe("Configured Git remote name (e.g. 'origin')."),
           branch: z.string().describe("Name of the target non-default remote branch to push to."),
-          resumableWork: resumableWorkSchema().optional().describe(
-            "P0 resumable-work pointer.  When supplied, the push is admitted only if the exact lease is currently held by the caller.",
-          ),
         },
         outputSchema: {
           remote: z.string(),
