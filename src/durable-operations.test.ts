@@ -341,7 +341,7 @@ async function dependencyFixtureManager(config: ReturnType<typeof loadConfig>, r
     verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(grant),
     resolveEffectBinding:(c,subject)=>c===context && subject.requestHash===requestHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash,role:"worker"}:undefined,
   };
-  const manager=new DurableOperationManager(config,runner,undefined,undefined,options);
+  const manager=new DurableOperationManager(config,runner,options);
   ownership=manager.store.createOwnershipStore(options);
   ownership.putGrantEvidence(context,grant,0);
   leaseId=ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"workspace",resourceId:root,resource:root,scope:[root],operation:"dependency_sync",baseRevision:base,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"fixture",grant}).leaseId;
