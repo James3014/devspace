@@ -28,9 +28,9 @@ jobs:
   run:
     name: Nexus Core issue run
     # Same-repository branches only; fork PRs are intentionally excluded.
-    if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.repo.fork == false
+    # This repository is itself a GitHub fork, so `head.repo.fork` is true for every
+    # same-repository branch; the same-repository identity check alone excludes fork PRs.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -50,10 +50,7 @@ jobs:
   verify:
     name: Nexus Core issue completion   # the required status check
     needs: run
-    if: >-
-      always() &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.head.repo.fork == false
+    if: always() && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
