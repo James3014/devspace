@@ -2,12 +2,12 @@ version = 2
 base_ref = "origin/main"
 allowed_patterns = ["**"]
 deletion_policy = "FORBID"
-universe_generation = 1
+universe_generation = 2
 materials = []
 
 [[verifiers]]
 id = "isolated-full-tests"
-command = ["npm", "run", "verify:nexus-core"]
+command = ["bash", "-lc", "set -euo pipefail; export TMPDIR=/tmp; npm run verify:nexus-core"]
 timeout_seconds = 3600
 logical_subject_id = "devspace/full-tests"
 evidence_kind = "test-result"
@@ -22,3 +22,8 @@ logical_subject_id = "devspace/typecheck-build-doctor"
 evidence_kind = "package-smoke"
 requirement_mode = "REQUIRED"
 applicability = "APPLICABLE"
+
+[isolation]
+mode = "container"
+image = "node:22-bookworm@sha256:0e5f906573693feaa1e21057ebdcfdb5bd5021f050b2dc7c9deceb629c7da2a8"
+network = "bridge"
