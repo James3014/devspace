@@ -101,7 +101,7 @@ test("C3 independent processes share one pin and a competing attempt cannot laun
       process.stdout.write("EFFECT_STARTED\\n");
       await new Promise(resolve=>process.stdin.once("data",resolve));
       return {exitCode:0,stdout:"canary",stderr:""};
-    },undefined,undefined,options);
+    },options);
     ownership=manager.store.createOwnershipStore(options);
     try {const r=await manager.dependencySync({...f.input,attemptKey:process.env.C3_ATTEMPT},context); process.stdout.write(r.status);}
     catch(e){process.stdout.write("DENIED:"+e.code);}
