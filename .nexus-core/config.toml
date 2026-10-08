@@ -1,7 +1,7 @@
 version = 2
 base_ref = "origin/main"
 allowed_patterns = ["**"]
-deletion_policy = "ALLOW"
+deletion_policy = "FORBID"
 universe_generation = 1
 materials = []
 
