@@ -1,10 +1,6 @@
 import { CarrierBindingStore, type CarrierCompletionBinding } from "./carrier-binding.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
-import {
-  createWorkResumeStore,
-  WorkResumeStore,
-} from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
@@ -221,7 +217,6 @@ import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
 import { registerHostCapabilitySnapshotTool } from "./host-capability-snapshot.js";
 import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { applyHostStoragePlan, buildHostStoragePlan, resolveHostStorageRoot } from "./host-storage-retention.js";
-import { openDatabase } from "./db/client.js";
 
 type Transport = StreamableHTTPServerTransport;
 class ReboundTransport extends StreamableHTTPServerTransport {
@@ -1036,7 +1031,6 @@ function registerCodexProcessTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
-  workResumeStore?: WorkResumeStore,
   carrierBindings?: CarrierBindingStore,
 ): void {
   registerAppTool(
@@ -3203,10 +3197,6 @@ export function createMcpServer(
   controlPlaneInventoryOverride?: ControlPlaneInventory,
   /** Production-only reread of the exact configured manifest path. */
   controlPlaneInventoryReader?: () => ControlPlaneInventory,
-  coreMutationSessions?: unknown,
-  coreMutationTestOnlyBypass?: unknown,
-  /** Legacy internal work-resume store retained only for persisted-state compatibility until Wave 3. */
-  workResumeStore?: WorkResumeStore,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -6849,20 +6839,6 @@ export function createServer(
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
   const durableOperations = new DurableOperationManager(config, undefined, options.coordination ?? carrierBindings?.readers);
   initializationCleanups.push(() => durableOperations.close());
-  // P0 WorkResumeStore — uses its own SQLite connection (same devspace.sqlite,
-  // WAL mode allows concurrent readers + one writer).
-  const workResumeDb = openDatabase(config.stateDir);
-  initializationCleanups.push(() => workResumeDb.close());
-  const { store: workResumeStore } = createWorkResumeStore(
-    workResumeDb.sqlite,
-    // Test/injected fallback only. Production binds directly to the exact #62
-    // CarrierBindingStore ownership instance so owner/CAS/grant semantics are
-    // identical to coordination leases rather than re-derived from chat ids.
-    (context) => typeof context === "string" && context.length > 0
-      ? { ownerThread: context }
-      : undefined,
-    carrierBindings?.ownership,
-  );
   const hostOperations = config.hostOperationsEnabled && config.hostOperationExecutable && config.hostOperationExecutableSha256 && config.hostOperationOwnerClientId && config.hostOperationCwd
     ? new HostOperationRegistrar(durableOperations.store, {
       enabled: true,
@@ -7607,9 +7583,6 @@ export function createServer(
     hostOperations,
     options.controlPlaneInventory,
     controlPlaneInventoryReader,
-    undefined, // coreMutationSessions
-    undefined, // coreMutationTestOnlyBypass — production never set
-    workResumeStore,
   );
 
   const reboundSessionIds = new Set<string>();
