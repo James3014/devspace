@@ -198,6 +198,55 @@ test("P2-A: requested/resolved metadata is not fabricated as physical model atte
   }
 });
 
+test("P2-A: legacy Agy JSON model claims fail closed on status read without rewriting durable history", async () => {
+  const { projectRoot, manager, cleanup } = setupEnv();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_p2_legacy_agy_attestation",
+      workspaceRoot: projectRoot,
+      profileName: "direct-opus",
+      prompt: "legacy Agy attestation projection",
+      profiles: mockProfiles,
+      attemptKey: "att-legacy-agy-json-output",
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const sqlite = (store as any).database.sqlite;
+
+    for (const attestationState of ["MATCH", "MODEL_ATTESTATION_MISMATCH"] as const) {
+      const record = store.getById(started.agentId)!;
+      const lifecycleState = {
+        ...record.lifecycleState,
+        modelAttestation: {
+          requestedModel: "claude-opus-4-6",
+          resolvedModel: "claude-opus-4-6",
+          observedModel: attestationState === "MATCH" ? "claude-opus-4-6" : "gemini-3.8-flash",
+          attestationSource: "agy_json_output",
+          attestationState,
+          attestedAt: "2026-10-05T00:00:00.000Z",
+        },
+      };
+      sqlite.prepare("update local_agent_sessions set lifecycle_state=? where id=?")
+        .run(JSON.stringify(lifecycleState), started.agentId);
+
+      const status = await manager.getAgentStatus({
+        workspaceId: "ws_p2_legacy_agy_attestation",
+        workspaceRoot: projectRoot,
+        agentId: started.agentId,
+      });
+
+      assert.deepEqual(status.modelAttestation, {
+        ...lifecycleState.modelAttestation,
+        observedModel: null,
+        attestationSource: "metadata_only",
+        attestationState: "ATTESTATION_UNAVAILABLE",
+      });
+      assert.deepEqual(store.getById(started.agentId)?.lifecycleState?.modelAttestation, lifecycleState.modelAttestation);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 test("P2-D: Dispatcher heartbeat is separated from providerProcessState and timeline", async () => {
   const { projectRoot, manager, cleanup } = setupEnv();
   try {
@@ -312,6 +361,7 @@ test("P2-E2: failure taxonomy preserves distinct control-plane/provider states",
       ["RECONCILIATION_REQUIRED", "anything", "present", "EFFECT_OUTCOME_UNKNOWN", true],
       ["RECONCILIATION_REQUIRED", "anything", "unknown", "EFFECT_OUTCOME_UNKNOWN", true],
       ["PROVIDER_AUTH_ERROR", "author field", "none", "PROVIDER_AUTH_ERROR", false],
+      ["PROVIDER_MODEL_UNAVAILABLE", "HTTP 401 ModelError: model is not supported", "none", "PROVIDER_MODEL_UNAVAILABLE", false],
       ["WORKER_LAUNCH_FAILED", "anything", "none", "PROVIDER_STARTUP_FAILED", false],
       ["PROVIDER_TIMEOUT", "permission denied scope", "none", "PROVIDER_EXECUTION_FAILED", false],
       ["PROVIDER_EXECUTION_ERROR", "quota", "none", "PROVIDER_EXECUTION_FAILED", false],
@@ -432,7 +482,7 @@ test("P2-G: Effect policy enforcement status accurately distinguishes request_on
   }
 });
 
-test("P2 follow-up (Item A): model attestation asserts MODEL_ATTESTATION_MISMATCH when observed differs from requested", async () => {
+test("P2 follow-up (Item A): model attestation compares provider-reported identity with requested model", async () => {
   const { projectRoot, manager, cleanup } = setupEnv();
   try {
     // 1. Pure function tests
@@ -440,13 +490,13 @@ test("P2 follow-up (Item A): model attestation asserts MODEL_ATTESTATION_MISMATC
       requestedModel: "claude-opus-4-6",
       resolvedModel: "claude-opus-4-6",
       observedModel: "gemini-3.8-flash",
-      attestationSource: "agy_json_output",
+      attestationSource: "provider_reported",
       attestedAt: "2026-10-05T00:00:00.000Z",
     });
     assert.equal(mismatch.attestationState, "MODEL_ATTESTATION_MISMATCH");
     assert.equal(mismatch.observedModel, "gemini-3.8-flash");
     assert.equal(mismatch.requestedModel, "claude-opus-4-6");
-    assert.equal(mismatch.attestationSource, "agy_json_output");
+    assert.equal(mismatch.attestationSource, "provider_reported");
 
     const match = computeModelAttestation({
       requestedModel: "claude-opus-4-6",
@@ -501,7 +551,7 @@ test("P2 follow-up (Item A): model attestation asserts MODEL_ATTESTATION_MISMATC
     assert.equal(status.modelAttestation.attestationState, "MODEL_ATTESTATION_MISMATCH");
     assert.equal(status.modelAttestation.observedModel, "gemini-3.8-flash");
     assert.equal(status.modelAttestation.requestedModel, "claude-opus-4-6");
-    assert.equal(status.modelAttestation.attestationSource, "agy_json_output");
+    assert.equal(status.modelAttestation.attestationSource, "provider_reported");
   } finally {
     cleanup();
   }

@@ -136,7 +136,7 @@ export async function performLocalBoundCutoverRestart(
   dependencies: LocalBoundCutoverRestartDependencies = {},
 ) {
   const bindings=new CarrierBindingStore(input.config.stateDir);
-  const manager=new DurableOperationManager(input.config,undefined,undefined,undefined,bindings.readers);
+  const manager=new DurableOperationManager(input.config,undefined,bindings.readers);
   try {
     const local=bindings.localDrainedCutoverContext({
       cutoverId:input.cutoverId,

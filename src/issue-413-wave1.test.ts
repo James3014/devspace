@@ -14,6 +14,8 @@ import { WorkspaceRegistry } from "./workspaces.js";
 import { createMcpServer } from "./server.js";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
+import { parseExecutionContract } from "./local-agent-contract.js";
+import { parseToolProjectionManifest, TOOL_INTENT_NAMESPACE, TOOL_PROJECTION_MANIFEST_SCHEMA } from "./execution-protocol.js";
 import { CodexGoalSessionManager } from "./codex-goal-sessions.js";
 
 interface TestEnv {
@@ -504,4 +506,62 @@ test("Test 8: Tool modes (minimal, dispatch, codex, full) surface separation is 
   assert.ok(codexTools.includes("codex_goal_cancel"));
   assert.ok(codexTools.includes("exec_command"));
   assert.ok(codexTools.includes("write_stdin"));
+});
+
+// ── Test 9: Retired governance input fails closed ────────────────────────────
+test("Test 9: internal execution contract rejects retired Nexus/work-resume governance keys", () => {
+  const retiredInputs: Record<string, unknown>[] = [
+    { authorityMode: "OWNER_DIRECT" },
+    {
+      nexusGrant: {
+        repository: "James3014/Nexus-new",
+        revision: "a".repeat(40),
+        grantPath: "tasks/grant.json",
+        grantSha256: "b".repeat(64),
+        authorityPath: "tasks/authority.json",
+        authoritySha256: "c".repeat(64),
+      },
+    },
+    { capabilityDiscovery: { schema: "retired" } },
+    { coreMutation: { sessionId: `cms_${"d".repeat(32)}`, bindingHash: `sha256:${"e".repeat(64)}` } },
+    { resumableWork: { workKey: `wk_${"f".repeat(32)}`, leaseId: "legacy", expectedLeaseVersion: 1, baseRevisionSha: "1".repeat(40) } },
+  ];
+
+  for (const input of retiredInputs) {
+    assert.throws(
+      () => parseExecutionContract(input),
+      /retired governance field/i,
+      `expected retired governance contract to fail closed: ${Object.keys(input)[0]}`,
+    );
+  }
+});
+
+// ── Test 10: Internal Wave 3 branches are physically removed ────────────────
+test("Test 10: Wave 3 source no longer contains Nexus execution-authority compatibility branches", async () => {
+  const executionProtocol = await readFile(join(process.cwd(), "src", "execution-protocol.ts"), "utf8");
+  const localContract = await readFile(join(process.cwd(), "src", "local-agent-contract.ts"), "utf8");
+  const localSessions = await readFile(join(process.cwd(), "src", "local-agent-sessions.ts"), "utf8");
+  const durableOperations = await readFile(join(process.cwd(), "src", "durable-operations.ts"), "utf8");
+
+  assert.doesNotMatch(executionProtocol, /NEXUS_GOVERNED|NEXUS_EXECUTION_GRANT|NexusExecutionGrant|AuthorityValidationEvidence/);
+  assert.doesNotMatch(localContract, /authorityMode|nexusGrant|capabilityDiscovery|coreMutation|resumableWork/);
+  assert.doesNotMatch(localSessions, /NEXUS_GOVERNED|nexusGrantResolver|resolveCanonicalNexusExecutionGrant|resumableWork/);
+  assert.doesNotMatch(durableOperations, /NEXUS_GOVERNED|input\.authorityMode|authorityMode\?: ExecutionAuthorityMode/);
+});
+
+// ── Test 11: Tool projection has only direct execution authority ────────────
+test("Test 11: internal tool projection rejects retired Nexus authority", () => {
+  assert.throws(
+    () => parseToolProjectionManifest({
+      schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+      namespace: TOOL_INTENT_NAMESPACE,
+      identity: { taskId: "wave3", attemptId: "wave3-1" },
+      authority: { mode: "NEXUS_GOVERNED", issuer: "nexus" },
+      authorizedToolCeiling: ["workspace.read"],
+      candidateTools: ["workspace.read"],
+      selectedTools: ["workspace.read"],
+      orderingMode: "ORDER_INDEPENDENT",
+    }),
+    /authority/i,
+  );
 });

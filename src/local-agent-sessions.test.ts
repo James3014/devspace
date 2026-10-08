@@ -1050,6 +1050,7 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
           retryable: false,
           model: "cline-pass/glm-5.3-flash",
           variant: "high",
+          rawProviderCode: "EntitlementError",
           providerSessionId: "sess-cline-live-1",
           providerMessage: "ClinePass entitlement required api_key=synthetic-secret-value-9f3a",
         });
@@ -1081,6 +1082,7 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
       code: "CLINEPASS_ENTITLEMENT_REQUIRED",
       errorClass: "ENTITLEMENT_REQUIRED",
       retryable: false,
+      rawProviderCode: "EntitlementError",
       model: "cline-pass/glm-5.3-flash",
       variant: "high",
       providerSessionId: "sess-cline-live-1",
@@ -1213,7 +1215,6 @@ test("HerdR request-only execution never reports proven scope or unknown overall
     } as any,
     async () => {},
     async () => true,
-    undefined,
     undefined,
     undefined,
     undefined,
@@ -1819,7 +1820,6 @@ test("LocalAgentSessionManager - HERDR public lifecycle routes start, continue, 
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
   );
   const attemptKey = "issue242-public-herdr-1";
@@ -1968,9 +1968,7 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
-    undefined,
     async ({ toolchainId, verifier, cwd, denyWriteRoots }) => {
       verifierCalls.push({ toolchainId, verifier });
       assert.deepEqual(denyWriteRoots, [workspaceRoot, stateDir]);
@@ -2356,7 +2354,6 @@ test("LocalAgentSessionManager - HERDR confirmed onboarding block settles termin
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
   );
   const attemptKey = "issue242-herdr-onboarding";
@@ -2448,7 +2445,6 @@ test("LocalAgentSessionManager - HERDR typed provider capacity failure stays dur
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
   );
   const attemptKey = "issue242-herdr-provider-capacity";
@@ -2520,7 +2516,6 @@ test("LocalAgentSessionManager - HERDR daemon unavailable fails closed before re
     config,
     async () => { legacyLaunches++; },
     async () => true,
-    undefined,
     undefined,
     undefined,
     undefined,
@@ -2897,7 +2892,6 @@ test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", 
       config,
       async () => {},
       async () => true,
-      undefined,
       undefined,
       undefined,
       undefined,
@@ -3381,7 +3375,6 @@ test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", 
         undefined,
         undefined,
         undefined,
-        undefined,
         restartGateway,
       );
       try {
@@ -3425,7 +3418,6 @@ test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", 
         restartConfig,
         async () => {},
         async () => true,
-        undefined,
         undefined,
         undefined,
         undefined,

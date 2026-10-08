@@ -563,6 +563,23 @@ if (args.includes("--print")) {
     process.stdout.write(JSON.stringify({ ...base, response }));
     process.exitCode = 0;
   }
+  else if (prompt === "REQUESTED_RESOLVED_MODEL_ONLY") {
+    console.log(JSON.stringify({
+      status: "SUCCESS",
+      conversation_id: "requested-resolved-model-only",
+      response: "requested/resolved metadata only",
+      model: "claude-opus-4-6",
+      resolved_model: "claude-opus-4-6",
+    }));
+  }
+  else if (prompt === "UNPROVEN_OBSERVED_MODEL_FIELD") {
+    console.log(JSON.stringify({
+      status: "SUCCESS",
+      conversation_id: "unproven-observed-model-field",
+      response: "unproven observed model field",
+      observed_model: "claude-opus-4-6",
+    }));
+  }
   else if (prompt === "STDERR_EXACT_LIMIT") {
     process.stderr.write("e".repeat(Number(process.env.AGY_ERROR_LIMIT)));
     console.log(JSON.stringify({ status: "SUCCESS", conversation_id: "stderr-boundary", response: "stderr boundary ok" }));
@@ -666,6 +683,27 @@ try {
       '{"serena":{"command":"UNRELATED_GLOBAL_MCP_SENTINEL"}}\n',
       "bounded Agy adapter must not mutate the ambient global MCP config",
     );
+  }
+
+  // Agy JSON key names do not establish provider-side identity provenance.
+  // Matching requested/resolved metadata and an `observed_model` key must
+  // remain unavailable until a documented physical readback exists.
+  {
+    const requestedResolvedOnly = await adapter.run({
+      prompt: "REQUESTED_RESOLVED_MODEL_ONLY",
+      workspaceRoot: process.cwd(),
+      model: "claude-opus-4-6",
+    });
+    assert.equal(requestedResolvedOnly.observedModel, undefined);
+    assert.equal(requestedResolvedOnly.attestationSource, undefined);
+
+    const unprovenObservedField = await adapter.run({
+      prompt: "UNPROVEN_OBSERVED_MODEL_FIELD",
+      workspaceRoot: process.cwd(),
+      model: "claude-opus-4-6",
+    });
+    assert.equal(unprovenObservedField.observedModel, undefined);
+    assert.equal(unprovenObservedField.attestationSource, undefined);
   }
 
   // B. Missing or forged scratch must fail closed before Agy can inherit HOME.

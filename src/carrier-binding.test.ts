@@ -76,7 +76,7 @@ async function prepareCapabilityMismatch(f: ReturnType<typeof fixture>, sessionI
   const plan=planCutoverStart(f.root,cutover);
   const preparedLease=f.store.prepareEffect(context,plan.subject);
   const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,`${sessionId}-config`),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,`${sessionId}-worktrees`),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-  const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+  const manager=new DurableOperationManager(config,undefined,f.store.readers);
   const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
   manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
   const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
@@ -103,7 +103,7 @@ async function prepareUnexpectedReplacement(f: ReturnType<typeof fixture>, sessi
   const plan=planCutoverStart(f.root,cutover);
   const preparedLease=f.store.prepareEffect(context,plan.subject);
   const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,`${sessionId}-config`),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,`${sessionId}-worktrees`),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-  const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+  const manager=new DurableOperationManager(config,undefined,f.store.readers);
   const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
   manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
   const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
@@ -160,7 +160,7 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
     const child=f.store.requestPairing(f.worker);
     assert.throws(()=>f.store.delegate(context,child.pendingId,{...contract,role:"worker"}));
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const manager=new DurableOperationManager(config,undefined,f.store.readers);
     let scheduled=0;
     const actuator={actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget,schedule:()=>{scheduled++;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget};}};
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
@@ -182,7 +182,7 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
       await assert.rejects(manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"test"}),actuator,context));
     } finally {manager.close();}
     const resumedStore=new CarrierBindingStore(f.root,f.clock);
-    const resumedManager=new DurableOperationManager(config,undefined,undefined,undefined,resumedStore.readers);
+    const resumedManager=new DurableOperationManager(config,undefined,resumedStore.readers);
     const successor={clientId:context.clientId,sessionId:"replacement-session"};
     try {
       if(expireLease) {
@@ -249,7 +249,7 @@ test("active coordination-bound prepared cutover can terminally reconcile an exa
     f.store.approveLocal(pairing.pendingId,{...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover});
     f.store.redeem(context,pairing.credential);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const manager=new DurableOperationManager(config,undefined,f.store.readers);
     try {
       f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
       const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
@@ -286,7 +286,7 @@ test("terminal hygiene releases the exact active prepared-replacement cutover le
     const plan=planCutoverStart(f.root,cutover);
     const acquired=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context);
     const cutoverId=start.receipt!.cutoverId as string;
     const replacement={serverInstanceId:"replacement",...cutover.expectedIdentity};
@@ -343,7 +343,7 @@ test("expired coordination-bound prepared cutover can terminally reconcile an ex
     const approved=f.store.approveLocal(pairing.pendingId,contract);
     f.store.redeem(context,pairing.credential);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const manager=new DurableOperationManager(config,undefined,f.store.readers);
     try {
       f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
       const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
@@ -388,7 +388,7 @@ test("host-local recovery terminally closes only an expired prepared cutover wit
     const plan=planCutoverStart(f.root,cutover);
     const lease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config2"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees2"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     const validityBefore=f.store.inspectLocal(approved.id).validity;
     f.advance(120000);
@@ -434,7 +434,7 @@ test("host-local expired prepared recovery rejects any prior drain effect",()=>{
     f.store.redeem(context,pairing.credential);
     const plan=planCutoverStart(f.root,cutover);f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config3"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees3"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     f.store.readers.approveCutoverLifecycle=()=>true;
     manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
@@ -463,7 +463,7 @@ test("expired prepared recovery crash before cutover close keeps the global fenc
     const approved=f.store.approveLocal(pairing.pendingId,contract);f.store.redeem(context,pairing.credential);
     const plan=planCutoverStart(f.root,cutover);const lease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config4"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees4"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     f.advance(120000);
     CutoverStateStore.prototype.recoverExpiredPreparedNoEffect=function(){throw new Error("injected-before-cutover-close");};
@@ -499,7 +499,7 @@ test("expired prepared recovery crash after cutover close replays only operation
     const approved=f.store.approveLocal(pairing.pendingId,contract);f.store.redeem(context,pairing.credential);
     const plan=planCutoverStart(f.root,cutover);const lease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config5"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees5"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     f.advance(120000);
     let injected=false;
@@ -799,7 +799,7 @@ test("host-local capability expectation mismatch recovery closes the failed cuto
     const plan=planCutoverStart(f.root,cutover);
     const preparedLease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-cap-mismatch"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-cap-mismatch"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
     const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
@@ -878,7 +878,7 @@ test("host-local capability expectation mismatch recovery accepts an arbitrary s
     const plan=planCutoverStart(f.root,cutover);
     const lease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-cap-mismatch-negative"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-cap-mismatch-negative"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
     const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
@@ -915,7 +915,7 @@ test("host-local failed activation recovery closes a consumed wrong-generation r
     const plan=planCutoverStart(f.root,cutover);
     const preparedLease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-failed-activation"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-failed-activation"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
     const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
@@ -1191,7 +1191,7 @@ test("handoff denies a pinned operation and permits terminal replay after predec
     const started=new Promise<void>(resolve=>{launched=resolve;});
     const terminal=new Promise<void>(resolve=>{finish=resolve;});
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_ALLOWED_ROOTS:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},f.store.readers);
     const input={workspaceId:"fixture-workspace",workspaceRoot:f.workspace,attemptKey:"handoff-terminal",recipe:"npm_ci" as const};
     const plan=await manager.planDependencySync(input);
     const lease=f.store.prepareEffect(sender,plan.subject);
@@ -1460,7 +1460,7 @@ for(const expire of [true,false]) test(`validity drift fences completion and ori
     const started=new Promise<void>(resolve=>{launched=resolve;});
     const terminal=new Promise<void>(resolve=>{finish=resolve;});
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_ALLOWED_ROOTS:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},f.store.readers);
     const input={workspaceId:"fixture-workspace",workspaceRoot:f.workspace,attemptKey:"handoff-terminal",recipe:"npm_ci" as const};
     const plan=await manager.planDependencySync(input);
     const lease=f.store.prepareEffect(sender,plan.subject);
@@ -1594,7 +1594,7 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
       HOST:"127.0.0.1",
       PORT:"7677",
     });
-    const setup=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const setup=new DurableOperationManager(config,undefined,f.store.readers);
     const start=setup.startCutover(cutover,context);
     const cutoverId=start.receipt!.cutoverId as string;
     setup.drainCutover(cutoverId,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
@@ -1746,7 +1746,7 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     const plan=planCutoverStart(f.root,cutover);
     const acquired=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",HOST:"127.0.0.1",PORT:"7677"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context);
     const cutoverId=start.receipt!.cutoverId as string;
     manager.drainCutover(cutoverId,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);

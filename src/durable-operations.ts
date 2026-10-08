@@ -16,7 +16,7 @@ import { join, resolve } from "node:path";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
-import { EXECUTION_PROTOCOL_VERSION, type ExecutionAuthorityMode } from "./execution-protocol.js";
+import { EXECUTION_PROTOCOL_VERSION } from "./execution-protocol.js";
 import { GitCandidateError, pushCandidate, type GitCandidateCommandRunner } from "./git-candidate.js";
 
 const spawn = nativeSpawn;
@@ -60,7 +60,6 @@ export interface DurableOperationRecord {
   attemptKey: string;
   requestHash: string;
   kind: DurableOperationKind;
-  authorityMode: ExecutionAuthorityMode;
   scopeRoot: string;
   workspaceId?: string;
   status: DurableOperationStatus;
@@ -236,7 +235,7 @@ export class DurableOperationStore {
         input.attemptKey,
         input.requestHash,
         input.kind,
-        input.authorityMode,
+        "OWNER_DIRECT",
         canonicalizePath(input.scopeRoot),
         input.workspaceId ?? null,
         JSON.stringify(input.request),
@@ -309,7 +308,6 @@ export interface WorkspaceCloneInput {
   remote: string;
   destination: string;
   ref?: string;
-  authorityMode?: ExecutionAuthorityMode;
 }
 
 export interface GitPushInput {
@@ -319,7 +317,6 @@ export interface GitPushInput {
   expectedHead: string;
   remote: string;
   branch: string;
-  authorityMode?: ExecutionAuthorityMode;
   /** Test-only command injection; MCP callers cannot supply this. */
   gitRunner?: GitCandidateCommandRunner;
 }
@@ -329,7 +326,6 @@ export interface DependencySyncInput {
   workspaceId: string;
   workspaceRoot: string;
   recipe: DependencySyncRecipe;
-  authorityMode?: ExecutionAuthorityMode;
   /**
    * Trusted server-side admission only. Callers cannot set this through MCP.
    * Allows OWNER_DIRECT frozen dependency sync without a carrier only for a
@@ -351,10 +347,7 @@ export class DurableOperationManager {
   constructor(
     private readonly config: ServerConfig,
     private readonly runCommand: CommandRunner = spawnCommand,
-    _runNexusGatewayRecovery?: unknown,
-    _runNexusGatewayRecoveryPreflight?: unknown,
     coordination?: ControlPlaneConsumerOptions,
-    _runNexusGatewayRecoveryMaterialize?: unknown,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
@@ -367,13 +360,6 @@ export class DurableOperationManager {
 
   async workspaceClone(input: WorkspaceCloneInput): Promise<DurableOperationRecord> {
     assertAttemptKey(input.attemptKey);
-    const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
-    if (authorityMode !== "OWNER_DIRECT") {
-      throw new DurableOperationError(
-        "RECONCILIATION_REQUIRED",
-        "NEXUS_GOVERNED workspace bootstrap is not self-authorizing; G9 must provide validated Nexus authority evidence.",
-      );
-    }
     assertCredentialFreeRemote(input.remote);
     const destination = canonicalizePath(
       assertAllowedDestination(input.destination, this.config.allowedRoots),
@@ -406,7 +392,6 @@ export class DurableOperationManager {
       attemptKey: input.attemptKey,
       requestHash,
       kind: "workspace_clone",
-      authorityMode,
       scopeRoot,
       request,
     });
@@ -441,13 +426,6 @@ export class DurableOperationManager {
 
   async gitPush(input: GitPushInput): Promise<DurableOperationRecord> {
     assertAttemptKey(input.attemptKey);
-    const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
-    if (authorityMode !== "OWNER_DIRECT") {
-      throw new DurableOperationError(
-        "RECONCILIATION_REQUIRED",
-        "NEXUS_GOVERNED Git publication is not self-authorizing; caller admission and Core authority remain external.",
-      );
-    }
     const workspaceRoot = canonicalizePath(input.workspaceRoot);
     const allowed =
       this.config.allowedRoots.some((root) => isPathInsideRoot(workspaceRoot, canonicalizePath(root))) ||
@@ -484,7 +462,6 @@ export class DurableOperationManager {
       attemptKey: input.attemptKey,
       requestHash,
       kind: "git_push",
-      authorityMode,
       scopeRoot: workspaceRoot,
       workspaceId: input.workspaceId,
       request,
@@ -627,7 +604,7 @@ export class DurableOperationManager {
         return {record:existing,created:false};
       }
       const coordinationBinding = consumer.pinCutover(context,subject,binding);
-      return this.store.createOrReplay({operationId,attemptKey:snapshot.attemptKey,requestHash,kind:"cutover_start",authorityMode:"OWNER_DIRECT",scopeRoot:stateRoot,request:{...request,coordinationBinding}});
+      return this.store.createOrReplay({operationId,attemptKey:snapshot.attemptKey,requestHash,kind:"cutover_start",scopeRoot:stateRoot,request:{...request,coordinationBinding}});
     });
     if (!intent.created) return this.reconcileCutoverStart(operationId,context);
     try {
@@ -826,13 +803,6 @@ export class DurableOperationManager {
 
   async planDependencySync(input: DependencySyncInput) {
     assertAttemptKey(input.attemptKey);
-    const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
-    if (authorityMode !== "OWNER_DIRECT") {
-      throw new DurableOperationError(
-        "RECONCILIATION_REQUIRED",
-        "NEXUS_GOVERNED dependency sync is not self-authorizing; G9 must provide validated Nexus authority evidence.",
-      );
-    }
     const workspaceRoot = canonicalizePath(input.workspaceRoot);
     if (!this.config.allowedRoots.some((root) => isPathInsideRoot(workspaceRoot, canonicalizePath(root))) &&
         !isPathInsideRoot(workspaceRoot, canonicalizePath(this.config.worktreeRoot))) {
@@ -855,7 +825,7 @@ export class DurableOperationManager {
     const requestHash = hashJson(request);
     const operationId = stableOperationId("dependency_sync", workspaceRoot, input.attemptKey);
     const subject = {operationId, requestHash, workspaceRoot, baseRevision, operation: "dependency_sync" as const};
-    return {subject, request, workspaceRoot, authorityMode, frozenInputs, before, baseRevision, requestHash, operationId};
+    return {subject, request, workspaceRoot, frozenInputs, before, baseRevision, requestHash, operationId};
   }
 
   async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
@@ -864,7 +834,7 @@ export class DurableOperationManager {
       throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
     }
     const consumer = this.consumer;
-    const {subject, request, workspaceRoot, authorityMode, frozenInputs, before, baseRevision, requestHash, operationId} = await this.planDependencySync(input);
+    const {subject, request, workspaceRoot, frozenInputs, before, baseRevision, requestHash, operationId} = await this.planDependencySync(input);
     const directWitnessId = "OWNER_DIRECT_ISOLATED";
     const prepared = this.store.atomic(() => {
       if (ownerDirectIsolated) {
@@ -873,7 +843,6 @@ export class DurableOperationManager {
           attemptKey: input.attemptKey,
           requestHash,
           kind: "dependency_sync",
-          authorityMode,
           scopeRoot: workspaceRoot,
           workspaceId: input.workspaceId,
           request,
@@ -886,7 +855,6 @@ export class DurableOperationManager {
         attemptKey: input.attemptKey,
         requestHash,
         kind: "dependency_sync",
-        authorityMode,
         scopeRoot: workspaceRoot,
         workspaceId: input.workspaceId,
         request,
@@ -961,7 +929,6 @@ export class DurableOperationManager {
       if (
         !record ||
         record.kind !== "dependency_sync" ||
-        record.authorityMode !== "OWNER_DIRECT" ||
         record.request.ownerDirectIsolated !== true
       ) {
         throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "owner-direct isolated reconciliation is not authorized for this operation");
@@ -1021,7 +988,7 @@ export class DurableOperationManager {
     if (record.kind === "cutover_start") return this.reconcileCutoverStart(operationId,consumerContext);
     if (record.kind === "git_push") return await this.reconcileGitPush(operationId);
     if (record.kind === "dependency_sync") {
-      if (record.authorityMode === "OWNER_DIRECT" && record.request.ownerDirectIsolated === true) {
+      if (record.request.ownerDirectIsolated === true) {
         return this.reconcileOwnerDirectDependencySync(operationId);
       }
       if (!this.consumer || typeof record.request.baseRevision !== "string") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires revision-bound host authority");
@@ -1074,7 +1041,6 @@ function rowToRecord(row: DurableOperationRow): DurableOperationRecord {
     attemptKey: row.attempt_key,
     requestHash: row.request_hash,
     kind: row.kind as DurableOperationKind,
-    authorityMode: row.authority_mode as ExecutionAuthorityMode,
     scopeRoot: row.scope_root,
     workspaceId: row.workspace_id ?? undefined,
     status: row.status as DurableOperationStatus,
