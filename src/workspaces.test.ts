@@ -188,6 +188,7 @@ test("a symlinked allowed root preserves checkout and worktree path behavior", {
   await createGitProject(context.root);
 
   const aliasConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(context.root, ".devspace-alias-home"),
     DEVSPACE_ALLOWED_ROOTS: aliasRoot,
     DEVSPACE_WORKTREE_ROOT: join(aliasRoot, ".devspace", "alias-worktrees"),
     DEVSPACE_AGENT_DIR: context.agentDir,
