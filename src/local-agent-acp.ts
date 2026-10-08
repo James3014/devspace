@@ -1071,7 +1071,13 @@ export function classifyAcpError(
   modelInfo?: { model?: string; variant?: string },
   stderrTail?: string,
 ): AgentProviderError | undefined {
-  const text = `${error instanceof Error ? error.message : String(error)} ${stderrTail ?? ""}`.trim();
+  const errorText = error instanceof Error
+    ? error.message
+    : typeof error === "string"
+      ? error
+      : JSON.stringify(error) ?? String(error);
+  const text = `${errorText} ${stderrTail ?? ""}`.trim();
+  const rawProviderCode = extractRawProviderCode(error, errorText);
   if (/no access to clinepass subscription models/i.test(text)) {
     return new AgentProviderFailureError({
       code: "CLINEPASS_ENTITLEMENT_REQUIRED",
@@ -1079,6 +1085,7 @@ export function classifyAcpError(
       provider,
       operation: "run",
       retryable: false,
+      ...(rawProviderCode ? { rawProviderCode } : {}),
       model: modelInfo?.model,
       variant: modelInfo?.variant,
       providerSessionId: sessionId,
@@ -1086,13 +1093,14 @@ export function classifyAcpError(
       message: `ClinePass subscription entitlement required: ${text.slice(0, 400)}`,
     });
   }
-  if (/model.*(?:not found|unavailable|unknown)/i.test(text)) {
+  if (/model.*(?:not found|unavailable|unknown|not supported)|unsupported model/i.test(text)) {
     return new AgentProviderFailureError({
       code: "PROVIDER_MODEL_UNAVAILABLE",
       errorClass: "MODEL_UNAVAILABLE",
       provider,
       operation: "run",
       retryable: false,
+      ...(rawProviderCode ? { rawProviderCode } : {}),
       model: modelInfo?.model,
       variant: modelInfo?.variant,
       providerSessionId: sessionId,
@@ -1107,6 +1115,7 @@ export function classifyAcpError(
       provider,
       operation: "run",
       retryable: false,
+      ...(rawProviderCode ? { rawProviderCode } : {}),
       model: modelInfo?.model,
       variant: modelInfo?.variant,
       providerSessionId: sessionId,
@@ -1121,6 +1130,7 @@ export function classifyAcpError(
       provider,
       operation: "run",
       retryable: true,
+      ...(rawProviderCode ? { rawProviderCode } : {}),
       model: modelInfo?.model,
       variant: modelInfo?.variant,
       providerSessionId: sessionId,
@@ -1129,6 +1139,24 @@ export function classifyAcpError(
     });
   }
   return undefined;
+}
+
+function extractRawProviderCode(error: unknown, errorText: string): string | undefined {
+  const directCode = directString(asRecord(error)?.code);
+  if (directCode) return directCode;
+
+  const jsonStart = errorText.indexOf("{");
+  if (jsonStart < 0) return undefined;
+  try {
+    const envelope = asRecord(JSON.parse(errorText.slice(jsonStart)));
+    const details = asRecord(envelope?.error);
+    return directString(details?.code)
+      ?? directString(details?.type)
+      ?? directString(envelope?.code)
+      ?? directString(envelope?.type);
+  } catch {
+    return undefined;
+  }
 }
 
 function extractAcpText(requiredParts: string[], fallbackUpdates: unknown[] = []): string {
