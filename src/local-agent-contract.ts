@@ -1,11 +1,8 @@
 import {
   normalizeToolIntentSet,
   parseDispatchIntent,
-  parseNexusExecutionGrantRef,
   parseToolProjectionManifest,
   type DispatchIntent,
-  type ExecutionAuthorityMode,
-  type NexusExecutionGrantRef,
   type ToolIntentId,
   type ToolProjectionManifest,
 } from "./execution-protocol.js";
@@ -14,11 +11,6 @@ import {
   parseLocalEffectProjection,
   type LocalEffectProjection,
 } from "./local-effect-enforcement.js";
-import {
-  parseResumableWorkPointer,
-  type ResumableWorkPointer,
-} from "./work-resume.js";
-
 /**
  * Structured execution contract for a DevSpace subagent turn.
  *
@@ -50,6 +42,8 @@ export type AgentTerminalReason =
   | "unknown";
 
 export interface ExecutionContract {
+  /** Internal fence for persisted legacy/corrupt contracts that must never execute. */
+  legacyRejected?: true;
   /** Immutable direct provider/model identity captured at MCP admission. */
   directSelection?: {
     provider: string;
@@ -70,10 +64,6 @@ export interface ExecutionContract {
     freshness: "fresh" | "stale" | "unknown";
     runtimeIdentity: string;
   };
-  /** Defaults to OWNER_DIRECT for backwards compatibility. */
-  authorityMode?: ExecutionAuthorityMode;
-  /** Immutable canonical Nexus authority pointer, required only for NEXUS_GOVERNED. */
-  nexusGrant?: NexusExecutionGrantRef;
   /** Controller-authored bounded work semantics, transported durably by DevSpace. */
   dispatchIntent?: DispatchIntent;
   /**
@@ -92,10 +82,6 @@ export interface ExecutionContract {
    * Filesystem write authority remains solely in writePaths.
    */
   effectProjection?: LocalEffectProjection;
-  /** Optional capability discovery receipt for compatibility. */
-  capabilityDiscovery?: unknown;
-  /** Exact pointer to an already-open Core-bound mutation session. */
-  coreMutation?: { sessionId: string; bindingHash: string };
   /**
    * If supplied, agent_start fails closed when the workspace HEAD no longer
    * matches before any worker mutation.
@@ -111,13 +97,6 @@ export interface ExecutionContract {
   maxFiles?: number;
   /** Toolchain id used to resolve verifier executables outside the model prompt. */
   toolchainId?: string;
-  /**
-   * P0 resumable-work pointer.  When supplied, all write-capable sinks MUST
-   * call centralAdmissionCheck with this pointer before launching any provider,
-   * file, git, or process effect.  Legacy callers that do not supply this field
-   * remain fully compatible and bypass the P0 fencing lane.
-   */
-  resumableWork?: ResumableWorkPointer;
   /** Optional wall-clock bound for the whole agent turn (turn start -> terminal). */
   maxWallMs?: number;
 
@@ -269,6 +248,30 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     throw new Error("executionContract must be an object.");
   }
   const record = value as Record<string, unknown>;
+  const supportedKeys = new Set([
+    "directSelection",
+    "catalogReceipt",
+    "dispatchIntent",
+    "authorizedToolCeiling",
+    "toolProjectionManifest",
+    "effectProjection",
+    "expectedHead",
+    "writePaths",
+    "maxFiles",
+    "toolchainId",
+    "maxWallMs",
+    "maxStartupMs",
+    "maxExecutionMs",
+    "idleTimeoutMs",
+    "idleTimeoutMode",
+    "role",
+    "parentEffectKey",
+    "supersedes",
+  ]);
+  const unsupportedKey = Object.keys(record).find((key) => !supportedKeys.has(key));
+  if (unsupportedKey) {
+    throw new Error(`executionContract contains a retired governance field or unsupported key: ${unsupportedKey}`);
+  }
   const contract: ExecutionContract = {};
 
   if (record.directSelection !== undefined) {
@@ -322,17 +325,6 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     };
   }
 
-  if (record.authorityMode !== undefined) {
-    if (record.authorityMode !== "OWNER_DIRECT" && record.authorityMode !== "NEXUS_GOVERNED") {
-      throw new Error("executionContract.authorityMode must be OWNER_DIRECT or NEXUS_GOVERNED.");
-    }
-    contract.authorityMode = record.authorityMode;
-  }
-
-  if (record.nexusGrant !== undefined) {
-    contract.nexusGrant = parseNexusExecutionGrantRef(record.nexusGrant);
-  }
-
   if (record.dispatchIntent !== undefined) {
     contract.dispatchIntent = parseDispatchIntent(record.dispatchIntent);
   }
@@ -353,24 +345,6 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
 
   if (record.effectProjection !== undefined) {
     contract.effectProjection = parseLocalEffectProjection(record.effectProjection);
-  }
-
-  if (record.capabilityDiscovery !== undefined) {
-    contract.capabilityDiscovery = record.capabilityDiscovery;
-  }
-
-  if (record.coreMutation !== undefined) {
-    if (typeof record.coreMutation !== "object" || record.coreMutation === null || Array.isArray(record.coreMutation)) {
-      throw new Error("executionContract.coreMutation must be an object.");
-    }
-    const coreMutation = record.coreMutation as Record<string, unknown>;
-    const keys = Object.keys(coreMutation).sort().join(",");
-    if (keys !== "bindingHash,sessionId"
-      || typeof coreMutation.sessionId !== "string" || !/^cms_[0-9a-f]{32}$/.test(coreMutation.sessionId)
-      || typeof coreMutation.bindingHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(coreMutation.bindingHash)) {
-      throw new Error("executionContract.coreMutation requires exact sessionId and bindingHash.");
-    }
-    contract.coreMutation = { sessionId: coreMutation.sessionId, bindingHash: coreMutation.bindingHash };
   }
 
   if (record.expectedHead !== undefined) {
@@ -405,17 +379,6 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       throw new Error("executionContract.toolchainId must be a non-empty string.");
     }
     contract.toolchainId = record.toolchainId.trim();
-  }
-
-  if (record.resumableWork !== undefined) {
-    try {
-      const ptr = parseResumableWorkPointer(record.resumableWork);
-      if (ptr) contract.resumableWork = ptr;
-    } catch (err) {
-      throw new Error(
-        `executionContract.resumableWork is invalid: ${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
   }
 
   if (record.maxWallMs !== undefined) {
@@ -479,16 +442,6 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     contract.supersedes = record.supersedes.trim();
   }
 
-  const authorityMode = contract.authorityMode ?? "OWNER_DIRECT";
-  if (authorityMode === "OWNER_DIRECT" && contract.nexusGrant) {
-    throw new Error("OWNER_DIRECT execution must not carry Nexus grant authority.");
-  }
-  if (authorityMode === "NEXUS_GOVERNED") {
-    if (!contract.nexusGrant || !contract.dispatchIntent || !contract.expectedHead) {
-      throw new Error("NEXUS_GOVERNED execution requires nexusGrant, dispatchIntent, and expectedHead.");
-    }
-  }
-
   if (contract.authorizedToolCeiling && !contract.toolProjectionManifest) {
     throw new Error("executionContract.authorizedToolCeiling requires toolProjectionManifest.");
   }
@@ -502,9 +455,8 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     if (manifest.authorizedToolCeiling.join("\n") !== ceilingKey) {
       throw new Error("executionContract.toolProjectionManifest authorizedToolCeiling must exactly match the durable executionContract.authorizedToolCeiling.");
     }
-    if (manifest.authority.mode !== authorityMode
-      || manifest.authority.issuer !== (authorityMode === "OWNER_DIRECT" ? "owner" : "nexus")) {
-      throw new Error("executionContract.toolProjectionManifest authority must match executionContract authorityMode.");
+    if (manifest.authority.mode !== "OWNER_DIRECT" || manifest.authority.issuer !== "owner") {
+      throw new Error("executionContract.toolProjectionManifest authority must be OWNER_DIRECT/owner.");
     }
     if (contract.dispatchIntent
       && (manifest.identity.taskId !== contract.dispatchIntent.taskId
@@ -544,6 +496,6 @@ export function deserializeExecutionContract(value: string | null | undefined): 
   try {
     return parseExecutionContract(JSON.parse(value));
   } catch {
-    return undefined;
+    return { legacyRejected: true };
   }
 }
