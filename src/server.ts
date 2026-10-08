@@ -1576,6 +1576,28 @@ function registerRepositoryIntelligenceTools(
         return hasSnapshot ? { snapshot: input.snapshot } : { cfi_report: input.cfi_report };
       },
     },
+    {
+      name: "repository_intelligence_knowledge",
+      title: "Repository Intelligence knowledge applicability",
+      description: "Compute canonical Repository Intelligence knowledge applicability from normalized caller-supplied evidence. Read-only and REPOSITORY_KNOWLEDGE_APPLICABILITY_EVIDENCE_ONLY: affected knowledge means review-needed evidence, not semantic incorrectness or mutation authority.",
+      operation: "knowledge",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        evidence: snapshotSchema,
+      },
+      extractInput: (input) => input.evidence,
+    },
+    {
+      name: "repository_intelligence_guard_delta",
+      title: "Repository Intelligence guard semantic delta",
+      description: "Compute canonical Repository Intelligence guard semantic delta from normalized caller-supplied old/new guard evidence. Read-only and GUARD_SEMANTIC_DELTA_ADVISORY_EVIDENCE_ONLY: classifications grant no policy, approval, merge, release, or dispatch authority.",
+      operation: "guard-delta",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        evidence: snapshotSchema,
+      },
+      extractInput: (input) => input.evidence,
+    },
   ];
 
   registerRepositoryIntelligenceArtifactTool(server, config, workspaces);
