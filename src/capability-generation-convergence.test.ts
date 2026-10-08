@@ -10,11 +10,11 @@ import {
   type SessionGenerationSnapshot,
   type ServiceRoleDeploymentIdentity,
 } from "./deployment-convergence.js";
-import { CUTOVER_SAFE_TOOLS } from "./mcp-cutover.js";
+import { classifyCutoverEffect } from "./mcp-cutover.js";
 import { McpSessionRegistry } from "./mcp-sessions.js";
 
-test("Issue #133: CUTOVER_SAFE_TOOLS includes capability_convergence_status", () => {
-  assert.equal(CUTOVER_SAFE_TOOLS.has("capability_convergence_status"), true);
+test("Issue #133: capability convergence observation remains independent of deployment conflicts", () => {
+  assert.equal(classifyCutoverEffect("capability_convergence_status"), "INDEPENDENT");
 });
 
 test("Issue #133: SessionConvergence detects stale server across restart", () => {
