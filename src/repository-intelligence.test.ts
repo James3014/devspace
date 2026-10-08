@@ -50,9 +50,15 @@ process.stdin.on('end', () => {
   const operation = args[args.indexOf('--operation') + 1];
   const ceiling = operation === 'ci' || operation === 'cfi'
     ? 'CI_EVIDENCE_ONLY'
-    : operation === 'eia' ? 'AUTOMATION_ADVISORY_ONLY' : 'PR_INTELLIGENCE_ONLY';
-  const top = mode === 'wrong-ceiling' ? 'PRE_REVIEW_ONLY' : ceiling;
-  const nested = mode === 'wrong-nested-ceiling' ? 'PRE_REVIEW_ONLY' : ceiling;
+    : operation === 'eia'
+      ? 'AUTOMATION_ADVISORY_ONLY'
+      : operation === 'knowledge'
+        ? 'REPOSITORY_KNOWLEDGE_APPLICABILITY_EVIDENCE_ONLY'
+        : operation === 'guard-delta'
+          ? 'GUARD_SEMANTIC_DELTA_ADVISORY_EVIDENCE_ONLY'
+          : 'PR_INTELLIGENCE_ONLY';
+  const top = mode === 'missing-ceiling' ? undefined : mode === 'wrong-ceiling' ? 'PRE_REVIEW_ONLY' : ceiling;
+  const nested = mode === 'missing-nested-ceiling' ? undefined : mode === 'wrong-nested-ceiling' ? 'PRE_REVIEW_ONLY' : ceiling;
   const input = JSON.parse(body || '{}');
   process.stdout.write(JSON.stringify({ operation, claim_ceiling: top, result: { echo: input, claim_ceiling: nested } }));
 });
@@ -73,9 +79,9 @@ process.stdin.on('end', () => {
       "if mode == 'invalid-json': print('not-json', end=''); raise SystemExit(0)",
       "if mode == 'overflow': print('x' * 4096, end=''); raise SystemExit(0)",
       "if mode == 'timeout': open('ri-child.pid', 'w').write(str(__import__('os').getpid())); time.sleep(60)",
-      "ceiling = 'CI_EVIDENCE_ONLY' if operation in ('ci', 'cfi') else ('AUTOMATION_ADVISORY_ONLY' if operation == 'eia' else 'PR_INTELLIGENCE_ONLY')",
-      "top = 'PRE_REVIEW_ONLY' if mode == 'wrong-ceiling' else ceiling",
-      "nested = 'PRE_REVIEW_ONLY' if mode == 'wrong-nested-ceiling' else ceiling",
+      "ceiling = 'CI_EVIDENCE_ONLY' if operation in ('ci', 'cfi') else ('AUTOMATION_ADVISORY_ONLY' if operation == 'eia' else ('REPOSITORY_KNOWLEDGE_APPLICABILITY_EVIDENCE_ONLY' if operation == 'knowledge' else ('GUARD_SEMANTIC_DELTA_ADVISORY_EVIDENCE_ONLY' if operation == 'guard-delta' else 'PR_INTELLIGENCE_ONLY')))",
+      "top = None if mode == 'missing-ceiling' else ('PRE_REVIEW_ONLY' if mode == 'wrong-ceiling' else ceiling)",
+      "nested = None if mode == 'missing-nested-ceiling' else ('PRE_REVIEW_ONLY' if mode == 'wrong-nested-ceiling' else ceiling)",
       "payload = json.loads(sys.stdin.read() or '{}')",
       "print(json.dumps({'operation': operation, 'claim_ceiling': top, 'result': {'echo': payload, 'claim_ceiling': nested}}), end='')",
     ].join("\n"));
@@ -126,6 +132,20 @@ test("runner verifies exact engine HEAD and preserves all operation claim ceilin
     const eia = await runRepositoryIntelligenceOperation(cfg, "eia", { snapshot });
     assert.equal(eia.claim_ceiling, "AUTOMATION_ADVISORY_ONLY");
     assert.equal(eia.engine.head, head);
+    const knowledge = await runRepositoryIntelligenceOperation(
+      cfg,
+      "knowledge",
+      { snapshot, knowledge_artifacts: [], changes: [], observed_source_sha256: {}, in_scope: ["src/**"], collection_complete: true, collection_errors: [] },
+    );
+    assert.equal(knowledge.claim_ceiling, "REPOSITORY_KNOWLEDGE_APPLICABILITY_EVIDENCE_ONLY");
+    assert.equal(knowledge.engine.head, head);
+    const guardDelta = await runRepositoryIntelligenceOperation(
+      cfg,
+      "guard-delta",
+      { old_snapshot: snapshot, new_snapshot: snapshot, old_guard: {}, new_guard: {}, known_files: [], behavioral_witnesses: [], collection_complete: true, collection_errors: [] },
+    );
+    assert.equal(guardDelta.claim_ceiling, "GUARD_SEMANTIC_DELTA_ADVISORY_EVIDENCE_ONLY");
+    assert.equal(guardDelta.engine.head, head);
   } finally { cleanupDir(root); }
 });
 
@@ -151,6 +171,14 @@ test("runner fails closed on malformed execution and claim evidence", async () =
     const cfg = { root, expectedHead: head, pythonBin, timeoutMs: 2_000 };
     await assert.rejects(() => withFakeMode("wrong-ceiling", () => runRepositoryIntelligenceOperation(cfg, "revision", {})), /claim ceiling mismatch/);
     await assert.rejects(() => withFakeMode("wrong-nested-ceiling", () => runRepositoryIntelligenceOperation(cfg, "readiness", {})), /nested claim ceiling mismatch/);
+    await assert.rejects(
+      () => withFakeMode("missing-ceiling", () => runRepositoryIntelligenceOperation(cfg, "knowledge", {})),
+      /claim ceiling mismatch/,
+    );
+    await assert.rejects(
+      () => withFakeMode("missing-nested-ceiling", () => runRepositoryIntelligenceOperation(cfg, "guard-delta", {})),
+      /nested claim ceiling mismatch/,
+    );
     await assert.rejects(() => withFakeMode("invalid-json", () => runRepositoryIntelligenceOperation(cfg, "revision", {})), /invalid JSON/);
     await assert.rejects(() => withFakeMode("nonzero", () => runRepositoryIntelligenceOperation(cfg, "revision", {})), /canonical failure/);
     await assert.rejects(() => withFakeMode("overflow", () => runRepositoryIntelligenceOperation({ ...cfg, maxStdoutBytes: 128 }, "revision", {})), /stdout exceeded 128 byte limit/);
@@ -263,6 +291,14 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
         }],
         ["repository_intelligence_cfi", "cfi", "CI_EVIDENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
         ["repository_intelligence_eia", "eia", "AUTOMATION_ADVISORY_ONLY", { workspaceId: opened.workspace.id, snapshot }],
+        ["repository_intelligence_knowledge", "knowledge", "REPOSITORY_KNOWLEDGE_APPLICABILITY_EVIDENCE_ONLY", {
+          workspaceId: opened.workspace.id,
+          evidence: { snapshot, knowledge_artifacts: [], changes: [], observed_source_sha256: {}, in_scope: ["src/**"], collection_complete: true, collection_errors: [] },
+        }],
+        ["repository_intelligence_guard_delta", "guard-delta", "GUARD_SEMANTIC_DELTA_ADVISORY_EVIDENCE_ONLY", {
+          workspaceId: opened.workspace.id,
+          evidence: { old_snapshot: snapshot, new_snapshot: snapshot, old_guard: {}, new_guard: {}, known_files: [], behavioral_witnesses: [], collection_complete: true, collection_errors: [] },
+        }],
       ] as const;
       for (const [name, operation, ceiling, args] of cases) {
         const response = await connected.client.callTool({ name, arguments: args as unknown as Record<string, unknown> });
