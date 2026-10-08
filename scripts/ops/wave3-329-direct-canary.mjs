@@ -8,6 +8,7 @@
  * WAVE3_ALLOW_PROVIDER_TURN=ONE_DISPOSABLE_FILE_EFFECT acknowledgement.
  */
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
@@ -56,9 +57,27 @@ function assertOnlyKeys(value, allowed, label) {
   if (extra.length > 0) throw new Error(`${label} contains fields outside the #422 direct contract: ${extra.join(", ")}`);
 }
 
-function assertOuterProjectionGeneration(outerProjectionGeneration, projectionEvidence) {
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, entry]) => [key, canonicalJson(entry)]));
+  }
+  return value;
+}
+
+function schemaSha256(schema) {
+  return createHash("sha256").update(JSON.stringify(canonicalJson(schema))).digest("hex");
+}
+
+function assertOuterProjectionGeneration(outerProjectionGeneration, outerSchemaSha256, projectionEvidence) {
   if (!projectionEvidence.catalogGeneration || outerProjectionGeneration !== projectionEvidence.catalogGeneration) {
     throw new Error("Outer caller projection generation does not match the current live server catalog; stop before provider dispatch.");
+  }
+  if (!projectionEvidence.agentStartSchemaSha256 || outerSchemaSha256 !== projectionEvidence.agentStartSchemaSha256) {
+    throw new Error("Outer caller agent_start schema does not match the live direct schema; stop before provider dispatch.");
   }
 }
 
@@ -129,7 +148,11 @@ function config({ dispatch }) {
   }
   const outerProjectionGeneration = dispatch ? required("WAVE3_OUTER_PROJECTION_GENERATION").toLowerCase() : undefined;
   if (outerProjectionGeneration && !/^[0-9a-f]{64}$/.test(outerProjectionGeneration)) {
-    throw new Error("WAVE3_OUTER_PROJECTION_GENERATION must be the 64-character CURRENT clientProjectionGeneration from the outer caller's #360 check.");
+    throw new Error("WAVE3_OUTER_PROJECTION_GENERATION must hash the actual outer caller's sorted callable DevSpace tool names.");
+  }
+  const outerAgentStartSchemaSha256 = dispatch ? required("WAVE3_OUTER_AGENT_START_SCHEMA_SHA256").toLowerCase() : undefined;
+  if (outerAgentStartSchemaSha256 && !/^[0-9a-f]{64}$/.test(outerAgentStartSchemaSha256)) {
+    throw new Error("WAVE3_OUTER_AGENT_START_SCHEMA_SHA256 must be a 64-character hash of the actual outer caller's agent_start input schema.");
   }
   return {
     endpoint,
@@ -139,6 +162,7 @@ function config({ dispatch }) {
     expectedSourceCommit,
     expectedHead,
     outerProjectionGeneration,
+    outerAgentStartSchemaSha256,
     profile,
     toolchainId,
     attemptKey,
@@ -221,35 +245,17 @@ async function inspectLiveProjection(client) {
   const startTool = byName.get("agent_start");
   if (!startTool) throw new Error("Live tools/list does not expose agent_start.");
   validateDirectAgentStartSchema(startTool);
-  if (!byName.has("capability_convergence_status")) {
-    throw new Error("Live tools/list lacks capability_convergence_status; #360 projection convergence cannot be proven.");
-  }
-  const convergence = await call(client, "capability_convergence_status", {
-    clientProjectionToolNames: names,
-    requestRefresh: false,
-  });
-  const projection = convergence.clientProjectionConvergence;
-  const session = convergence.sessionConvergence;
-  if (projection?.state !== "CURRENT" || projection?.converged !== true
-    || session?.controllerDisposition !== "CURRENT" || session?.converged !== true
-    || session?.activeDrift === true) {
-    throw new Error("#360 live catalog/session projection is not proven CURRENT; reconnect/relist and rerun read-only checks before any canary.");
-  }
-  const catalogGeneration = session.serverGeneration?.catalogGeneration;
-  if (!/^[0-9a-f]{64}$/.test(catalogGeneration ?? "")
-    || projection.clientProjectionGeneration !== catalogGeneration) {
-    throw new Error("#360 current projection generation does not match a valid live server catalog generation.");
-  }
+  // Dispatch mode intentionally hides the control-plane convergence tool.
+  // Its catalog generation is SHA-256(JSON(sorted unique tool names)). The
+  // outer caller must provide its independently captured name generation and
+  // agent_start schema hash before a provider turn can be dispatched.
+  const catalogGeneration = createHash("sha256").update(JSON.stringify(names)).digest("hex");
   return {
     toolNames: names,
     toolCount: names.length,
     catalogGeneration,
-    clientProjectionGeneration: projection.clientProjectionGeneration ?? null,
-    convergence: {
-      state: projection.state,
-      sessionDisposition: session.controllerDisposition,
-      converged: session.converged,
-    },
+    agentStartSchemaSha256: schemaSha256(startTool.inputSchema),
+    outerCallerEvidence: "REQUIRED_BEFORE_DISPATCH",
     agentStartSchema: {
       properties: Object.keys(startTool.inputSchema.properties).sort(),
       required: [...(startTool.inputSchema.required ?? [])].sort(),
@@ -361,7 +367,11 @@ async function runDispatch(client, configValue, opened, preflight, projectionEvi
   if (process.env.WAVE3_ALLOW_PROVIDER_TURN !== "ONE_DISPOSABLE_FILE_EFFECT") {
     throw new Error("Dispatch is disabled without WAVE3_ALLOW_PROVIDER_TURN=ONE_DISPOSABLE_FILE_EFFECT.");
   }
-  assertOuterProjectionGeneration(configValue.outerProjectionGeneration, projectionEvidence);
+  assertOuterProjectionGeneration(
+    configValue.outerProjectionGeneration,
+    configValue.outerAgentStartSchemaSha256,
+    projectionEvidence,
+  );
   const before = localState(configValue.workspaceRoot);
   assertCleanCanary(before, configValue.expectedHead);
   const startArgs = directStartRequest(
@@ -490,7 +500,7 @@ async function main() {
   if (args.mode === "help") {
     process.stdout.write(
       `${SCRIPT} [--plan|--inspect|--dispatch]\n` +
-      "Default --plan is local/static and does not connect. --inspect reads tools/list, projection convergence, open_workspace, and agent_preflight.\n" +
+      "Default --plan is local/static and does not connect. --inspect reads tools/list, open_workspace, and agent_preflight.\n" +
       "--dispatch also requires the outer-caller #360 projection gate, WAVE3_ALLOW_PROVIDER_TURN=ONE_DISPOSABLE_FILE_EFFECT, and exact runtime/workspace bindings.\n",
     );
     return;
@@ -500,11 +510,11 @@ async function main() {
       mode: "plan",
       networkCalls: [],
       providerCalls: [],
-      requiredLiveChecks: ["tools/list agent_start direct schema", "capability_convergence_status CURRENT", "runtime source/build", "profile and verifier toolchain"],
+      requiredLiveChecks: ["tools/list agent_start direct schema", "outer caller name and schema evidence", "runtime source/build", "profile and verifier toolchain"],
       directAgentStartKeys: [...DIRECT_START_KEYS],
       directExecutionContractKeys: [...DIRECT_CONTRACT_KEYS],
       plannedEffect: { path: "effect.txt", contents: EXPECTED_EFFECT, maxFiles: 1 },
-      sequence: ["outer caller proves #360 projection CURRENT", "live tools/list and exact accepted agent_start schema", "capability_convergence_status CURRENT", "open_workspace", "agent_preflight", "agent_start once", "agent_status", "exact same-attempt replay", "reconnect", "agent_status", "agent_reconcile", "post-reconcile agent_status", "physical readback"],
+      sequence: ["outer caller captures actual names and agent_start schema", "live tools/list and exact accepted agent_start schema", "compare catalog generation and schema hash", "open_workspace", "agent_preflight", "agent_start once", "agent_status", "exact same-attempt replay", "reconnect", "agent_status", "agent_reconcile", "post-reconcile agent_status", "physical readback"],
     }, null, 2)}\n`);
     return;
   }

@@ -30,10 +30,9 @@ function startTool(overrides = {}) {
   };
 }
 
-function liveClient({ toolOverrides, convergence } = {}) {
+function liveClient({ toolOverrides } = {}) {
   const tools = [
     startTool(toolOverrides),
-    { name: "capability_convergence_status", inputSchema: { type: "object", properties: {} } },
     { name: "open_workspace", inputSchema: { type: "object", properties: {} } },
     { name: "agent_preflight", inputSchema: { type: "object", properties: {} } },
     { name: "agent_status", inputSchema: { type: "object", properties: {} } },
@@ -42,24 +41,6 @@ function liveClient({ toolOverrides, convergence } = {}) {
   return {
     tools,
     async listTools() { return { tools }; },
-    async callTool({ name }) {
-      assert.equal(name, "capability_convergence_status");
-      return {
-        structuredContent: convergence ?? {
-          clientProjectionConvergence: {
-            state: "CURRENT",
-            converged: true,
-            clientProjectionGeneration: "a".repeat(64),
-          },
-          sessionConvergence: {
-            controllerDisposition: "CURRENT",
-            converged: true,
-            activeDrift: false,
-            serverGeneration: { catalogGeneration: "a".repeat(64) },
-          },
-        },
-      };
-    },
   };
 }
 
@@ -95,31 +76,28 @@ test("direct request has no legacy fields and carries the exact bounded write sc
   });
 });
 
-test("live projection gate requires a current server session and rejects stale schemas/projections", async () => {
+test("direct catalog inspection works without the hidden control-plane tool and rejects stale schemas", async () => {
   const evidence = await inspectLiveProjection(liveClient());
-  assert.equal(evidence.convergence.state, "CURRENT");
+  assert.equal(evidence.outerCallerEvidence, "REQUIRED_BEFORE_DISPATCH");
+  assert.match(evidence.catalogGeneration, /^[0-9a-f]{64}$/);
+  assert.match(evidence.agentStartSchemaSha256, /^[0-9a-f]{64}$/);
   assert.equal(evidence.agentStartSchema.executionContractProperties.length, 9);
 
-  let statusCalls = 0;
   const staleSchema = liveClient({ toolOverrides: { executionContract: {
     type: "object", properties: { ...directContractProperties, dispatchIntent: {} },
   } } });
-  staleSchema.callTool = async () => { statusCalls += 1; return {}; };
   await assert.rejects(() => inspectLiveProjection(staleSchema), /schema keys differ/);
-  assert.equal(statusCalls, 0, "schema mismatch must stop before a convergence or dispatch call");
-
-  await assert.rejects(() => inspectLiveProjection(liveClient({ convergence: {
-    clientProjectionConvergence: { state: "SERVER_AHEAD_OF_CLIENT", converged: false },
-    sessionConvergence: { controllerDisposition: "STALE_RECONNECT_REQUIRED", converged: false, activeDrift: true },
-  } })), /not proven CURRENT/);
 });
 
-test("outer caller generation must match the current live catalog before dispatch", () => {
-  const catalogGeneration = "a".repeat(64);
-  assert.doesNotThrow(() => assertOuterProjectionGeneration(catalogGeneration, { catalogGeneration }));
-  assert.throws(() => assertOuterProjectionGeneration(undefined, { catalogGeneration }), /does not match/);
-  assert.throws(() => assertOuterProjectionGeneration("b".repeat(64), { catalogGeneration }), /does not match/);
-  assert.throws(() => assertOuterProjectionGeneration(catalogGeneration, {}), /does not match/);
+test("outer caller must match both live tool names and agent_start schema before dispatch", async () => {
+  const evidence = await inspectLiveProjection(liveClient());
+  const generation = evidence.catalogGeneration;
+  const schemaHash = evidence.agentStartSchemaSha256;
+  assert.doesNotThrow(() => assertOuterProjectionGeneration(generation, schemaHash, evidence));
+  assert.throws(() => assertOuterProjectionGeneration(undefined, schemaHash, evidence), /projection generation does not match/);
+  assert.throws(() => assertOuterProjectionGeneration("b".repeat(64), schemaHash, evidence), /projection generation does not match/);
+  assert.throws(() => assertOuterProjectionGeneration(generation, "b".repeat(64), evidence), /agent_start schema does not match/);
+  assert.throws(() => assertOuterProjectionGeneration(generation, undefined, evidence), /agent_start schema does not match/);
 });
 
 test("preflight and workspace checks fail closed on local blockers while preserving provider UNKNOWN", () => {
