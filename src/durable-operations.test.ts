@@ -341,7 +341,7 @@ async function dependencyFixtureManager(config: ReturnType<typeof loadConfig>, r
     verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(grant),
     resolveEffectBinding:(c,subject)=>c===context && subject.requestHash===requestHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash,role:"worker"}:undefined,
   };
-  const manager=new DurableOperationManager(config,runner,undefined,undefined,options);
+  const manager=new DurableOperationManager(config,runner,options);
   ownership=manager.store.createOwnershipStore(options);
   ownership.putGrantEvidence(context,grant,0);
   leaseId=ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"workspace",resourceId:root,resource:root,scope:[root],operation:"dependency_sync",baseRevision:base,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"fixture",grant}).leaseId;
@@ -428,7 +428,6 @@ test("dependency_sync OWNER_DIRECT isolated mode does not require carrier author
         workspaceId: "ws_isolated",
         workspaceRoot: project,
         recipe: "npm_ci",
-        authorityMode: "OWNER_DIRECT",
         ownerDirectIsolated: true,
       });
       assert.equal(result.status, "succeeded");
@@ -467,7 +466,6 @@ test("dependency_sync OWNER_DIRECT isolated reconciliation requires its exact te
         workspaceId: "ws_isolated",
         workspaceRoot: project,
         recipe: "npm_ci",
-        authorityMode: "OWNER_DIRECT",
         ownerDirectIsolated: true,
       });
       assert.equal(result.status, "outcome_unknown");
@@ -558,7 +556,6 @@ test("restart fences a nonterminal mutating operation as outcome_unknown and req
       attemptKey: "interrupted-1",
       requestHash: "hash-1",
       kind: "workspace_clone",
-      authorityMode: "OWNER_DIRECT",
       scopeRoot: f.root,
       request: { destination, remote: join(f.root, "missing-source") },
     }).record;
@@ -581,28 +578,6 @@ test("restart fences a nonterminal mutating operation as outcome_unknown and req
       assert.equal(runnerCalls, 0, "reconciliation must inspect physical state without re-executing mutation");
     } finally {
       restarted.close();
-    }
-  } finally {
-    await f.cleanup();
-  }
-});
-
-test("NEXUS_GOVERNED mutating operations fail closed before G9 validation wiring", async () => {
-  const f = await fixture();
-  try {
-    const manager = new DurableOperationManager(f.config, async () => ({ exitCode: 0, stdout: "", stderr: "" }));
-    try {
-      await assert.rejects(
-        manager.workspaceClone({
-          attemptKey: "nexus-not-wired-1",
-          remote: join(f.root, "source"),
-          destination: join(f.root, "destination"),
-          authorityMode: "NEXUS_GOVERNED",
-        }),
-        /G9 must provide validated Nexus authority evidence/,
-      );
-    } finally {
-      manager.close();
     }
   } finally {
     await f.cleanup();

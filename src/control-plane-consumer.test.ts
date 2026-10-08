@@ -30,7 +30,7 @@ function fixture(run: ConstructorParameters<typeof DurableOperationManager>[1]) 
     verifyGrantEvidence: g => permitted && JSON.stringify(g) === JSON.stringify(grant),
     resolveEffectBinding: (c,s) => c === context && permitted && s.workspaceRoot === root && s.baseRevision === base && s.operation === "dependency_sync" && s.requestHash === approvedHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:s.requestHash,role:"worker"} : undefined,
   };
-  const manager = new DurableOperationManager(config,run,undefined,undefined,options);
+  const manager = new DurableOperationManager(config,run,options);
   ownership = manager.store.createOwnershipStore(options);
   ownership.putGrantEvidence(context,grant,0);
   leaseId = ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"workspace",resourceId:root,resource:root,operation:"dependency_sync",scope:[root],baseRevision:base,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"fixture",grant}).leaseId;
@@ -67,7 +67,7 @@ test("C3 lost effect response preserves pin and restart or new attempt cannot re
   try {
     assert.equal((await f.manager.dependencySync(f.input,f.context)).status,"outcome_unknown");
     assert.ok(f.lease().operationHandle);
-    const reopened = new DurableOperationManager(f.config,async()=>{launches++; return {exitCode:0,stdout:"",stderr:""};},undefined,undefined,f.options);
+    const reopened = new DurableOperationManager(f.config,async()=>{launches++; return {exitCode:0,stdout:"",stderr:""};},f.options);
     try {
       await assert.rejects(reopened.dependencySync(f.input,f.context), /uncertain physical effects/);
       await assert.rejects(reopened.dependencySync({...f.input,attemptKey:"new-attempt"},f.context));
@@ -101,7 +101,7 @@ test("C3 independent processes share one pin and a competing attempt cannot laun
       process.stdout.write("EFFECT_STARTED\\n");
       await new Promise(resolve=>process.stdin.once("data",resolve));
       return {exitCode:0,stdout:"canary",stderr:""};
-    },undefined,undefined,options);
+    },options);
     ownership=manager.store.createOwnershipStore(options);
     try {const r=await manager.dependencySync({...f.input,attemptKey:process.env.C3_ATTEMPT},context); process.stdout.write(r.status);}
     catch(e){process.stdout.write("DENIED:"+e.code);}
@@ -154,7 +154,7 @@ test("C3 externally verified terminal proof reconciles durable record and pin to
     f.options.verifyDependencyReconciliation=e=>JSON.stringify(e)===JSON.stringify(proof);
     f.options.verifyReconciliationEvidence=e=>e.operationHandle===proof.operationHandle && e.detail===JSON.stringify({requestHash:proof.requestHash,exitCode:proof.exitCode,frozenInputsUnchanged:proof.frozenInputsUnchanged});
     // The host policy is fixed at construction; reopen against the same durable database.
-    const reopened=new DurableOperationManager(f.config,undefined,undefined,undefined,f.options);
+    const reopened=new DurableOperationManager(f.config,undefined,f.options);
     try {
       const result=reopened.reconcileDependencySync(unknown.operationId,proof,f.context);
       assert.equal(result.status,"succeeded");
@@ -223,7 +223,7 @@ test("C3 reconciliation callbacks cannot change verified outcome, record, or bin
         return accepted;
       };
       f.options.verifyReconciliationEvidence=e=>e.operationHandle===unknown.operationId && JSON.parse(e.detail!).exitCode===0;
-      const reopened=new DurableOperationManager(f.config,undefined,undefined,undefined,f.options);
+      const reopened=new DurableOperationManager(f.config,undefined,f.options);
       callbackStore=reopened.store;
       try {
         if(attack==="original-proof") {
@@ -263,7 +263,7 @@ test("C3 late predecessor result cannot overwrite terminal reconciliation follow
         verifyDependencyReconciliation:e=>JSON.stringify(e)===JSON.stringify(proof),
         verifyReconciliationEvidence:e=>e.ownerThread===prior.ownerThread && e.operationHandle===proof.operationHandle && e.detail===JSON.stringify({requestHash:proof.requestHash,exitCode:0,frozenInputsUnchanged:true}),
       };
-      successor=new DurableOperationManager(f.config,undefined,undefined,undefined,recoveryOptions);
+      successor=new DurableOperationManager(f.config,undefined,recoveryOptions);
       const terminal=successor.reconcileDependencySync(proof.operationHandle,proof,f.context);
       assert.equal(terminal.status,"succeeded");
       const reconciled=f.lease();
@@ -293,7 +293,7 @@ function cutoverFixture() {
   const request={version:"devspace.execution.v1",baseRevision:input.currentIdentity.sourceCommit,stateRoot:config.stateDir,currentIdentity:input.currentIdentity,expectedIdentity:input.expectedIdentity};
   const hash=createHash("sha256").update(JSON.stringify(sort(request))).digest("hex");
   const options:ControlPlaneConsumerOptions={resolveOwnerContext:c=>c===context?{ownerThread:"controller"}:undefined,verifyGrantEvidence:g=>permitted&&JSON.stringify(g)===JSON.stringify(grant),resolveEffectBinding:(c,s)=>c===context&&permitted&&s.requestHash===hash&&s.operation==="cutover_start"?{leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:hash,role:"controller"}:undefined};
-  const manager=new DurableOperationManager(config,undefined,undefined,undefined,options);ownership=manager.store.createOwnershipStore(options);ownership.putGrantEvidence(context,grant,0);
+  const manager=new DurableOperationManager(config,undefined,options);ownership=manager.store.createOwnershipStore(options);ownership.putGrantEvidence(context,grant,0);
   leaseId=ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"filesystem",resourceId:config.stateDir,resource:config.stateDir,operation:"cutover_start",scope:[config.stateDir],baseRevision:input.currentIdentity.sourceCommit,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"cutover",grant}).leaseId;
   return {manager,config,context,input,options,ownership,leaseId,revoke:()=>{permitted=false;}};
 }
@@ -345,7 +345,7 @@ test("C3 cutover start correlates real state, retains pin, replays once and deni
     assert.equal(record.coordinationBinding?.operationHandle,result.operationId);
     assert.equal(f.ownership.get(f.leaseId)?.operationHandle,result.operationId);
     assert.deepEqual(f.manager.startCutover(f.input,f.context),result);
-    const reopened=new DurableOperationManager(f.config,undefined,undefined,undefined,f.options);
+    const reopened=new DurableOperationManager(f.config,undefined,f.options);
     try {assert.equal(reopened.reconcileCutoverStart(result.operationId,f.context).receipt?.cutoverId,record.cutoverId);} finally {reopened.close();}
     const before=JSON.stringify(f.manager.store.getByOperationId(result.operationId));f.revoke();
     assert.throws(()=>f.manager.reconcileCutoverStart(result.operationId,f.context),/authority|binding/);
@@ -362,7 +362,7 @@ test("C3 cutover crash windows never retry and only exact bound file can reconci
       const result=f.manager.startCutover(f.input,f.context);
       assert.equal(result.status,"outcome_unknown");assert.equal(calls,1);
       CutoverStateStore.prototype.begin=original;
-      const reopened=new DurableOperationManager(f.config,undefined,undefined,undefined,f.options);
+      const reopened=new DurableOperationManager(f.config,undefined,f.options);
       try {
         assert.equal(reopened.store.getByOperationId(result.operationId)?.status,"outcome_unknown");
         if (afterWrite) assert.equal(reopened.startCutover(f.input,f.context).status,"succeeded");
@@ -400,7 +400,7 @@ test("C3 separate cutover processes share intent and pin before the real file wr
     import {existsSync,writeFileSync} from 'node:fs';
     const payload=JSON.parse(process.env.CUTOVER_FIXTURE);const context={};let ownership;
     const options={resolveOwnerContext:c=>c===context?{ownerThread:'controller'}:undefined,verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(payload.grant),resolveEffectBinding:(c,s)=>c===context&&s.requestHash===payload.hash?{leaseId:payload.leaseId,leaseVersion:ownership.get(payload.leaseId).version,requestHash:s.requestHash,role:'controller'}:undefined};
-    const manager=new DurableOperationManager(payload.config,undefined,undefined,undefined,options);ownership=manager.store.createOwnershipStore(options);
+    const manager=new DurableOperationManager(payload.config,undefined,options);ownership=manager.store.createOwnershipStore(options);
     if(!payload.pause){writeFileSync(payload.ready,'ready');const deadline=Date.now()+15000;while(!existsSync(payload.go)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);}
     if(payload.pause){const original=CutoverStateStore.prototype.begin;CutoverStateStore.prototype.begin=function(input){writeFileSync(payload.marker,'pinned');const deadline=Date.now()+15000;while(!existsSync(payload.release)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);if(!existsSync(payload.release))throw new Error('fixture timeout');return original.call(this,input);};}
     try{process.stdout.write(JSON.stringify({result:manager.startCutover(payload.input,context)}));}catch(e){process.stdout.write(JSON.stringify({error:e.code||e.message}));}finally{manager.close();}

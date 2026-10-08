@@ -3862,15 +3862,12 @@ export function createMcpServer(
       createdAt: z.string(),
       updatedAt: z.string(),
     };
-    const operationResponse = (operation: DurableOperationRecord) => {
-      const { authorityMode: _internalAuthorityMode, ...publicOperation } = operation;
-      return {
-        content: [textBlock(
-          `${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`,
-        )],
-        structuredContent: publicOperation as unknown as Record<string, unknown>,
-      };
-    };
+    const operationResponse = (operation: DurableOperationRecord) => ({
+      content: [textBlock(
+        `${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`,
+      )],
+      structuredContent: operation as unknown as Record<string, unknown>,
+    });
 
     if (hostOperations) {
       const hostInput = {
@@ -3933,7 +3930,6 @@ export function createMcpServer(
             remote,
             destination,
             ref,
-            authorityMode: "OWNER_DIRECT",
           });
           return operationResponse(operation);
         } catch (error) {
@@ -3988,7 +3984,6 @@ export function createMcpServer(
             workspaceRoot: workspace.root,
             attemptKey,
             recipe,
-            authorityMode: "OWNER_DIRECT",
             ownerDirectIsolated,
           }, consumerContext);
           return operationResponse(operation);
@@ -4011,7 +4006,7 @@ export function createMcpServer(
       {
         title: "Durable operation status",
         description:
-          "Read one exact durable workspace, dependency, fixed Nexus Gateway recovery, or durable effect-free Gateway preflight operation without starting, retrying, or replacing it.",
+          "Read one exact durable operation without starting, retrying, or replacing it.",
         inputSchema: { operationId: z.string().min(1) },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -4030,7 +4025,7 @@ export function createMcpServer(
       {
         title: "Reconcile durable operation",
         description:
-          "Reconcile one exact durable operation after timeout or restart uncertainty. A durable Gateway preflight may re-run only the same stored read-only request. A Nexus Gateway recovery re-enters only the same fixed manager seam with the same persisted request and idempotency fence so the Nexus #526 ledger can reconcile physical truth; callers cannot replace the request or select another process target.",
+          "Reconcile one exact durable operation after timeout or restart uncertainty using its persisted request and idempotency fence; callers cannot replace the request.",
         inputSchema: { operationId: z.string().min(1) },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -6852,7 +6847,7 @@ export function createServer(
   initializationCleanups.push(() => processSessions.shutdown());
   const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir, options.carrierClock, options.completionBindings);
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
-  const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination ?? carrierBindings?.readers);
+  const durableOperations = new DurableOperationManager(config, undefined, options.coordination ?? carrierBindings?.readers);
   initializationCleanups.push(() => durableOperations.close());
   // P0 WorkResumeStore — uses its own SQLite connection (same devspace.sqlite,
   // WAL mode allows concurrent readers + one writer).
@@ -6906,7 +6901,7 @@ export function createServer(
   const latestMcpToolCatalogGeneration = { value: "unresolved" };
   const latestMcpToolCatalogNames = { value: [] as string[] };
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource, undefined, workResumeStore)
+    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, clineCatalogService, opencodeCatalogSource)
     : undefined;
   initializationCleanups.push(() => agentSessionManager?.close());
   const capabilityManifest = deriveLoadedCapabilityManifest(

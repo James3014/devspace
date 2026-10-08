@@ -1219,7 +1219,6 @@ test("HerdR request-only execution never reports proven scope or unknown overall
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
   );
   const store = (manager as any).store as LocalAgentStore;
@@ -1821,7 +1820,6 @@ test("LocalAgentSessionManager - HERDR public lifecycle routes start, continue, 
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
   );
   const attemptKey = "issue242-public-herdr-1";
@@ -1970,9 +1968,7 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
-    undefined,
     async ({ toolchainId, verifier, cwd, denyWriteRoots }) => {
       verifierCalls.push({ toolchainId, verifier });
       assert.deepEqual(denyWriteRoots, [workspaceRoot, stateDir]);
@@ -2358,7 +2354,6 @@ test("LocalAgentSessionManager - HERDR confirmed onboarding block settles termin
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
   );
   const attemptKey = "issue242-herdr-onboarding";
@@ -2450,7 +2445,6 @@ test("LocalAgentSessionManager - HERDR typed provider capacity failure stays dur
     undefined,
     undefined,
     undefined,
-    undefined,
     gateway,
   );
   const attemptKey = "issue242-herdr-provider-capacity";
@@ -2522,7 +2516,6 @@ test("LocalAgentSessionManager - HERDR daemon unavailable fails closed before re
     config,
     async () => { legacyLaunches++; },
     async () => true,
-    undefined,
     undefined,
     undefined,
     undefined,
@@ -2899,7 +2892,6 @@ test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", 
       config,
       async () => {},
       async () => true,
-      undefined,
       undefined,
       undefined,
       undefined,
@@ -3383,7 +3375,6 @@ test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", 
         undefined,
         undefined,
         undefined,
-        undefined,
         restartGateway,
       );
       try {
@@ -3427,7 +3418,6 @@ test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", 
         restartConfig,
         async () => {},
         async () => true,
-        undefined,
         undefined,
         undefined,
         undefined,

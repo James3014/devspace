@@ -46,7 +46,6 @@ import {
   runToolchainVerifier,
   type ToolchainVerificationResult,
 } from "./local-agent-toolchains.js";
-import type { WorkResumeStore } from "./work-resume.js";
 import { inspectCodexRuntime, type CodexRuntimeIdentity } from "./codex-runtime.js";
 import {
   cleanupProviderScratch,
@@ -70,21 +69,16 @@ import { ClineCatalogService as ClineCatalogServiceImpl } from "./local-agent-cl
 import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
 import { canonicalizePath, isPathInsideRoot, isSameWorktreePath } from "./roots.js";
 import {
-  assertNexusGrantAuthorizesExecution,
   assertSameExecutionGeneration,
   buildExecutionGenerationBinding,
   buildHostGenerationBinding,
   hashDispatchIntent,
   renderDispatchIntentForWorker,
   validateDispatchIntent,
-  validateResolvedNexusExecutionGrant,
-  type AuthorityValidationEvidence,
   type DispatchIntent,
   type ExecutionAuthReadiness,
   type ExecutionGenerationBinding,
   type HostGenerationBinding,
-  type NexusExecutionGrant,
-  type NexusExecutionGrantRef,
   ExecutionProtocolError,
 } from "./execution-protocol.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
@@ -531,8 +525,6 @@ export type AgentTurnRunner = (
   callbacks?: LocalAgentRunCallbacks,
 ) => Promise<LocalAgentRunResult>;
 
-export type NexusGrantResolver = (ref: NexusExecutionGrantRef) => Promise<NexusExecutionGrant>;
-
 // ─── Owned temp cleanup ──────────────────────────────────────────────────────
 
 /**
@@ -573,7 +565,6 @@ export class LocalAgentSessionManager {
   private readonly turnRunner?: AgentTurnRunner;
   private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
   private capabilityManifestSha256?: string;
-  private readonly nexusGrantResolver: NexusGrantResolver;
   private readonly clineCatalogService?: ClineCatalogService;
   private readonly opencodeCatalogSource: ReturnType<typeof createMcpOpencodeCatalogSource>;
   private readonly ownsOpencodeCatalogSource: boolean;
@@ -584,7 +575,6 @@ export class LocalAgentSessionManager {
   private readonly herdrVerifiedLive = new Set<string>();
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
-  private workResumeStore?: WorkResumeStore;
   private readonly toolchainVerifier: typeof runToolchainVerifier;
 
   constructor(
@@ -593,23 +583,19 @@ export class LocalAgentSessionManager {
     testTerminator?: WorkerTerminator,
     testTurnRunner?: AgentTurnRunner,
     runtimeBuildIdentity?: RuntimeBuildIdentity,
-    nexusGrantResolver?: NexusGrantResolver,
     clineCatalogService?: ClineCatalogService,
     opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
     herdrGateway?: HerdrThinGateway,
-    workResumeStore?: WorkResumeStore,
     testToolchainVerifier?: typeof runToolchainVerifier,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
-    this.nexusGrantResolver = nexusGrantResolver ?? resolveCanonicalNexusExecutionGrant;
     this.clineCatalogService = clineCatalogService ?? new ClineCatalogServiceImpl();
     this.opencodeCatalogSource = opencodeCatalogSource ?? createMcpOpencodeCatalogSource();
     this.ownsOpencodeCatalogSource = opencodeCatalogSource === undefined;
     this.herdrGateway = herdrGateway ?? new HerdrThinGateway(HERDR_DEFAULT_SOCKET_PATH, defaultHerdrGatewayRegistry, this.store);
-    this.workResumeStore = workResumeStore;
     this.toolchainVerifier = testToolchainVerifier ?? runToolchainVerifier;
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
@@ -618,10 +604,6 @@ export class LocalAgentSessionManager {
       stateRoot: config.stateDir,
       profileCatalogGeneration: "unresolved",
     });
-  }
-
-  setWorkResumeStore(workResumeStore: WorkResumeStore): void {
-    this.workResumeStore = workResumeStore;
   }
 
   bindCapabilityManifestSha256(manifestSha256: string): void {
@@ -1230,7 +1212,6 @@ export class LocalAgentSessionManager {
         effectKey,
         result: blocked,
       });
-      if (recorded.applied) this.persistHerdrVerifierResult(record, blocked);
       return recorded.current?.lifecycleState?.automatedVerifierEffects?.[effectKey] ?? blocked;
     }
 
@@ -1260,7 +1241,6 @@ export class LocalAgentSessionManager {
           `HerdR verifier effect ${effectKey} lacks its pre-execution obligation and could not be durably marked unknown.`,
         );
       }
-      this.persistHerdrVerifierResult(record, unknown);
       return unknown;
     }
 
@@ -1292,7 +1272,6 @@ export class LocalAgentSessionManager {
       return this.reconcileOrSettleHerdrVerifier(record.id, generation, durable);
     }
 
-    this.persistHerdrVerifierResult(record, pending);
     const task = (async (): Promise<Record<string, unknown>> => {
       let result: Record<string, unknown>;
       try {
@@ -1362,7 +1341,6 @@ export class LocalAgentSessionManager {
           `HerdR verifier ${effectKey} ran but its terminal outcome could not be durably recorded.`,
         );
       }
-      this.persistHerdrVerifierResult(record, result);
       return result;
     })();
     this.herdrVerifierTasks.set(taskKey, task);
@@ -1437,7 +1415,6 @@ export class LocalAgentSessionManager {
         result: result as Record<string, unknown>,
       });
       if (completed.applied) {
-        if (completed.current) this.persistHerdrVerifierResult(completed.current, result as Record<string, unknown>);
         return result as Record<string, unknown>;
       }
     }
@@ -1466,7 +1443,6 @@ export class LocalAgentSessionManager {
       result: unknown,
     });
     if (settled.applied) {
-      if (settled.current) this.persistHerdrVerifierResult(settled.current, unknown);
       return unknown;
     }
     const durable = this.store.getById(agentId)?.lifecycleState?.automatedVerifierResult;
@@ -1475,17 +1451,6 @@ export class LocalAgentSessionManager {
       "AGENT_LIFECYCLE_CORRUPT",
       `HerdR verifier ${String(identity.effectKey)} is unresolved and could not be recorded as unknown.`,
     );
-  }
-
-  private persistHerdrVerifierResult(record: LocalAgentRecord, result: Record<string, unknown>): void {
-    const workKey = record.executionContract?.resumableWork?.workKey;
-    if (!workKey || !this.workResumeStore) return;
-    try {
-      this.workResumeStore.recordAutomatedVerifierResult(workKey, result);
-    } catch {
-      // The lifecycle CAS is canonical for this external runtime. Preserve the
-      // work-resume projection's existing best-effort behavior.
-    }
   }
 
   private async runHerdrTurn(agentId: string, prompt: string): Promise<void> {
@@ -1840,7 +1805,6 @@ export class LocalAgentSessionManager {
       );
     }
 
-    await this.assertExecutionAuthority(profileName, executionContract);
     this.assertDispatchOwnershipAvailable(workspaceRoot, executionContract);
 
     let startCapacity = this.executionCapacitySnapshot(workspaceRoot);
@@ -1990,37 +1954,6 @@ export class LocalAgentSessionManager {
     }
     const herdrHandle = this.getHerdrExternalHandle(record.id);
     return recordToStartOutput(this.store.getById(record.id) ?? record, herdrHandle);
-  }
-
-  private async assertExecutionAuthority(profileName: string, contract: ExecutionContract | undefined): Promise<AuthorityValidationEvidence> {
-    const mode = contract?.authorityMode ?? "OWNER_DIRECT";
-    if (mode === "OWNER_DIRECT") {
-      if (contract?.nexusGrant) {
-        throw new AgentSessionError("NEXUS_AUTHORITY_REJECTED", "OWNER_DIRECT execution must not carry Nexus grant authority.");
-      }
-      return { kind: "OWNER_DIRECT" };
-    }
-    if (!contract?.nexusGrant || !contract.dispatchIntent || !contract.expectedHead) {
-      throw new AgentSessionError(
-        "NEXUS_AUTHORITY_REJECTED",
-        "NEXUS_GOVERNED execution requires canonical Nexus grant, dispatchIntent, and expectedHead before worker launch.",
-      );
-    }
-    try {
-      const grant = await this.nexusGrantResolver(contract.nexusGrant);
-      return assertNexusGrantAuthorizesExecution({
-        grant,
-        dispatchIntent: contract.dispatchIntent,
-        expectedHead: contract.expectedHead,
-        profile: profileName,
-        writePaths: contract.writePaths ?? [],
-        authorizedToolCeiling: contract.authorizedToolCeiling,
-        toolProjectionManifest: contract.toolProjectionManifest,
-      });
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      throw new AgentSessionError("NEXUS_AUTHORITY_REJECTED", `NEXUS_GOVERNED authority rejected before worker launch: ${detail}`);
-    }
   }
 
   /**
@@ -2214,7 +2147,7 @@ export class LocalAgentSessionManager {
     }
 
     const contract = record.executionContract;
-    await this.assertExecutionAuthority(record.profileName, contract);
+    assertDispatchContractCoherence(contract);
     const lineageBaseline = record.lifecycleState?.turnEndBaseline ?? record.scopeBaseline;
 
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
@@ -3793,14 +3726,6 @@ export class LocalAgentSessionManager {
         }
       }
 
-      if (contract?.resumableWork?.workKey && this.workResumeStore && automatedVerifierResult) {
-        try {
-          this.workResumeStore.recordAutomatedVerifierResult(contract.resumableWork.workKey, automatedVerifierResult);
-        } catch {
-          // ignore
-        }
-      }
-
       const modelAttestation = computeModelAttestation({
         requestedModel,
         resolvedModel,
@@ -3911,14 +3836,6 @@ export class LocalAgentSessionManager {
               error: err instanceof Error ? err.message : String(err),
             };
           }
-        }
-      }
-
-      if (contract?.resumableWork?.workKey && this.workResumeStore && automatedVerifierResult) {
-        try {
-          this.workResumeStore.recordAutomatedVerifierResult(contract.resumableWork.workKey, automatedVerifierResult);
-        } catch {
-          // ignore
         }
       }
 
@@ -4459,6 +4376,12 @@ function providerEnvironment(
 }
 
 function assertDispatchContractCoherence(contract: ExecutionContract | undefined): void {
+  if (contract?.legacyRejected) {
+    throw new AgentSessionError(
+      "INVALID_EXECUTION_CONTRACT",
+      "Persisted execution contract uses retired governance fields or invalid legacy state; execution is blocked until a fresh direct contract is created.",
+    );
+  }
   const intent = contract?.dispatchIntent;
   if (!intent) return;
   try {
@@ -4495,61 +4418,6 @@ function dispatchContractOutput(intent: DispatchIntent | undefined): DispatchCon
     exclusiveOwnership: intent.exclusiveOwnership,
     intentHash: hashDispatchIntent(intent),
   };
-}
-
-const NEXUS_CANONICAL_REMOTE = "https://github.com/James3014/Nexus-new.git";
-const NEXUS_RAW_HOST = "raw.githubusercontent.com";
-const NEXUS_AUTHORITY_FETCH_TIMEOUT_MS = 10_000;
-const NEXUS_AUTHORITY_MAX_BYTES = 256 * 1024;
-
-async function resolveCanonicalNexusExecutionGrant(ref: NexusExecutionGrantRef): Promise<NexusExecutionGrant> {
-  const observedMain = observeCanonicalNexusMain();
-  const [grantRaw, authorityRaw] = await Promise.all([
-    fetchCanonicalNexusText(ref.revision, ref.grantPath),
-    fetchCanonicalNexusText(ref.revision, ref.authorityPath),
-  ]);
-  return validateResolvedNexusExecutionGrant(ref, grantRaw, authorityRaw, observedMain);
-}
-
-function observeCanonicalNexusMain(): string {
-  const probe = spawnSync("git", ["ls-remote", NEXUS_CANONICAL_REMOTE, "refs/heads/main"], {
-    encoding: "utf8",
-    timeout: NEXUS_AUTHORITY_FETCH_TIMEOUT_MS,
-    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    maxBuffer: 64 * 1024,
-  });
-  if (probe.error || probe.status !== 0) {
-    throw new ExecutionProtocolError(
-      "NEXUS_AUTHORITY_NOT_VALIDATED",
-      `Unable to resolve canonical Nexus main: ${probe.error?.message ?? String(probe.stderr || `git exited ${probe.status}`)}`,
-    );
-  }
-  const match = /^([0-9a-f]{40})\s+refs\/heads\/main\s*$/m.exec(String(probe.stdout || ""));
-  if (!match) {
-    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", "Canonical Nexus main probe returned malformed identity.");
-  }
-  return match[1];
-}
-
-async function fetchCanonicalNexusText(revision: string, path: string): Promise<string> {
-  const encodedPath = path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
-  const url = new URL(`https://${NEXUS_RAW_HOST}/James3014/Nexus-new/${revision}/${encodedPath}`);
-  const response = await fetch(url, {
-    redirect: "error",
-    signal: AbortSignal.timeout(NEXUS_AUTHORITY_FETCH_TIMEOUT_MS),
-    headers: { Accept: "text/plain" },
-  });
-  if (!response.ok || new URL(response.url).hostname !== NEXUS_RAW_HOST) {
-    throw new ExecutionProtocolError(
-      "NEXUS_AUTHORITY_NOT_VALIDATED",
-      `Canonical Nexus authority fetch failed closed for ${path} (HTTP ${response.status}).`,
-    );
-  }
-  const raw = await response.text();
-  if (Buffer.byteLength(raw, "utf8") > NEXUS_AUTHORITY_MAX_BYTES) {
-    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", `Canonical Nexus authority artifact ${path} exceeds the bounded size limit.`);
-  }
-  return raw;
 }
 
 function writeScopesOverlap(left: string[], right: string[]): boolean {
@@ -4832,7 +4700,18 @@ function recordToStatusOutput(
 
   // P2-A: Model attestation
   if (record.lifecycleState?.modelAttestation) {
-    output.modelAttestation = record.lifecycleState.modelAttestation;
+    const attestation = record.lifecycleState.modelAttestation;
+    // Older Agy adapters treated JSON keys as provider identity even though
+    // their provenance was never established. Keep the stored record intact
+    // for audit, but never expose that legacy claim as physical attestation.
+    output.modelAttestation = attestation.attestationSource === "agy_json_output"
+      ? {
+          ...attestation,
+          observedModel: null,
+          attestationSource: "metadata_only",
+          attestationState: "ATTESTATION_UNAVAILABLE",
+        }
+      : attestation;
   } else if (record.model || record.executionContract?.directSelection?.model) {
     const requested = record.executionContract?.directSelection?.model;
     const resolved = record.model;
