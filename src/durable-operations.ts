@@ -347,10 +347,7 @@ export class DurableOperationManager {
   constructor(
     private readonly config: ServerConfig,
     private readonly runCommand: CommandRunner = spawnCommand,
-    _runNexusGatewayRecovery?: unknown,
-    _runNexusGatewayRecoveryPreflight?: unknown,
     coordination?: ControlPlaneConsumerOptions,
-    _runNexusGatewayRecoveryMaterialize?: unknown,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
