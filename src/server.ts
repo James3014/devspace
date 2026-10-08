@@ -3862,15 +3862,12 @@ export function createMcpServer(
       createdAt: z.string(),
       updatedAt: z.string(),
     };
-    const operationResponse = (operation: DurableOperationRecord) => {
-      const { authorityMode: _internalAuthorityMode, ...publicOperation } = operation;
-      return {
-        content: [textBlock(
-          `${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`,
-        )],
-        structuredContent: publicOperation as unknown as Record<string, unknown>,
-      };
-    };
+    const operationResponse = (operation: DurableOperationRecord) => ({
+      content: [textBlock(
+        `${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`,
+      )],
+      structuredContent: operation as unknown as Record<string, unknown>,
+    });
 
     if (hostOperations) {
       const hostInput = {
@@ -3933,7 +3930,6 @@ export function createMcpServer(
             remote,
             destination,
             ref,
-            authorityMode: "OWNER_DIRECT",
           });
           return operationResponse(operation);
         } catch (error) {
@@ -3988,7 +3984,6 @@ export function createMcpServer(
             workspaceRoot: workspace.root,
             attemptKey,
             recipe,
-            authorityMode: "OWNER_DIRECT",
             ownerDirectIsolated,
           }, consumerContext);
           return operationResponse(operation);
@@ -6905,7 +6900,7 @@ export function createServer(
   const latestMcpToolCatalogGeneration = { value: "unresolved" };
   const latestMcpToolCatalogNames = { value: [] as string[] };
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource, undefined, workResumeStore)
+    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, clineCatalogService, opencodeCatalogSource)
     : undefined;
   initializationCleanups.push(() => agentSessionManager?.close());
   const capabilityManifest = deriveLoadedCapabilityManifest(
