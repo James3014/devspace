@@ -24,11 +24,6 @@ const DEFAULT_ROWS = 24;
 
 export type ProcessEnvironmentPolicy = "inherit" | "sanitized";
 
-export interface CoreMutationProcessBinding {
-  sessionId: string;
-  bindingHash: string;
-}
-
 export interface StartCommandInput {
   workspaceId: string;
   command: string;
@@ -63,8 +58,6 @@ export interface StartCommandInput {
    * terminated when this duration is exceeded.
    */
   timeoutSeconds?: number;
-  /** Exact Core mutation provenance captured before process spawn. */
-  coreMutation?: CoreMutationProcessBinding;
 }
 
 export interface GetCommandStatusInput {
@@ -97,7 +90,6 @@ export interface ProcessSnapshot {
   timedOut?: boolean;
   processTreeState?: OwnedProcessTreeState;
   wallTimeMs: number;
-  coreMutation?: CoreMutationProcessBinding;
 }
 
 interface ManagedProcess {
@@ -210,7 +202,6 @@ interface ProcessSession {
   environmentPolicy?: ProcessEnvironmentPolicy;
   tty?: boolean;
   timeoutSeconds?: number;
-  coreMutation?: CoreMutationProcessBinding;
   process?: ManagedProcess;
   startedAt: number;
   columns: number;
@@ -626,8 +617,6 @@ export class ProcessSessionManager {
     }
 
     if (existing.timeoutSeconds !== input.timeoutSeconds) return false;
-    if (existing.coreMutation?.sessionId !== input.coreMutation?.sessionId) return false;
-    if (existing.coreMutation?.bindingHash !== input.coreMutation?.bindingHash) return false;
 
     const existingEnv = existing.environmentPolicy ?? "inherit";
     const inputEnv = input.environmentPolicy ?? "inherit";
@@ -695,7 +684,6 @@ export class ProcessSessionManager {
       environmentPolicy: input.environmentPolicy ?? "inherit",
       tty: Boolean(input.tty),
       timeoutSeconds: input.timeoutSeconds,
-      coreMutation: input.coreMutation ? { ...input.coreMutation } : undefined,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
@@ -872,7 +860,6 @@ export class ProcessSessionManager {
       timedOut: session.timedOut,
       processTreeState: session.processTreeState,
       wallTimeMs: Date.now() - session.startedAt,
-      coreMutation: session.coreMutation ? { ...session.coreMutation } : undefined,
     };
   }
 
@@ -891,22 +878,6 @@ export class ProcessSessionManager {
       }
     }
     return states;
-  }
-
-  getCoreMutationBinding(workspaceId: string, sessionId: number): CoreMutationProcessBinding | undefined {
-    const binding = this.getOwnedSession(workspaceId, sessionId).coreMutation;
-    return binding ? { ...binding } : undefined;
-  }
-
-  inspectCoreMutationWriters(
-    sessionId: string,
-    bindingHash: string,
-  ): "CLEAR" | "ACTIVE" | "UNKNOWN" {
-    const matching = [...this.sessions.values()].filter((session) =>
-      session.coreMutation?.sessionId === sessionId && session.coreMutation.bindingHash === bindingHash,
-    );
-    if (matching.some((session) => session.running)) return "ACTIVE";
-    return matching.length > 0 ? "CLEAR" : "UNKNOWN";
   }
 
   private getOwnedSession(workspaceId: string, sessionId: number, workspaceRoot?: string): ProcessSession {
