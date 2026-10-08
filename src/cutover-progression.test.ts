@@ -4,14 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  CUTOVER_ACTIVATION_BINDING_SCHEMA,
   CutoverStateStore,
   type CutoverServerIdentity,
   type ExpectedCutoverIdentity,
 } from "./cutover-state.js";
 import {
   McpCutoverController,
+  classifyCutoverEffect,
   type DurableReconciliationWitness,
-  CUTOVER_SAFE_TOOLS,
 } from "./mcp-cutover.js";
 import {
   CutoverOrchestrator,
@@ -53,6 +54,23 @@ const positiveWitness: DurableReconciliationWitness = {
   agentQueryable: true,
   agentReconciled: true,
 };
+
+function bindActivation(stateDir: string, controller: McpCutoverController) {
+  const record = controller.record();
+  assert.ok(record);
+  const binding = {
+    schema: CUTOVER_ACTIVATION_BINDING_SCHEMA,
+    cutoverId: record.cutoverId,
+    sourceCommit: record.expectedNewIdentity.sourceCommit,
+    buildId: record.expectedNewIdentity.buildId,
+    releaseSha256: "e".repeat(64),
+    releasePath: join(stateDir, "releases", "release-target"),
+    pointerPath: join(stateDir, "current-release.json"),
+    boundAt: new Date().toISOString(),
+  } as const;
+  new CutoverStateStore(stateDir).recordActivationBinding(record.cutoverId, binding);
+  return binding;
+}
 
 function createMockActuator(fail = false): SelfRestartActuator & { scheduledCount: number } {
   const actuator = {
@@ -108,10 +126,13 @@ function createOrchestratorFixture(stateDir: string, options?: {
 // G0 & G2: Surface and Inventory Verification
 // ---------------------------------------------------------------------------
 
-test("devspace#263 G0/G2: cutover_advance is registered in CUTOVER_SAFE_TOOLS allowlist", () => {
-  assert.equal(CUTOVER_SAFE_TOOLS.has("cutover_advance"), true);
-  assert.equal(CUTOVER_SAFE_TOOLS.has("cutover_status"), true);
-  assert.equal(CUTOVER_SAFE_TOOLS.has("capability_convergence_status"), true);
+test("devspace#263 G0/G2: cutover progression controls remain explicit control/observation effects", () => {
+  assert.equal(classifyCutoverEffect("cutover_advance"), "CUTOVER_CONTROL_OR_OBSERVATION");
+  assert.equal(classifyCutoverEffect("cutover_status"), "CUTOVER_CONTROL_OR_OBSERVATION");
+  assert.equal(
+    classifyCutoverEffect("capability_convergence_status"),
+    "CUTOVER_CONTROL_OR_OBSERVATION",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -154,6 +175,7 @@ test("devspace#263 G4: end-to-end self-cutover progression canary (advance-drive
       verifiedBy: "build-pipeline",
       verifiedAt: new Date().toISOString(),
     });
+    const activation = bindActivation(stateDir, f.oldController);
 
     // Step 6: cutover_advance marks restart and invokes actuator -> ADVANCED / AWAITING_RECONNECT
     const step6 = await f.oldOrch.advance();
@@ -168,18 +190,32 @@ test("devspace#263 G4: end-to-end self-cutover progression canary (advance-drive
     assert.equal(step7.blocker, "AWAITING_RECONNECT");
     assert.equal(f.actuator.scheduledCount, 1, "must never schedule duplicate restart");
 
-    // Step 8: Client reconnects to replacement instance (reconcile-only mode)
-    assert.equal(f.replacementController.mode(), "reconcile-only");
-    const step8 = await f.replacementOrch.advance({
+    // Step 8: Client reconnects to the exact activation-bound replacement.
+    const exactReplacement = new McpCutoverController(
+      new CutoverStateStore(stateDir),
+      {
+        ...replacementIdentity,
+        releaseSha256: activation.releaseSha256,
+        releasePath: activation.releasePath,
+        activationCutoverId: activation.cutoverId,
+      },
+    );
+    const exactReplacementOrch = new CutoverOrchestrator({
+      controller: exactReplacement,
+      actuator: f.actuator,
+      enumerateAll: async () => positiveWitness,
+    });
+    assert.equal(exactReplacement.mode(), "reconcile-only");
+    const step8 = await exactReplacementOrch.advance({
       callerContinuity: { caller: "reconnected-agent" },
     });
     assert.equal(step8.status, "TERMINAL");
     assert.equal(step8.cutover_phase, "closed");
     assert.equal(step8.reconciliation_required, false);
-    assert.equal(f.replacementController.mode(), "normal");
+    assert.equal(exactReplacement.mode(), "normal");
 
     // Step 9: Post-close advance returns TERMINAL
-    const final = await f.replacementOrch.advance();
+    const final = await exactReplacementOrch.advance();
     assert.equal(final.status, "TERMINAL");
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
@@ -277,6 +313,7 @@ test("devspace#263 G3: build-ready missing or probe failure blocks with BUILD_NO
       verifiedBy: "attester",
       verifiedAt: new Date().toISOString(),
     });
+    bindActivation(stateDir, f.oldController);
     const probeFailed = await f.oldOrch.advance();
     assert.equal(probeFailed.status, "BLOCKED");
     assert.equal(probeFailed.blocker, "BUILD_NOT_READY");
@@ -297,6 +334,7 @@ test("devspace#263 G3: replacement identity mismatch fails closed with RECONCILI
       verifiedBy: "attester",
       verifiedAt: new Date().toISOString(),
     });
+    bindActivation(stateDir, f.oldController);
     await f.oldOrch.advance();
 
     // Replacement boots with unexpected source/build
@@ -319,6 +357,7 @@ test("devspace#263 G3: actuator failure is durable and never retried blindly", a
       verifiedBy: "attester",
       verifiedAt: new Date().toISOString(),
     });
+    bindActivation(stateDir, f.oldController);
 
     const failed = await f.oldOrch.advance();
     assert.equal(failed.status, "BLOCKED");

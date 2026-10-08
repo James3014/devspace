@@ -4,15 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ChatSwarmError } from "./chat-swarm-contract.js";
-import { ChatSwarmLifecycle, type ChatSwarmLifecycleMode } from "./chat-swarm-lifecycle.js";
+import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
 import type { ChatSwarmCarrierAdapter } from "./chat-swarm-carrier.js";
 import { DurableOperationStore } from "./durable-operations.js";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "devspace-chat-swarm-lifecycle-"));
-  let mode: ChatSwarmLifecycleMode = "normal";
-  const lifecycle = new ChatSwarmLifecycle({ stateDir: root, mode: () => mode });
-  return { root, lifecycle, setMode: (next: ChatSwarmLifecycleMode) => { mode = next; } };
+  const lifecycle = new ChatSwarmLifecycle({ stateDir: root });
+  return { root, lifecycle };
 }
 
 function cleanup(f: ReturnType<typeof fixture>): void {
@@ -101,67 +100,34 @@ test("startup recovery normalizes continuation after generic durable-operation f
   }
 });
 
-test("drain permits current-task next and uncertainty-safe completion, but rejects new claims", () => {
+test("ChatSwarm admission is independent of deployment cutover state", () => {
   const f = fixture();
   try {
-    f.setMode("drain");
-    for (const action of [
-      "create",
-      "join",
-      "dispatch",
-      "close",
-      "continuation_request",
-      "continuation_approve",
-    ] as const) {
-      assert.throws(
-        () => f.lifecycle.admit(action),
-        (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_STATE",
-      );
-    }
-    assert.doesNotThrow(() => f.lifecycle.admit("next", { existingTask: true }));
-    assert.throws(() => f.lifecycle.admit("next", { existingTask: false }), ChatSwarmError);
-    for (const action of [
-      "submit",
-      "status",
-      "collect",
-      "cancel",
-      "reconcile",
-      "continuation_status",
-      "continuation_reconcile",
-    ] as const) {
-      assert.doesNotThrow(() => f.lifecycle.admit(action));
-    }
-  } finally {
-    cleanup(f);
-  }
-});
-
-test("reconcile-only permits inspection and explicit recovery actions only", () => {
-  const f = fixture();
-  try {
-    f.setMode("reconcile-only");
-    for (const action of [
-      "status",
-      "collect",
-      "cancel",
-      "reconcile",
-      "submit",
-      "continuation_status",
-      "continuation_reconcile",
-    ] as const) {
-      assert.doesNotThrow(() => f.lifecycle.admit(action));
-    }
     for (const action of [
       "create",
       "join",
       "dispatch",
       "next",
+      "submit",
+      "status",
+      "collect",
+      "cancel",
+      "reconcile",
       "close",
+      "peer_status",
+      "inspect",
+      "tasks",
+      "join_request",
+      "approve_join",
       "continuation_request",
+      "continuation_status",
       "continuation_approve",
+      "continuation_reconcile",
     ] as const) {
-      assert.throws(() => f.lifecycle.admit(action), ChatSwarmError);
+      assert.doesNotThrow(() => f.lifecycle.admit(action));
     }
+    assert.doesNotThrow(() => f.lifecycle.admit("next", { existingTask: true }));
+    assert.doesNotThrow(() => f.lifecycle.admit("next", { existingTask: false }));
   } finally {
     cleanup(f);
   }
@@ -183,9 +149,8 @@ test("disabled lifecycle has no store and closes safely", () => {
   }
 });
 
-test("carrier effects require injected adapter, owner, normal mode, and explicit startup recovery", async () => {
+test("carrier effects require injected adapter, owner, and explicit startup recovery", async () => {
   const root = mkdtempSync(join(tmpdir(), "devspace-chat-swarm-carrier-lifecycle-"));
-  let mode: ChatSwarmLifecycleMode = "normal";
   const adapter: ChatSwarmCarrierAdapter = {
     kind: "fake",
     capabilities: () => ({
@@ -217,7 +182,6 @@ test("carrier effects require injected adapter, owner, normal mode, and explicit
   };
   const lifecycle = new ChatSwarmLifecycle({
     stateDir: root,
-    mode: () => mode,
     carrierAdapter: adapter,
   });
   const owner = { "openai/session": "owner" };
@@ -231,17 +195,14 @@ test("carrier effects require injected adapter, owner, normal mode, and explicit
     });
     const status = lifecycle.carrierStatus(owner, swarm.id);
     assert.equal(status.workers.length, 1);
-    mode = "drain";
-    await assert.rejects(
-      lifecycle.ensureCarriers(owner, {
-        swarmId: swarm.id,
-        capacity: 1,
-        adapterConfigHash: "b".repeat(64),
-      }),
-      /carrier effects are unavailable/,
-    );
-    mode = "normal";
     assert.equal(lifecycle.recoverAfterStartup(), 0);
+    const ensured = await lifecycle.ensureCarriers(owner, {
+      swarmId: swarm.id,
+      capacity: 1,
+      adapterConfigHash: "b".repeat(64),
+    });
+    assert.equal(ensured.length, 1);
+    assert.equal(ensured[0]?.state, "SUCCEEDED");
   } finally {
     lifecycle.close();
     rmSync(root, { recursive: true, force: true });

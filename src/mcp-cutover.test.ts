@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { CutoverStateStore } from "./cutover-state.js";
-import { CUTOVER_SAFE_TOOLS, CONSEQUENTIAL_MCP_TOOLS, classifyCutoverEffect, McpCutoverController, type DurableReconciliationWitness } from "./mcp-cutover.js";
+import { CONSEQUENTIAL_MCP_TOOLS, classifyCutoverEffect, McpCutoverController, type DurableReconciliationWitness } from "./mcp-cutover.js";
 
 const identity = (serverInstanceId: string, sourceCommit: string, buildId: string, capability = "cap") => ({
   serverInstanceId,
@@ -47,7 +47,6 @@ test("old instance drains and replacement instance is reconcile-only across rest
     );
     assert.equal(replacement.mode(), "reconcile-only");
     assert.deepEqual(replacement.record()?.coordinationBinding,binding);
-    assert.equal(replacement.canInitializeTransport(), true);
     assert.throws(
       () => replacement.recordDrain("cutover-one", { activeSessions: 0, oldestAgeMs: 0 }),
       /only the old server instance/i,
@@ -359,8 +358,8 @@ test("#386 reconnect during drain admits new transport, control tools, and unrel
     old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
     assert.equal(old.mode(), "drain");
 
-    // Simulating a reconnecting / newly initialized MCP transport
-    assert.equal(old.canInitializeTransport(), true);
+    // Reconnecting / newly initialized transports are no longer governed by
+    // a cutover-wide mode gate; per-effect admission applies after connection.
 
     // Control and reconciliation tools must reach handler
     assert.doesNotThrow(() => old.assertToolAllowed("cutover_status"));
@@ -561,18 +560,29 @@ test("#386: cutover fencing is deployment-effect scoped while unrelated mutation
       protectedPaths: [stateDir],
     }));
 
-    // Known control/read tools remain reachable so the exact deployment effect
-    // can be reconciled or terminalized. Removed governance tools must not remain
-    // as dead cutover allowlist entries.
-    for (const removedTool of ["coordination_recovery_request", "coordination_handoff_readback"]) {
-      assert.equal(CUTOVER_SAFE_TOOLS.has(removedTool), false);
-      assert.equal(CONSEQUENTIAL_MCP_TOOLS.has(removedTool), false);
-    }
-    for (const safeTool of CUTOVER_SAFE_TOOLS) {
+    // Cutover lifecycle/observation tools are classified explicitly as their
+    // own domain. They remain reachable to their handler-level authority checks
+    // without relying on a global safe-tool allowlist.
+    for (const controlTool of [
+      "cutover_status",
+      "cutover_start",
+      "cutover_drain",
+      "cutover_restart_self",
+      "cutover_reconcile",
+      "cutover_finish",
+      "cutover_recover",
+      "cutover_repair_binding",
+      "cutover_advance",
+      "capability_convergence_status",
+    ]) {
+      assert.equal(classifyCutoverEffect(controlTool), "CUTOVER_CONTROL_OR_OBSERVATION");
       assert.doesNotThrow(
-        () => old.assertToolAllowed(safeTool),
-        `Expected safe tool ${safeTool} to be allowed during drain`,
+        () => old.assertToolAllowed(controlTool),
+        `Expected control tool ${controlTool} to reach its own authority gate`,
       );
+    }
+    for (const removedTool of ["coordination_recovery_request", "coordination_handoff_readback"]) {
+      assert.equal(CONSEQUENTIAL_MCP_TOOLS.has(removedTool), false);
     }
 
     // Previously blanket-blocked workspace/Git/agent/process operations now

@@ -1,13 +1,7 @@
 import type {
-  BuildReadyProbeResult,
-} from "./cutover-build-ready.js";
-import { CutoverBuildNotReadyError } from "./cutover-build-ready.js";
-import type { SelfRestartActuator } from "./cutover-restart.js";
-import type {
   BuildReadyReceipt,
   CutoverCoordinationBinding,
   CutoverBindingRepairReceipt,
-  CutoverActivationBinding,
   CutoverDrainEvidence,
   CutoverReconciliationReceipt,
   CutoverServerIdentity,
@@ -16,7 +10,6 @@ import type {
 } from "./cutover-state.js";
 import { CutoverStateError, CutoverStateStore, effectiveExpectedIdentity } from "./cutover-state.js";
 import type { NextFunction, Request, Response } from "express";
-import type { OrchestrationOutcome } from "./cutover-orchestration.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 
 /** Legacy entrypoints cannot mutate a generation owned by the coordination consumer. */
@@ -52,61 +45,22 @@ export interface CutoverIdentityComparison {
   releaseMatches: boolean;
 }
 
-/**
- * Authoritative fail-closed allowlist for tools allowed to execute during
- * cutover drain or reconcile-only modes. Any tool not in this set is strictly
- * blocked with CUTOVER_RECONCILIATION_REQUIRED.
- */
-export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
-  // Core cutover control & recovery
-  "cutover_status",
-  "cutover_start", // Guarded handler admits only authorized starts or exact replay.
-  "cutover_drain",
-  "cutover_restart_self",
-  "cutover_reconcile",
-  "cutover_finish",
-  "cutover_recover",
-  "cutover_repair_binding",
-  "capability_convergence_status",
-  "cutover_advance",
-
-  // Agent inspection & reconciliation
-  "agent_status",
-  "agent_reconcile",
-  "agent_list",
-  "agent_preflight",
-
-  // Workspace, host, storage, and file inspection (read-only)
-  "workspace_inspect",
-  "storage_inventory",
-  "host_capability_snapshot",
-  "read",
-  "grep",
-  "glob",
-  "ls",
-  "show_changes",
-
-  // Existing-task completion only; lifecycle admission still rejects new claims.
-  "chat_swarm_next",
-  "chat_swarm_submit",
-  "chat_swarm_status",
-  "chat_swarm_collect",
-  "chat_swarm_reconcile",
-  "chat_swarm_cancel",
-
-  // Operation & command inspection
-  "operation_status",
-  "operation_reconcile",
-  "command_status",
-  "codex_goal_status",
-
-  // Safe read/preflight inspection
-  "candidate_integration_readiness",
-  "remote_writability_probe",
-]);
-
-export function isCutoverSafeTool(toolName: string): boolean {
-  return CUTOVER_SAFE_TOOLS.has(toolName);
+function isCutoverControlOrObservation(toolName: string): boolean {
+  switch (toolName) {
+    case "cutover_status":
+    case "cutover_start":
+    case "cutover_drain":
+    case "cutover_restart_self":
+    case "cutover_reconcile":
+    case "cutover_finish":
+    case "cutover_recover":
+    case "cutover_repair_binding":
+    case "cutover_advance":
+    case "capability_convergence_status":
+      return true;
+    default:
+      return false;
+  }
 }
 
 export type CutoverEffectDomain =
@@ -153,7 +107,7 @@ export function classifyCutoverEffect(
   toolName: string,
   target: CutoverEffectTarget = {},
 ): CutoverEffectDomain {
-  if (CUTOVER_SAFE_TOOLS.has(toolName)) return "CUTOVER_CONTROL_OR_OBSERVATION";
+  if (isCutoverControlOrObservation(toolName)) return "CUTOVER_CONTROL_OR_OBSERVATION";
   if (CUTOVER_DEPLOYMENT_CONFLICT_TOOLS.has(toolName)) return "DEPLOYMENT_CONFLICT";
   // Unknown future cutover/deployment primitives fail closed by namespace. A
   // future unrelated tool does not inherit global deployment authority merely
@@ -217,9 +171,9 @@ export const CONSEQUENTIAL_MCP_TOOLS = new Set([
 export class CutoverBlockedError extends Error {
   readonly code = "CUTOVER_RECONCILIATION_REQUIRED";
 
-  constructor(readonly cutoverId: string, readonly mode: Exclude<CutoverMode, "normal">) {
+  constructor(readonly cutoverId: string, readonly phase: DurableCutoverRecord["phase"]) {
     super(
-      `[CUTOVER_RECONCILIATION_REQUIRED] Cutover ${cutoverId} is ${mode}; ` +
+      `[CUTOVER_RECONCILIATION_REQUIRED] Cutover ${cutoverId} has unresolved deployment phase ${phase}; ` +
       "the requested deployment-conflicting effect is blocked until exact reconciliation closes it.",
     );
     this.name = "CutoverBlockedError";
@@ -318,15 +272,11 @@ export class McpCutoverController {
       : "reconcile-only";
   }
 
-  canInitializeTransport(): boolean {
-    return true;
-  }
-
   assertToolAllowed(toolName: string, target: CutoverEffectTarget = {}): void {
-    const mode = this.mode();
-    if (mode === "normal") return;
+    const record = this.store.get();
+    if (!record || record.phase === "closed") return;
     if (classifyCutoverEffect(toolName, target) !== "DEPLOYMENT_CONFLICT") return;
-    throw new CutoverBlockedError(this.store.get()!.cutoverId, mode);
+    throw new CutoverBlockedError(record.cutoverId, record.phase);
   }
 
   status(transportEvidence: CutoverDrainEvidence): Record<string, unknown> {
@@ -657,24 +607,18 @@ export interface CutoverHttpDependencies {
   controller: McpCutoverController;
   authenticate: (req: Request, res: Response, next: NextFunction) => void;
   transportEvidence: () => CutoverDrainEvidence;
-  reconcileDurableState: (input: {
-    workspaceId: string;
-    agentId: string;
-  }) => Promise<DurableReconciliationWitness>;
-  restartSelf?: SelfRestartActuator;
-  ensureActivationBound?: (cutoverId: string) => CutoverActivationBinding;
-  probeBuildReady?: (
-    expected: ExpectedCutoverIdentity,
-  ) => Promise<BuildReadyProbeResult> | BuildReadyProbeResult;
-  advance?: () => Promise<OrchestrationOutcome>;
 }
 
 interface RouteRegistrar {
   get(path: string, ...handlers: Array<(req: Request, res: Response, next: NextFunction) => unknown>): unknown;
-  post(path: string, ...handlers: Array<(req: Request, res: Response, next: NextFunction) => unknown>): unknown;
 }
 
-/** Authenticated controller recovery API. Responses contain aggregate metrics only. */
+/**
+ * Authenticated read-only cutover status endpoint.
+ *
+ * Consequential cutover lifecycle effects are intentionally MCP-only so they
+ * must consume the existing trusted coordination / durable-operation authority.
+ */
 export function registerCutoverHttpRoutes(
   app: RouteRegistrar,
   dependencies: CutoverHttpDependencies,
@@ -683,233 +627,10 @@ export function registerCutoverHttpRoutes(
     controller,
     authenticate,
     transportEvidence,
-    reconcileDurableState,
-    restartSelf,
-    ensureActivationBound,
-    probeBuildReady,
-    advance,
   } = dependencies;
-
-  const requireUnbound=(req:Request,res:Response,next:NextFunction)=>{
-    try {assertLegacyCutoverUnbound(controller.record());next();} catch(error){sendCutoverError(res,error);}
-  };
 
   app.get("/api/cutover/status", authenticate, (_req, res) => {
     res.json(controller.status(transportEvidence()));
   });
 
-  app.post("/api/cutover/start", authenticate, requireUnbound, (req, res) => {
-    try {
-      const body = objectBody(req.body);
-      const sourceCommit = requiredString(body.expectedSourceCommit, "expectedSourceCommit");
-      const buildId = requiredString(body.expectedBuildId, "expectedBuildId");
-      const capabilityManifestSha256 = optionalString(body.expectedCapabilityManifestSha256)
-        ?? controller.currentIdentity.capabilityManifestSha256;
-      const record = controller.begin(
-        { sourceCommit, buildId, ...(capabilityManifestSha256 ? { capabilityManifestSha256 } : {}) },
-        optionalString(body.expiresAt),
-      );
-      res.status(201).json({ cutover: record, mode: controller.mode() });
-    } catch (error) {
-      sendCutoverError(res, error);
-    }
-  });
-
-  app.post("/api/cutover/drain", authenticate, requireUnbound, (req, res) => {
-    try {
-      const cutoverId = requiredString(objectBody(req.body).cutoverId, "cutoverId");
-      const evidence=transportEvidence();
-      assertLegacyCutoverUnbound(controller.record());
-      const record = controller.recordDrain(cutoverId, evidence);
-      res.json({ cutover: record, mode: controller.mode() });
-    } catch (error) {
-      sendCutoverError(res, error);
-    }
-  });
-
-  app.post("/api/cutover/restart", authenticate, requireUnbound, async (req, res) => {
-    try {
-      const body = objectBody(req.body);
-      const cutoverId = requiredString(body.cutoverId, "cutoverId");
-      if (body.buildReady === undefined) {
-        throw new CutoverBuildNotReadyError(`Restart request ${cutoverId} lacks a build-ready attestation.`);
-      }
-      const buildReady = buildReadyReceipt(body.buildReady);
-      if (!ensureActivationBound) {
-        throw new CutoverStateError(
-          "Cutover restart is unavailable without a canonical activation-binding owner.",
-        );
-      }
-      ensureActivationBound(cutoverId);
-      const request = controller.requestRestart(cutoverId, buildReady);
-      const restart = request.record.restartRequest;
-      if (!restart?.buildReady) {
-        throw new CutoverBuildNotReadyError(
-          `Restart request ${cutoverId} lacks a build-ready attestation.`,
-        );
-      }
-      if (restart.restartScheduledAt) {
-        res.status(200).json({
-          cutover: request.record,
-          mode: controller.mode(),
-          restart: { scheduled: false, alreadyRequested: true, scheduleBlocked: false },
-        });
-        return;
-      }
-      if (probeBuildReady) {
-        const probe = await probeBuildReady(request.record.expectedNewIdentity);
-        if (!probe.buildReady) {
-          throw new CutoverBuildNotReadyError(probe.detail);
-        }
-      }
-      if (!restartSelf) {
-        throw new CutoverStateError("Restart scheduling is unavailable in this environment.");
-      }
-      assertLegacyCutoverUnbound(controller.record());
-      const mark = controller.markRestartScheduled(cutoverId);
-      const scheduled = mark.newlyScheduled ? restartSelf.schedule() : undefined;
-      if (!scheduled) {
-        res.status(200).json({
-          cutover: mark.record,
-          mode: controller.mode(),
-          restart: { scheduled: false, alreadyRequested: true, scheduleBlocked: false },
-        });
-        return;
-      }
-      res.status(200).json({
-        cutover: mark.record,
-        mode: controller.mode(),
-        restart: {
-          scheduled: true,
-          alreadyRequested: false,
-          actuator: "launchd-self",
-          serviceLabel: restartSelf.serviceLabel,
-          launchdTarget: restartSelf.launchdTarget,
-        },
-      });
-    } catch (error) {
-      sendCutoverError(res, error);
-    }
-  });
-
-  app.post("/api/cutover/advance", authenticate, requireUnbound, async (_req, res) => {
-    if (!advance) {
-      sendCutoverError(
-        res,
-        new CutoverStateError("Cutover orchestration is unavailable in this environment."),
-      );
-      return;
-    }
-    try {
-      const outcome = await advance();
-      if (outcome.outcome === "blocked") {
-        res.status(409).json({
-          error: { code: outcome.code, message: outcome.reason },
-          outcome,
-        });
-        return;
-      }
-      res.status(200).json({ outcome });
-    } catch (error) {
-      sendCutoverError(res, error);
-    }
-  });
-
-  app.post("/api/cutover/recover", authenticate, requireUnbound, (req, res) => {
-    try {
-      const body = objectBody(req.body);
-      const cutoverId = requiredString(body.cutoverId, "cutoverId");
-      const sourceCommit = requiredString(body.expectedSourceCommit, "expectedSourceCommit");
-      const buildId = requiredString(body.expectedBuildId, "expectedBuildId");
-      const capabilityManifestSha256 = optionalString(body.expectedCapabilityManifestSha256);
-      const recovered = controller.recoverCutover({
-        cutoverId,
-        expectedNewIdentity: {
-          sourceCommit,
-          buildId,
-          ...(capabilityManifestSha256 ? { capabilityManifestSha256 } : {}),
-        },
-        ...(optionalString(body.expiresAt) ? { expiresAt: body.expiresAt as string } : {}),
-      });
-      res.json({
-        terminal: recovered.terminal,
-        successor: recovered.successor,
-        newlyRecovered: recovered.newlyRecovered,
-        mode: controller.mode(),
-      });
-    } catch (error) {
-      sendCutoverError(res, error);
-    }
-  });
-
-  app.post("/api/cutover/finish", authenticate, requireUnbound, async (req, res) => {
-    try {
-      const body = objectBody(req.body);
-      const cutoverId = requiredString(body.cutoverId, "cutoverId");
-      const workspaceId = requiredString(body.workspaceId, "workspaceId");
-      const agentId = requiredString(body.agentId, "agentId");
-      const record = await controller.finish(
-        cutoverId,
-        () => reconcileDurableState({ workspaceId, agentId }),
-      );
-      res.json({ cutover: record, mode: controller.mode() });
-    } catch (error) {
-      sendCutoverError(res, error);
-    }
-  });
-}
-
-function objectBody(value: unknown): Record<string, unknown> {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new CutoverStateError("Request body must be a JSON object.");
-  }
-  return value as Record<string, unknown>;
-}
-
-function requiredString(value: unknown, field: string): string {
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new CutoverStateError(`${field} must be a non-empty string.`);
-  }
-  return value;
-}
-
-function optionalString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() !== "" ? value : undefined;
-}
-
-function buildReadyReceipt(value: unknown): BuildReadyReceipt {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new CutoverStateError("buildReady must be a build-ready attestation object.");
-  }
-  const receipt = value as Partial<BuildReadyReceipt>;
-  if (
-    typeof receipt.verifiedBy !== "string" ||
-    receipt.verifiedBy.trim() === "" ||
-    typeof receipt.verifiedAt !== "string" ||
-    !Number.isFinite(Date.parse(receipt.verifiedAt)) ||
-    (receipt.evidence !== undefined && typeof receipt.evidence !== "string")
-  ) {
-    throw new CutoverStateError("buildReady must contain a non-empty verifiedBy and an ISO verifiedAt.");
-  }
-  return {
-    verifiedBy: receipt.verifiedBy,
-    verifiedAt: receipt.verifiedAt,
-    ...(receipt.evidence !== undefined ? { evidence: receipt.evidence } : {}),
-  };
-}
-
-function sendCutoverError(res: Response, error: unknown): void {
-  const message = error instanceof Error ? error.message : String(error);
-  if (error instanceof CutoverBuildNotReadyError) {
-    res.status(409).json({
-      error: { code: "CUTOVER_BUILD_NOT_READY", message },
-    });
-    return;
-  }
-  res.status(error instanceof CutoverStateError ? 409 : 500).json({
-    error: {
-      code: error instanceof CutoverStateError ? "CUTOVER_RECONCILIATION_REQUIRED" : "CUTOVER_INTERNAL_ERROR",
-      message,
-    },
-  });
 }

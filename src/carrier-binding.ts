@@ -588,9 +588,9 @@ export class CarrierBindingStore {
       if(lease.version!==correlation.pinnedLeaseVersion && !(lease.version===correlation.pinnedLeaseVersion+1 && lease.terminalState==="expired_reconciled" && lease.operationState==="finished" && lease.operationHandle===undefined)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Expired prepared recovery lease version changed");
       if(lease.version===correlation.pinnedLeaseVersion && (lease.terminalState || lease.operationState!=="active" || lease.operationHandle!==correlation.operationHandle)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Expired prepared recovery requires the original active pin");
 
-      // Reconcile the ownership pin before opening the global cutover fence. If the
-      // process crashes after this point, the prepared cutover still blocks all
-      // consequential MCP work and a replay can safely finish the remaining steps.
+      // Reconcile the ownership pin before terminalizing this exact cutover effect.
+      // If the process crashes after this point, the unresolved deployment effect
+      // remains fail-closed and a replay can safely finish the remaining steps.
       const evidence:ReconciliationEvidence={leaseId:correlation.leaseId,ownerThread:binding.row.id,operationHandle:correlation.operationHandle,operation:"cutover_start",baseRevision:binding.contract.baseRevision,leaseVersion:correlation.pinnedLeaseVersion,state:"finished",detail:recoveryDetail};
       const reconciliation=localOwnership.reconcile(localContext,correlation.leaseId,correlation.pinnedLeaseVersion,evidence);
       const afterLease=cutoverStore.get();

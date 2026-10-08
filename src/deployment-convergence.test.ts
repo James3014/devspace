@@ -5,6 +5,7 @@ import {
   evaluateClientProjectionConvergence,
   evaluateDeploymentConvergence,
   evaluateSessionConvergence,
+  evaluateSessionAdmissionConvergence,
   evaluateMultiRoleConvergence,
   assertDeploymentCandidateValid,
   DeploymentConvergenceError,
@@ -289,6 +290,12 @@ test("SessionConvergence: RECONCILE_REQUIRED when server is in cutover drain mod
   const result = evaluateSessionConvergence(snapshot, current);
   assert.equal(result.state, "RECONCILE_REQUIRED");
   assert.equal(result.reconciliationRequired, true);
+
+  const admission = evaluateSessionAdmissionConvergence(snapshot, current);
+  assert.equal(admission.state, "CURRENT");
+  assert.equal(admission.controllerDisposition, "CURRENT");
+  assert.equal(admission.reconciliationRequired, false);
+  assert.equal(admission.converged, true);
 });
 
 test("SessionConvergence: STALE_SERVER when server instance changed", () => {

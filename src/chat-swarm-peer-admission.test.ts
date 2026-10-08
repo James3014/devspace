@@ -446,9 +446,8 @@ test("readonly peer_status and inspect do not mutate database state or bump vers
   }
 });
 
-// 12. lifecycle drain admission permits peer_status and inspect but blocks join_request and approve_join
-test("lifecycle drain admission permits peer_status and inspect but blocks join_request and approve_join", () => {
-  let mode: "normal" | "drain" = "normal";
+// 12. deployment cutover does not own peer-admission authority
+test("peer admission remains governed by swarm authority, not cutover mode", () => {
   const f = fixture();
   let lifecycle: ChatSwarmLifecycle | undefined;
 
@@ -456,26 +455,12 @@ test("lifecycle drain admission permits peer_status and inspect but blocks join_
     const activeLifecycle = new ChatSwarmLifecycle({
       stateDir: f.root,
       enabled: true,
-      mode: () => mode,
     });
     lifecycle = activeLifecycle;
 
-    assert.doesNotThrow(() => activeLifecycle.admit("peer_status"));
-    assert.doesNotThrow(() => activeLifecycle.admit("inspect"));
-    assert.doesNotThrow(() => activeLifecycle.admit("join_request"));
-    assert.doesNotThrow(() => activeLifecycle.admit("approve_join"));
-
-    mode = "drain";
-    assert.doesNotThrow(() => activeLifecycle.admit("peer_status"));
-    assert.doesNotThrow(() => activeLifecycle.admit("inspect"));
-    assert.throws(
-      () => activeLifecycle.admit("join_request"),
-      (err: unknown) => err instanceof ChatSwarmError && err.code === "INVALID_STATE",
-    );
-    assert.throws(
-      () => activeLifecycle.admit("approve_join"),
-      (err: unknown) => err instanceof ChatSwarmError && err.code === "INVALID_STATE",
-    );
+    for (const action of ["peer_status", "inspect", "join_request", "approve_join"] as const) {
+      assert.doesNotThrow(() => activeLifecycle.admit(action));
+    }
   } finally {
     try {
       lifecycle?.close();

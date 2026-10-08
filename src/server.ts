@@ -165,6 +165,7 @@ import {
   evaluateClientProjectionConvergence,
   unprovenClientProjectionConvergence,
   evaluateSessionConvergence,
+  evaluateSessionAdmissionConvergence,
   evaluateMultiRoleConvergence,
   type SessionGenerationSnapshot,
   type SessionConvergenceEvaluation,
@@ -6934,7 +6935,7 @@ export function createServer(
     ? new ChatSwarmRuntimeOwner(config.stateDir)
     : undefined;
   chatSwarmRuntimeOwner?.acquire();
-  const chatSwarmLifecycle = new ChatSwarmLifecycle({ stateDir: config.stateDir, enabled: config.chatSwarmEnabled, mode: () => cutoverController.mode() });
+  const chatSwarmLifecycle = new ChatSwarmLifecycle({ stateDir: config.stateDir, enabled: config.chatSwarmEnabled });
   initializationCleanups.push(() => chatSwarmLifecycle.close());
   if (chatSwarmLifecycle.enabled) chatSwarmLifecycle.recoverAfterStartup();
   options.chatSwarmInitializationHook?.();
@@ -7468,11 +7469,6 @@ export function createServer(
     controller: cutoverController,
     authenticate: bearerAuth,
     transportEvidence: () => transports.metrics(),
-    reconcileDurableState: reconcileCutoverDurableState,
-    ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
-    ...(restartSelfActuator ? { ensureActivationBound: ensureCutoverActivationBound } : {}),
-    ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
-    ...(advanceCutover ? { advance: advanceCutover } : {}),
   });
 
   const createSessionServer = (resolveRequestSessionId: () => string | undefined) => createMcpServer(
@@ -7790,17 +7786,6 @@ export function createServer(
       return;
     }
 
-    if (initializeRequest && !cutoverController.canInitializeTransport()) {
-      const record = cutoverController.record();
-      sendJsonRpcError(
-        res,
-        409,
-        -32002,
-        `[CUTOVER_RECONCILIATION_REQUIRED] Cutover ${record?.cutoverId ?? "unknown"} is draining; new MCP initialization is blocked.`,
-      );
-      return;
-    }
-
     if (
       req.method === "POST" &&
       req.body?.method === "tools/call" &&
@@ -7849,8 +7834,8 @@ export function createServer(
           }
         }
 
-        if (cutoverController.mode() === "normal" && toolName !== "capability_convergence_status" && toolName !== "tools/list") {
-          const convergence = evaluateSessionConvergence(sessionSnapshot, {
+        if (toolName !== "capability_convergence_status" && toolName !== "tools/list") {
+          const convergence = evaluateSessionAdmissionConvergence(sessionSnapshot, {
             serverInstanceId: runtimeBuildIdentity.serverInstanceId,
             sourceCommit: runtimeBuildIdentity.sourceCommit,
             buildId: runtimeBuildIdentity.buildId,
@@ -7941,9 +7926,15 @@ export function createServer(
           !transport &&
           req.method === "POST" &&
           (req.body?.method === "tools/list" || isReboundSession) &&
-          cutoverController.mode() === "normal" &&
           MCP_SESSION_ID_PATTERN.test(sessionId) &&
-          !closedReboundSessionIds.has(sessionId)
+          !closedReboundSessionIds.has(sessionId) &&
+          (() => {
+            const cutover = cutoverController.record();
+            // A fresh initialize remains available during unresolved cutover,
+            // but an unknown pre-restart session id cannot mint synthetic
+            // continuity while deployment identity is unresolved.
+            return !cutover || cutover.phase === "closed";
+          })()
         ) {
           transport = new ReboundTransport(sessionId);
           setTransportCloseHandler(transport, sessionId);
@@ -8053,8 +8044,7 @@ export function createServer(
           registrySessionId &&
           toolsListRequested &&
           res.statusCode >= 200 &&
-          res.statusCode < 300 &&
-          cutoverController.mode() === "normal"
+          res.statusCode < 300
         ) {
           const beforeAcknowledgement = transports.getSnapshot(registrySessionId);
           const acknowledged = transports.acknowledgeToolsList(registrySessionId, {

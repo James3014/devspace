@@ -10,7 +10,6 @@ import {
 import { ChatSwarmContinuationCoordinator } from "./chat-swarm-continuation-coordinator.js";
 import { ChatSwarmContinuationStore } from "./chat-swarm-continuation-store.js";
 
-export type ChatSwarmLifecycleMode = "normal" | "drain" | "reconcile-only";
 export type ChatSwarmLifecycleAction =
   | "create"
   | "join"
@@ -35,7 +34,6 @@ export type ChatSwarmLifecycleAction =
 export interface ChatSwarmLifecycleOptions {
   stateDir: string;
   enabled?: boolean;
-  mode?: () => ChatSwarmLifecycleMode;
   carrierAdapter?: ChatSwarmCarrierAdapter;
 }
 
@@ -54,13 +52,11 @@ export class ChatSwarmLifecycle {
   readonly coordinator?: ChatSwarmCoordinator;
   readonly continuationStore?: ChatSwarmContinuationStore;
   readonly continuationCoordinator?: ChatSwarmContinuationCoordinator;
-  private readonly modeProvider: () => ChatSwarmLifecycleMode;
   private closed = false;
   private readonly carrierManager?: ChatSwarmCarrierManager;
 
   constructor(options: ChatSwarmLifecycleOptions) {
     this.enabled = options.enabled ?? true;
-    this.modeProvider = options.mode ?? (() => "normal");
     if (this.enabled) {
       const store = new ChatSwarmStore(options.stateDir);
       const coordinator = new ChatSwarmCoordinator(store);
@@ -126,33 +122,13 @@ export class ChatSwarmLifecycle {
   }
 
   admit(
-    action: ChatSwarmLifecycleAction,
-    context: ChatSwarmAdmissionContext = {},
+    _action: ChatSwarmLifecycleAction,
+    _context: ChatSwarmAdmissionContext = {},
   ): void {
+    // Cutover state does not own ChatSwarm admission. Deployment-conflicting
+    // physical effects are fenced by the server's effect-domain classifier;
+    // swarm ownership, task lifecycle, and continuation authority remain here.
     this.requireEnabled();
-    const mode = this.modeProvider();
-    if (mode === "normal") return;
-
-    if (action === "next" && context.existingTask === true) return;
-    if (
-      [
-        "status",
-        "collect",
-        "cancel",
-        "reconcile",
-        "submit",
-        "peer_status",
-        "inspect",
-        "tasks",
-        "continuation_status",
-        "continuation_reconcile",
-      ].includes(action)
-    ) return;
-
-    throw new ChatSwarmError(
-      "INVALID_STATE",
-      `chat swarm action '${action}' is unavailable while cutover is ${mode}`,
-    );
   }
 
   close(): void {
@@ -179,12 +155,6 @@ export class ChatSwarmLifecycle {
 
   private requireCarrierEffects(): void {
     this.requireEnabled();
-    if (this.modeProvider() !== "normal") {
-      throw new ChatSwarmError(
-        "INVALID_STATE",
-        "carrier effects are unavailable while lifecycle is not normal",
-      );
-    }
     if (!this.carrierManager) {
       throw new ChatSwarmError("INVALID_STATE", "carrier adapter is unavailable");
     }

@@ -396,29 +396,25 @@ export function assertDeploymentCandidateValid(
   }
 }
 
-export function evaluateSessionConvergence(
+function evaluateSessionConvergenceInternal(
   sessionSnapshot: SessionGenerationSnapshot | undefined,
-  currentServer: {
-    serverInstanceId: string;
-    sourceCommit: string;
-    buildId: string;
-    capabilityManifestSha256: string;
-    catalogGeneration: string;
-    toolNames?: string[];
-    freshness?: string;
-    cutoverMode: string;
-    reconciliationRequired: boolean;
-  },
-  currentCallerIdentityFingerprint?: string,
-  currentConversationIdentityFingerprint?: string,
+  currentServer: SessionConvergenceEvaluation["serverGeneration"],
+  currentCallerIdentityFingerprint: string | undefined,
+  currentConversationIdentityFingerprint: string | undefined,
+  includeCutoverReconciliation: boolean,
 ): SessionConvergenceEvaluation {
   const base = {
     sessionSnapshot,
     serverGeneration: currentServer,
   };
 
-  // 1. Server is draining or requires reconciliation
-  if (currentServer.reconciliationRequired || currentServer.cutoverMode !== "normal") {
+  // Cutover reconciliation remains diagnostic state. Admission callers may
+  // deliberately exclude it because exact deployment conflicts are fenced by
+  // the cutover effect classifier rather than becoming a global session gate.
+  if (
+    includeCutoverReconciliation &&
+    (currentServer.reconciliationRequired || currentServer.cutoverMode !== "normal")
+  ) {
     return {
       ...base,
       state: "RECONCILE_REQUIRED",
@@ -543,6 +539,42 @@ export function evaluateSessionConvergence(
     activeDrift: false,
     details: "Session generation is fully synchronized with live server identity and tool catalog",
   };
+}
+
+/** Diagnostic projection: includes unresolved cutover reconciliation state. */
+export function evaluateSessionConvergence(
+  sessionSnapshot: SessionGenerationSnapshot | undefined,
+  currentServer: SessionConvergenceEvaluation["serverGeneration"],
+  currentCallerIdentityFingerprint?: string,
+  currentConversationIdentityFingerprint?: string,
+): SessionConvergenceEvaluation {
+  return evaluateSessionConvergenceInternal(
+    sessionSnapshot,
+    currentServer,
+    currentCallerIdentityFingerprint,
+    currentConversationIdentityFingerprint,
+    true,
+  );
+}
+
+/**
+ * Admission projection: evaluates only session/server/catalog/caller freshness.
+ * Cutover state is intentionally not authority here; exact deployment effects
+ * are independently fenced by the cutover effect-domain classifier.
+ */
+export function evaluateSessionAdmissionConvergence(
+  sessionSnapshot: SessionGenerationSnapshot | undefined,
+  currentServer: SessionConvergenceEvaluation["serverGeneration"],
+  currentCallerIdentityFingerprint?: string,
+  currentConversationIdentityFingerprint?: string,
+): SessionConvergenceEvaluation {
+  return evaluateSessionConvergenceInternal(
+    sessionSnapshot,
+    currentServer,
+    currentCallerIdentityFingerprint,
+    currentConversationIdentityFingerprint,
+    false,
+  );
 }
 
 export interface ServiceRoleDeploymentIdentity {
