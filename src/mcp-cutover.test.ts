@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { CutoverStateStore } from "./cutover-state.js";
-import { CUTOVER_SAFE_TOOLS, CONSEQUENTIAL_MCP_TOOLS, classifyCutoverEffect, McpCutoverController, type DurableReconciliationWitness } from "./mcp-cutover.js";
+import { CONSEQUENTIAL_MCP_TOOLS, classifyCutoverEffect, McpCutoverController, type DurableReconciliationWitness } from "./mcp-cutover.js";
 
 const identity = (serverInstanceId: string, sourceCommit: string, buildId: string, capability = "cap") => ({
   serverInstanceId,
@@ -565,13 +565,18 @@ test("#386: cutover fencing is deployment-effect scoped while unrelated mutation
     // can be reconciled or terminalized. Removed governance tools must not remain
     // as dead cutover allowlist entries.
     for (const removedTool of ["coordination_recovery_request", "coordination_handoff_readback"]) {
-      assert.equal(CUTOVER_SAFE_TOOLS.has(removedTool), false);
+      assert.notEqual(classifyCutoverEffect(removedTool), "CUTOVER_CONTROL_OR_OBSERVATION");
       assert.equal(CONSEQUENTIAL_MCP_TOOLS.has(removedTool), false);
     }
-    for (const safeTool of CUTOVER_SAFE_TOOLS) {
+    for (const tool of [
+      "cutover_status", "cutover_start", "cutover_drain", "cutover_advance",
+      "cutover_reconcile", "cutover_finish", "cutover_recover",
+      "capability_convergence_status", "agent_status", "agent_reconcile",
+      "read", "workspace_inspect", "remote_writability_probe",
+    ]) {
       assert.doesNotThrow(
-        () => old.assertToolAllowed(safeTool),
-        `Expected safe tool ${safeTool} to be allowed during drain`,
+        () => old.assertToolAllowed(tool),
+        `Expected non-conflicting operation ${tool} to remain reachable`,
       );
     }
 

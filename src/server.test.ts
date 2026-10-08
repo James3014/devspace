@@ -28,7 +28,7 @@ import {
   resolveDurableReconciliationWitnessFromInventory,
 } from "./server.js";
 import { CUTOVER_ACTIVATION_BINDING_SCHEMA, CutoverStateStore } from "./cutover-state.js";
-import { CONSEQUENTIAL_MCP_TOOLS, CUTOVER_SAFE_TOOLS, McpCutoverController } from "./mcp-cutover.js";
+import { CONSEQUENTIAL_MCP_TOOLS, McpCutoverController } from "./mcp-cutover.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
