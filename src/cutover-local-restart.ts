@@ -24,6 +24,7 @@ import {
   CutoverStateError,
   CutoverStateStore,
   type CutoverServerIdentity,
+  type DurableReconciliationWitness,
   type ExpectedCutoverIdentity,
 } from "./cutover-state.js";
 
@@ -223,6 +224,99 @@ export async function performLocalBoundCutoverRestart(
       stableServiceRoot:stableService.serviceRoot,
       activationBinding,
     };
+  } finally {
+    manager.close();
+    bindings.close();
+  }
+}
+
+export interface LocalBoundCutoverFinishDependencies {
+  readHealth?: () => Promise<unknown>;
+  /** Defaults to the server's exact-pair inventory witness over the real workspace store and agent manager. */
+  reconcile?: (pair: { workspaceId: string; agentId: string }) => Promise<DurableReconciliationWitness>;
+}
+
+export interface LocalBoundCutoverFinishInput {
+  config: ServerConfig;
+  cutoverId: string;
+  carrierId: string;
+  expectedCarrierVersion: number;
+  expectedValidityVersion: number;
+  carrierCredential: string;
+  confirmCutoverId: string;
+  workspaceId: string;
+  agentId: string;
+}
+
+async function reconcileExactPair(
+  config: ServerConfig,
+  pair: { workspaceId: string; agentId: string },
+): Promise<DurableReconciliationWitness> {
+  // Lazy imports keep the heavy server module off the other CLI paths.
+  const { resolveDurableReconciliationWitnessFromInventory } = await import("./server.js");
+  const { createWorkspaceStore } = await import("./workspace-store.js");
+  const { WorkspaceRegistry } = await import("./workspaces.js");
+  const { LocalAgentSessionManager } = await import("./local-agent-sessions.js");
+  const workspaceStore = createWorkspaceStore(config.stateDir);
+  const agentSessionManager = new LocalAgentSessionManager(config);
+  try {
+    return await resolveDurableReconciliationWitnessFromInventory(
+      { workspaceStore, workspaces: new WorkspaceRegistry(config, workspaceStore), agentSessionManager },
+      pair,
+    );
+  } finally {
+    agentSessionManager.close();
+    workspaceStore.close?.();
+  }
+}
+
+/**
+ * Owner-local closure of a coordination-bound DRAINED generation whose
+ * replacement runtime is already live (for example after restart-bound when the
+ * owner sidecar died before finish). Mints no authority: it projects the same
+ * root carrier context as restart-bound, requires the live healthz identity to
+ * be the exact expected replacement (and not the old instance), runs the
+ * exact-pair witness, and delegates every state/lease check to finishCutover().
+ */
+export async function performLocalBoundCutoverFinish(
+  input: LocalBoundCutoverFinishInput,
+  dependencies: LocalBoundCutoverFinishDependencies = {},
+) {
+  const bindings=new CarrierBindingStore(input.config.stateDir);
+  const manager=new DurableOperationManager(input.config,undefined,bindings.readers);
+  try {
+    const local=bindings.localDrainedCutoverContext({
+      cutoverId:input.cutoverId,
+      carrierId:input.carrierId,
+      expectedVersion:input.expectedCarrierVersion,
+      expectedValidityVersion:input.expectedValidityVersion,
+      carrierCredential:input.carrierCredential,
+      confirmCutoverId:input.confirmCutoverId,
+    });
+    const file=new CutoverStateStore(input.config.stateDir).get();
+    if(!file || file.cutoverId!==input.cutoverId || file.phase!=="drained") {
+      throw new CutoverStateError("Bound local finish requires the exact drained cutover generation.");
+    }
+    const health=parseLiveCutoverHealth(
+      await (dependencies.readHealth ? dependencies.readHealth() : readDefaultHealth(input.config)),
+    );
+    const expected=file.expectedNewIdentity;
+    if(health.identity.serverInstanceId===file.oldServerIdentity.serverInstanceId ||
+      health.identity.sourceCommit!==expected.sourceCommit ||
+      health.identity.buildId!==expected.buildId ||
+      (expected.capabilityManifestSha256!==undefined &&
+        health.identity.capabilityManifestSha256!==expected.capabilityManifestSha256)) {
+      throw new CutoverStateError("Live DevSpace runtime is not the exact expected replacement; refusing bound finish.");
+    }
+    const pair={workspaceId:input.workspaceId,agentId:input.agentId};
+    const closed=await manager.finishCutover(
+      input.cutoverId,
+      health.identity,
+      pair,
+      ()=>dependencies.reconcile ? dependencies.reconcile(pair) : reconcileExactPair(input.config,pair),
+      local.context,
+    );
+    return {record:closed,liveIdentity:health.identity};
   } finally {
     manager.close();
     bindings.close();
