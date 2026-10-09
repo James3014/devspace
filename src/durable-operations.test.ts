@@ -471,13 +471,49 @@ test("C4 refuses to downgrade a persisted Carrier-bound cutover into new OWNER_D
       expectedNewIdentity: input.expectedIdentity,
       coordinationBinding,
     });
-    const attempt = manager.startDirectCutover(input);
-    assert.equal(attempt.status, "outcome_unknown");
-    assert.equal(attempt.retrySafe, false);
+    const operationId = planCutoverStart(f.config.stateDir, input).operationId;
+    assert.throws(() => manager.startDirectCutover(input), /Unresolved cutover.*fence/i);
+    assert.equal(manager.store.getByOperationId(operationId), undefined, "no intent may be persisted for a known active legacy fence");
     assert.deepEqual(new CutoverStateStore(f.config.stateDir).get()?.coordinationBinding, coordinationBinding);
     assert.equal(new CutoverStateStore(f.config.stateDir).get()?.directOperation, undefined);
     assert.equal(new CutoverStateStore(f.config.stateDir).get()?.cutoverId, bound.cutoverId);
-    assert.throws(() => manager.reconcileDirectCutoverStart(attempt.operationId), /no retry is authorized/);
+  } finally {
+    manager.close();
+    await f.cleanup();
+  }
+});
+
+test("C4 occupied native cutover fence denies pre-intent and permits same attemptKey after genuine closure", async () => {
+  const f = await fixture();
+  const manager = new DurableOperationManager(f.config);
+  try {
+    const state = new CutoverStateStore(f.config.stateDir);
+    const first = state.begin({
+      oldServerIdentity: {serverInstanceId: "old-active", sourceCommit: "a".repeat(40), buildId: "build-a"},
+      expectedNewIdentity: {sourceCommit: "b".repeat(40), buildId: "build-b"},
+    });
+    const input = {
+      attemptKey: "c4-known-fence-retry",
+      currentIdentity: {serverInstanceId: "new-active", sourceCommit: "b".repeat(40), buildId: "build-b"},
+      expectedIdentity: {sourceCommit: "c".repeat(40), buildId: "build-c"},
+    };
+    const operationId = planCutoverStart(f.config.stateDir, input).operationId;
+    assert.throws(() => manager.startDirectCutover(input), /Unresolved cutover.*fence/i);
+    assert.equal(manager.store.getByOperationId(operationId), undefined, "pre-intent collision must leave the attempt key reusable");
+    assert.equal(state.get()?.cutoverId, first.cutoverId);
+    state.close(first.cutoverId, {
+      closedByServerInstanceId: "closed-active",
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      reconciledAt: new Date().toISOString(),
+    });
+    const started = manager.startDirectCutover(input);
+    assert.equal(started.status, "succeeded");
+    assert.equal(started.operationId, operationId);
+    assert.deepEqual(manager.startDirectCutover(input), started, "same-effect replay may not be rejected by its own active fence");
+    assert.equal(state.get()?.directOperation?.operationId, operationId);
+    assert.notEqual(state.get()?.cutoverId, first.cutoverId);
   } finally {
     manager.close();
     await f.cleanup();

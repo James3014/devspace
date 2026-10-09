@@ -3,7 +3,7 @@ import type { SelfRestartActuator } from "./cutover-restart.js";
 import type { CompletionSelection } from "./current-completion-matrix.js";
 import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
-import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding, type CutoverActivationBinding } from "./cutover-state.js";
+import { CutoverStateError, CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding, type CutoverActivationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput, type TakeoverInput, type ReconciliationReceipt } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
@@ -610,13 +610,18 @@ export class DurableOperationManager {
   }
 
   /**
-   * A closed Carrier-bound cutover can still have an unfinished SQLite/lease
-   * terminalization after its file is closed. Archiving that file prematurely
-   * would strand the original generation and make bound recovery impossible.
+   * Known occupied generations must reject a new cutover before its durable
+   * attempt is created. A closed Carrier-bound generation also needs an exact
+   * terminal receipt before its file can be archived for the next generation.
    */
-  private assertLegacyBoundCutoverIsTerminal(stateRoot: string): void {
+  private assertCutoverFenceAvailable(stateRoot: string): void {
     const existing = new CutoverStateStore(stateRoot).get();
-    if (!existing?.coordinationBinding || existing.phase !== "closed") return;
+    if (existing && existing.phase !== "closed") {
+      throw new CutoverStateError(
+        `Unresolved cutover ${existing.cutoverId} already owns the durable cutover fence.`,
+      );
+    }
+    if (!existing?.coordinationBinding) return;
     const binding = existing.coordinationBinding;
     const operation = this.store.getByOperationId(binding.operationHandle);
     if (!operation || operation.kind !== "cutover_start" ||
@@ -645,16 +650,22 @@ export class DurableOperationManager {
     const { snapshot, stateRoot, operationId } = planned;
     const request = { ...planned.request, ownerDirect: true };
     const requestHash = hashJson(request);
-    // This is a pre-intent admission gate: known historical recovery blockers
-    // must not poison a new direct attempt with an outcome_unknown record.
-    this.assertLegacyBoundCutoverIsTerminal(stateRoot);
-    const intent = this.store.createOrReplay({
-      operationId,
-      attemptKey: snapshot.attemptKey,
-      requestHash,
-      kind: "cutover_start",
-      scopeRoot: stateRoot,
-      request,
+    // Admit a genuinely new attempt only if no older generation owns the
+    // physical cutover fence. An already-persisted attempt bypasses this
+    // preflight so that exact lost-ACK replay can still reconcile its own
+    // active generation without ever starting another effect.
+    const intent = this.store.atomic(() => {
+      if (!this.store.getByAttempt(stateRoot, snapshot.attemptKey)) {
+        this.assertCutoverFenceAvailable(stateRoot);
+      }
+      return this.store.createOrReplay({
+        operationId,
+        attemptKey: snapshot.attemptKey,
+        requestHash,
+        kind: "cutover_start",
+        scopeRoot: stateRoot,
+        request,
+      });
     });
     if (!intent.created) return this.reconcileDirectCutoverStart(operationId);
     try {
@@ -664,7 +675,8 @@ export class DurableOperationManager {
         }
         // Recheck under the durable transaction immediately before changing
         // the separate cutover file, including late terminal receipt changes.
-        this.assertLegacyBoundCutoverIsTerminal(stateRoot);
+        // A genuinely racing effect may still be unknown; never blind retry it.
+        this.assertCutoverFenceAvailable(stateRoot);
         const controller = new McpCutoverController(new CutoverStateStore(stateRoot), snapshot.currentIdentity);
         controller.begin(snapshot.expectedIdentity, snapshot.expiresAt, undefined, { operationId, requestHash });
         return this.reconcileDirectCutoverStart(operationId);
