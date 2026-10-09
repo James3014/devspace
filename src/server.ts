@@ -67,6 +67,7 @@ import {
 import {
   McpSessionRegistry,
   type McpSessionCloseResult,
+  type McpSessionCapacityRejectionCause,
   type McpSessionDisposalReason,
 } from "./mcp-sessions.js";
 import {
@@ -6822,6 +6823,7 @@ export function createServer(
   const transports = new McpSessionRegistry<Transport>({
     maxSessions: config.mcpSessionMaxSessions,
     idleTimeoutMs: config.mcpSessionIdleTimeoutMs,
+    lruMinIdleMs: config.mcpSessionLruMinIdleMs,
     onDispose: (sessionId, transport, reason) => notifyRegistryDisposal(sessionId, transport, reason),
   });
   const projectionRefreshAcknowledgedCatalogByConversation = new Map<string, string>();
@@ -7620,10 +7622,16 @@ export function createServer(
       });
     }
   };
-  const logCapacityRejected = (req: Request, requestId: string | undefined, path: "rebound" | "initialize") => {
+  const logCapacityRejected = (
+    req: Request,
+    requestId: string | undefined,
+    path: "rebound" | "initialize",
+    rejectionCause: McpSessionCapacityRejectionCause,
+  ) => {
     logEvent(config.logging, "warn", "mcp_session_capacity_rejected", {
       requestId,
       path,
+      rejectionCause,
       ip: requestIp(req, config.logging.trustProxy),
       host: req.header("host"),
       userAgent: req.header("user-agent"),
@@ -7973,7 +7981,9 @@ export function createServer(
             server,
           });
           if (!registration.accepted) {
-            if (registration.reason === "capacity_exhausted") logCapacityRejected(req, requestId, "rebound");
+            if (registration.reason === "capacity_exhausted") {
+              logCapacityRejected(req, requestId, "rebound", registration.rejectionCause);
+            }
             sendJsonRpcError(
               res,
               503,
@@ -7994,7 +8004,7 @@ export function createServer(
         }
       } else if (initializeRequest) {
         if (!transports.admitRegistration()) {
-          logCapacityRejected(req, requestId, "initialize");
+          logCapacityRejected(req, requestId, "initialize", transports.capacityRejectionCause());
           sendJsonRpcError(res, 503, -32004, "MCP session capacity exhausted; retry after a session becomes available.");
           return;
         }

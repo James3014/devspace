@@ -12,7 +12,17 @@ export type McpSessionDisposalReason = "capacity_eviction" | "capacity_lru" | "i
 
 export type McpSessionRegistrationResult =
   | { accepted: true; evicted: number }
-  | { accepted: false; reason: "capacity_exhausted" | "duplicate_session" };
+  | { accepted: false; reason: "duplicate_session" }
+  | { accepted: false; reason: "capacity_exhausted"; rejectionCause: McpSessionCapacityRejectionCause };
+
+/**
+ * Why a registration at capacity could not evict anything: every resident
+ * session is in flight or pending close, or some are evictable but none has
+ * been idle for at least lruMinIdleMs.
+ */
+export type McpSessionCapacityRejectionCause = "all_in_flight" | "no_session_idle_min";
+
+const DEFAULT_LRU_MIN_IDLE_MS = 60_000;
 
 interface McpSessionEntry<TTransport> {
   transport: TTransport;
@@ -27,6 +37,8 @@ export interface McpSessionRegistryOptions<TTransport extends ClosableMcpTranspo
   now?: () => number;
   maxSessions?: number;
   idleTimeoutMs?: number;
+  /** Minimum idle age before LRU eviction at capacity. Defaults to min(60s, idleTimeoutMs). */
+  lruMinIdleMs?: number;
   onDispose?: (sessionId: string, transport: TTransport, reason: McpSessionDisposalReason) => void;
 }
 
@@ -59,6 +71,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly now: () => number;
   private readonly maxSessions?: number;
   private readonly idleTimeoutMs?: number;
+  private readonly lruMinIdleMs: number;
   private readonly onDispose?: McpSessionRegistryOptions<TTransport>["onDispose"];
   private highWaterActiveSessions = 0;
   private registrations = 0;
@@ -74,6 +87,8 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     this.now = options.now ?? Date.now;
     this.maxSessions = options.maxSessions;
     this.idleTimeoutMs = options.idleTimeoutMs;
+    this.lruMinIdleMs = options.lruMinIdleMs
+      ?? Math.min(DEFAULT_LRU_MIN_IDLE_MS, options.idleTimeoutMs ?? DEFAULT_LRU_MIN_IDLE_MS);
     this.onDispose = options.onDispose;
   }
 
@@ -84,6 +99,14 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   canAcceptRegistration(): boolean {
     if (this.maxSessions === undefined || this.sessions.size < this.maxSessions) return true;
     return this.hasEvictableSession();
+  }
+
+  /** Why a registration at capacity would be rejected right now (call only when at capacity). */
+  capacityRejectionCause(): McpSessionCapacityRejectionCause {
+    for (const entry of this.sessions.values()) {
+      if (entry.inFlight === 0 && !entry.pendingClose) return "no_session_idle_min";
+    }
+    return "all_in_flight";
   }
 
   /**
@@ -113,7 +136,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     if (this.maxSessions !== undefined && this.sessions.size >= this.maxSessions) {
       this.capacityRejections += 1;
       void this.closeUnregisteredTransport(transport);
-      return { accepted: false, reason: "capacity_exhausted" };
+      return { accepted: false, reason: "capacity_exhausted", rejectionCause: this.capacityRejectionCause() };
     }
     this.sessions.set(sessionId, {
       transport,
@@ -217,15 +240,18 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
 
   /**
    * Last-resort eviction at capacity: the least-recently-active session with no
-   * in-flight work, regardless of age. Runs only after idle eviction.
+   * in-flight work that has been idle for at least lruMinIdleMs. Runs only after
+   * idle eviction; younger sessions stay protected.
    */
   private evictLruToLimit(): Array<{ sessionId: string; transport: TTransport }> {
     const evicted: Array<{ sessionId: string; transport: TTransport }> = [];
+    const lruCutoff = this.now() - this.lruMinIdleMs;
     while (this.sessions.size >= this.maxSessions!) {
       let lruId: string | undefined;
       let lruActivity = Number.POSITIVE_INFINITY;
       for (const [sessionId, entry] of this.sessions) {
         if (entry.inFlight > 0 || entry.pendingClose) continue;
+        if (entry.lastActivityAt > lruCutoff) continue;
         if (entry.lastActivityAt < lruActivity) {
           lruActivity = entry.lastActivityAt;
           lruId = sessionId;
@@ -241,8 +267,9 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   }
 
   private hasEvictableSession(): boolean {
+    const lruCutoff = this.now() - this.lruMinIdleMs;
     for (const entry of this.sessions.values()) {
-      if (entry.inFlight === 0 && !entry.pendingClose) return true;
+      if (entry.inFlight === 0 && !entry.pendingClose && entry.lastActivityAt <= lruCutoff) return true;
     }
     return false;
   }
