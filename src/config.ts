@@ -18,6 +18,7 @@ const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MCP_SESSION_MAX_SESSIONS = 256;
+const DEFAULT_MCP_SESSION_LRU_MIN_IDLE_MS = 60_000;
 const DEFAULT_CHAT_SWARM_MAX_WORKERS = 16;
 const DEFAULT_CHAT_SWARM_QUEUE_LIMIT = 1000;
 const DEFAULT_CHAT_SWARM_RESULT_MAX_CHARS = 256 * 1024;
@@ -52,6 +53,7 @@ export interface ServerConfig {
   codexBin?: string;
   mcpSessionIdleTimeoutMs: number;
   mcpSessionMaxSessions: number;
+  mcpSessionLruMinIdleMs: number;
   chatSwarmEnabled: boolean;
   chatSwarmMaxWorkers: number;
   chatSwarmQueueLimit: number;
@@ -387,6 +389,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     new URL(publicBaseUrl).hostname,
     ...(files.config.allowedHosts ?? []),
   ];
+  const mcpSessionIdleTimeoutMs = parsePositiveInteger(
+    env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS ?? numberConfigValue(files.config.mcpSessionIdleTimeoutMs),
+    DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
+    "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS",
+  );
+  // The default is clamped so a short idle timeout never makes the default invalid;
+  // an explicit value above the idle timeout is rejected.
+  const mcpSessionLruMinIdleMs = parsePositiveInteger(
+    env.DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS ?? numberConfigValue(files.config.mcpSessionLruMinIdleMs),
+    Math.min(DEFAULT_MCP_SESSION_LRU_MIN_IDLE_MS, mcpSessionIdleTimeoutMs),
+    "DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS",
+    mcpSessionIdleTimeoutMs,
+  );
 
   return {
     host,
@@ -430,11 +445,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     agentExecutionBackend: parseAgentExecutionBackend(env.DEVSPACE_AGENT_EXECUTION_BACKEND),
     codexGoalsEnabled: parseBoolean(env.DEVSPACE_CODEX_GOALS),
     codexBin: env.DEVSPACE_CODEX_BIN?.trim() || undefined,
-    mcpSessionIdleTimeoutMs: parsePositiveInteger(
-      env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS ?? numberConfigValue(files.config.mcpSessionIdleTimeoutMs),
-      DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
-      "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS",
-    ),
+    mcpSessionIdleTimeoutMs,
+    mcpSessionLruMinIdleMs,
     mcpSessionMaxSessions: parsePositiveInteger(
       env.DEVSPACE_MCP_SESSION_MAX_SESSIONS ?? numberConfigValue(files.config.mcpSessionMaxSessions),
       DEFAULT_MCP_SESSION_MAX_SESSIONS,
