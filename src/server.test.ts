@@ -1174,6 +1174,88 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
   }
 });
 
+test("C4 MCP direct cutover starts and reconciles without paired Carrier or coordination reader", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-c4-direct-cutover-mcp-"));
+  const stateDir = join(root, ".state");
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_TOOL_MODE: "full",
+    PORT: "1",
+  });
+  const workspaceStore = new SqliteWorkspaceStore(stateDir);
+  const manager = new DurableOperationManager(config);
+  const currentIdentity = {
+    serverInstanceId: "direct-old-server",
+    sourceCommit: "a".repeat(40),
+    buildId: "direct-old-build",
+    capabilityManifestSha256: "c".repeat(64),
+  };
+  const controller = new McpCutoverController(new CutoverStateStore(stateDir), currentIdentity);
+  const server = createMcpServer(
+    config,
+    new WorkspaceRegistry(config, workspaceStore),
+    createReviewCheckpointManager(),
+    new ProcessSessionManager(),
+    () => [],
+    [],
+    undefined,
+    undefined,
+    undefined,
+    manager,
+    {
+      controller,
+      transportEvidence: () => ({ activeSessions: 0, oldestAgeMs: 0 }),
+      reconcileDurableState: async () => ({
+        workspaceQueryable: true,
+        agentQueryable: true,
+        agentReconciled: true,
+      }),
+    },
+  );
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "devspace-c4-direct", version: "1.0.0" });
+  try {
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    const args = {
+      expectedSourceCommit: "b".repeat(40),
+      expectedBuildId: "direct-target-build",
+      expectedCapabilityManifestSha256: "c".repeat(64),
+      attemptKey: "c4-direct-mcp-cutover",
+    };
+    const first = await client.callTool({ name: "cutover_start", arguments: args });
+    assert.equal(first.isError, undefined, JSON.stringify(first));
+    const firstData = structuredContent(first);
+    const active = firstData.cutover as { directOperation?: {operationId: string; requestHash: string}; coordinationBinding?: unknown };
+    assert.equal(active.coordinationBinding, undefined);
+    assert.equal(active.directOperation?.operationId, firstData.operationId);
+    assert.deepEqual(manager.store.getByOperationId(firstData.operationId as string)?.request.ownerDirect, true);
+    const replay = await client.callTool({ name: "cutover_start", arguments: args });
+    assert.equal(replay.isError, undefined, JSON.stringify(replay));
+    assert.equal(structuredContent(replay).operationId, firstData.operationId);
+    const reconciled = await client.callTool({
+      name: "operation_reconcile",
+      arguments: { operationId: firstData.operationId },
+    });
+    assert.equal(reconciled.isError, undefined, JSON.stringify(reconciled));
+    assert.equal(structuredContent(reconciled).status, "succeeded");
+    const conflict = await client.callTool({
+      name: "cutover_start",
+      arguments: { ...args, expectedBuildId: "wrong-new-build" },
+    });
+    assert.equal(conflict.isError, true);
+    assert.equal(controller.record()?.cutoverId, (firstData.cutover as {cutoverId: string}).cutoverId);
+  } finally {
+    await client.close();
+    await server.close();
+    manager.close();
+    workspaceStore.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cutover restart tool is absent when no bounded self actuator is available", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-cutover-no-actuator-"));
   const stateDir = join(root, ".state");
@@ -3230,7 +3312,7 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
 
 });
 
-test("OWNER_DIRECT dependency_sync bypasses carrier only for a managed isolated worktree", async (t) => {
+test("C4 OWNER_DIRECT dependency_sync supports managed isolated worktree and single-conversation checkout", async (t) => {
   const context = await fixture(t, { git: true });
   await writeFile(join(context.project, "package.json"), JSON.stringify({ name: "isolated-fixture", version: "1.0.0" }) + "\n");
   await writeFile(join(context.project, "package-lock.json"), JSON.stringify({
@@ -3272,8 +3354,35 @@ test("OWNER_DIRECT dependency_sync bypasses carrier only for a managed isolated 
     },
     _meta: { "openai/session": "checkout-dependency-sync" },
   });
-  assert.equal(checkoutResult.isError, true);
-  assert.match(JSON.stringify(checkoutResult), /authenticated MCP client context is required/);
+  assert.equal(checkoutResult.isError, undefined, JSON.stringify(checkoutResult));
+  assert.equal(structuredContent(checkoutResult).status, "succeeded");
+  assert.equal(
+    ((structuredContent(checkoutResult).request as Record<string, unknown>) ?? {}).ownerDirectExecution,
+    true,
+  );
+  const checkoutReplay = await context.client.callTool({
+    name: "dependency_sync",
+    arguments: {
+      workspaceId: checkoutWorkspaceId,
+      attemptKey: "checkout-owner-direct-deps",
+      recipe: "npm_ci",
+    },
+    _meta: { "openai/session": "checkout-dependency-sync" },
+  });
+  assert.equal(structuredContent(checkoutReplay).operationId, structuredContent(checkoutResult).operationId);
+
+  await callOpen(context.client, context.project, "competing-dependency-sync", "checkout");
+  const shared = await context.client.callTool({
+    name: "dependency_sync",
+    arguments: {
+      workspaceId: checkoutWorkspaceId,
+      attemptKey: "checkout-shared-must-not-run",
+      recipe: "npm_ci",
+    },
+    _meta: { "openai/session": "checkout-dependency-sync" },
+  });
+  assert.equal(shared.isError, true);
+  assert.match(JSON.stringify(shared), /CONVERSATION_CHECKOUT_SHARED|managed worktree|shared by active conversations/i);
 });
 
 test("command_status metadata annotations and minimal mode visibility", async (t) => {
@@ -4242,11 +4351,14 @@ test("#386: real server /mcp keeps unrelated workspace mutation usable during dr
     assert.equal(startRes.status, 200);
     const startText=await startRes.text();
     const startData=startText.split("\n").find(line=>line.startsWith("data: "));
-    assert.equal(JSON.parse(startData?startData.slice(6):startText).result.isError,true);
-    assert.equal(new CutoverStateStore(stateDir).get(),undefined);
-    // Arrange drain through the trusted fixture API; this test covers reconnect.
-    const runtime=await (await fetch(`http://127.0.0.1:${port}/identity`)).json() as any;
-    new CutoverStateStore(stateDir).begin({oldServerIdentity:{serverInstanceId:runtime.serverInstanceId,sourceCommit:runtime.sourceCommit,buildId:runtime.buildId,capabilityManifestSha256:runtime.capabilityManifest.manifestSha256},expectedNewIdentity:{sourceCommit:"a".repeat(40),buildId:"build-p04"}});
+    const startResult=JSON.parse(startData?startData.slice(6):startText).result;
+    assert.equal(startResult.isError,undefined, JSON.stringify(startResult));
+    const startedCutover=new CutoverStateStore(stateDir).get();
+    assert.equal(startedCutover?.phase,"prepared");
+    assert.equal(startedCutover?.coordinationBinding,undefined);
+    assert.equal(startedCutover?.directOperation?.operationId,startResult.structuredContent?.operationId);
+    // The actual MCP direct start is now the fixture's persisted cutover.
+    // Reconnect and drain must operate on that exact generation.
 
 
     // 3. Client 2 (reconnecting ChatGPT connector after drop, starting new session during drain)

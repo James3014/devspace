@@ -1,6 +1,8 @@
-# CLI coordination readers
+# Legacy CLI coordination readers (migration compatibility)
 
-An operator can connect the existing host reader interface when starting DevSpace:
+**C4 migration boundary:** New `cutover_start` and single-conversation or managed-worktree `dependency_sync` use DevSpace-native durable operations, not Carrier/ControlPlane admission. Ordinary startup does not initialize the Carrier store unless a historical persisted bound effect still needs recovery, or an operator explicitly supplies legacy completion/coordination readers. The commands below document historical compatibility, not a supported path for introducing new governance. Do not use them to start new cutovers or direct dependency operations.
+
+An operator recovering a historical bound effect can connect its original trusted host reader interface when starting DevSpace:
 
 ```sh
 devspace serve --coordination-reader-module /absolute/path/readers.mjs --coordination-reader-sha256 <64-hex-sha256>
@@ -49,10 +51,11 @@ Pairing remains available. Selecting the module pins executable code, not eviden
 truth: the reviewed reader must still validate its canonical sources, artifact
 integrity and acceptance provenance. Synthetic fixtures cannot establish delivery.
 
-Without a custom reader module, the server now exposes a local pairing path for
-bounded dependency operations. Unpaired sessions have no coordination authority.
-An explicitly configured custom reader retains exclusive control; the built-in
-pairing tools are not enabled alongside it.
+The following pairing workflow describes **historical persisted Carrier sessions**.
+It is no longer the ordinary MCP execution path, and `coordination_pair` /
+`coordination_resume` are not registered as new direct-operation tools.
+A custom legacy reader remains solely responsible for the original authority
+of a pre-existing bound record; it cannot authorize a new direct operation.
 
 1. The MCP client calls `coordination_pair` and keeps its private credential.
    The pending ID identifies the pairing request; it does not grant authority.

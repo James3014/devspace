@@ -11,11 +11,14 @@ import { promisify } from "node:util";
 import type { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { loadConfig } from "./config.js";
+import { CutoverStateStore } from "./cutover-state.js";
 import { canonicalizePath } from "./roots.js";
 import {
   DurableOperationError,
   DurableOperationManager,
   DurableOperationStore,
+  planCutoverStart,
+  hashJson,
   type CommandRunner,
 } from "./durable-operations.js";
 
@@ -404,6 +407,167 @@ test("dependency_sync frozen recipe succeeds without changing manifest or lock i
   }
 });
 
+test("C4: new direct cutover persists exact durable correlation without Carrier governance", async () => {
+  const f = await fixture();
+  const manager = new DurableOperationManager(f.config);
+  try {
+    const input = {
+      attemptKey: "c4-direct-cutover-1",
+      currentIdentity: {
+        serverInstanceId: "old-server",
+        sourceCommit: "a".repeat(40),
+        buildId: "old-build",
+        capabilityManifestSha256: "c".repeat(64),
+      },
+      expectedIdentity: {
+        sourceCommit: "b".repeat(40),
+        buildId: "new-build",
+        capabilityManifestSha256: "c".repeat(64),
+      },
+    };
+    const first = manager.startDirectCutover(input);
+    assert.equal(first.status, "succeeded");
+    assert.equal(first.retrySafe, false);
+    const cutover = new CutoverStateStore(f.config.stateDir).get();
+    assert.equal(cutover?.phase, "prepared");
+    assert.equal(cutover?.coordinationBinding, undefined);
+    assert.deepEqual(cutover?.directOperation, {
+      operationId: first.operationId,
+      requestHash: first.requestHash,
+    });
+    assert.equal(first.receipt?.cutoverId, cutover?.cutoverId);
+    assert.deepEqual(manager.startDirectCutover(input), first);
+    assert.deepEqual(await manager.reconcile(first.operationId), first);
+    assert.throws(() => manager.startDirectCutover({
+      ...input,
+      expectedIdentity: { ...input.expectedIdentity, buildId: "wrong-target" },
+    }), /OPERATION_REPLAY_CONFLICT|materially different/);
+    assert.equal(new CutoverStateStore(f.config.stateDir).get()?.cutoverId, cutover?.cutoverId);
+  } finally {
+    manager.close();
+    await f.cleanup();
+  }
+});
+
+test("C4 refuses to downgrade a persisted Carrier-bound cutover into new OWNER_DIRECT authority", async () => {
+  const f = await fixture();
+  const manager = new DurableOperationManager(f.config);
+  try {
+    const input = {
+      attemptKey: "c4-must-not-downgrade",
+      currentIdentity: { serverInstanceId: "legacy-old", sourceCommit: "a".repeat(40), buildId: "old" },
+      expectedIdentity: { sourceCommit: "b".repeat(40), buildId: "new" },
+    };
+    const coordinationBinding = {
+      leaseId: "lease-old",
+      pinnedLeaseVersion: 2,
+      operationHandle: "op_" + "e".repeat(16),
+      requestHash: "f".repeat(64),
+      ownerThread: "legacy-controller",
+    };
+    const bound = new CutoverStateStore(f.config.stateDir).begin({
+      oldServerIdentity: input.currentIdentity,
+      expectedNewIdentity: input.expectedIdentity,
+      coordinationBinding,
+    });
+    const attempt = manager.startDirectCutover(input);
+    assert.equal(attempt.status, "outcome_unknown");
+    assert.equal(attempt.retrySafe, false);
+    assert.deepEqual(new CutoverStateStore(f.config.stateDir).get()?.coordinationBinding, coordinationBinding);
+    assert.equal(new CutoverStateStore(f.config.stateDir).get()?.directOperation, undefined);
+    assert.equal(new CutoverStateStore(f.config.stateDir).get()?.cutoverId, bound.cutoverId);
+    assert.throws(() => manager.reconcileDirectCutoverStart(attempt.operationId), /no retry is authorized/);
+  } finally {
+    manager.close();
+    await f.cleanup();
+  }
+});
+
+test("C4 direct cutover lost-ACK reconciles exact intent, never recreates absent or mismatched physical effects", async () => {
+  const f = await fixture();
+  const manager = new DurableOperationManager(f.config);
+  try {
+    const input = {
+      attemptKey: "c4-unknown-cutover",
+      currentIdentity: { serverInstanceId: "old-1", sourceCommit: "a".repeat(40), buildId: "old-build" },
+      expectedIdentity: { sourceCommit: "b".repeat(40), buildId: "new-build" },
+    };
+    const planned = planCutoverStart(f.config.stateDir, input);
+    const request = { ...planned.request, ownerDirect: true };
+    const requestHash = hashJson(request);
+    const intent = manager.store.createOrReplay({
+      operationId: planned.operationId,
+      attemptKey: input.attemptKey,
+      requestHash,
+      kind: "cutover_start",
+      scopeRoot: planned.stateRoot,
+      request,
+    });
+    assert.equal(intent.record.status, "started");
+    assert.throws(() => manager.reconcileDirectCutoverStart(planned.operationId), /no retry is authorized/);
+    assert.throws(() => manager.startDirectCutover(input), /no retry is authorized/);
+    assert.equal(new CutoverStateStore(f.config.stateDir).get(), undefined);
+    assert.equal(manager.store.getByOperationId(planned.operationId)?.status, "started");
+    const observed = new CutoverStateStore(f.config.stateDir).begin({
+      oldServerIdentity: input.currentIdentity,
+      expectedNewIdentity: input.expectedIdentity,
+      directOperation: { operationId: planned.operationId, requestHash },
+    });
+    const reconciled = manager.reconcileDirectCutoverStart(planned.operationId);
+    assert.equal(reconciled.status, "succeeded");
+    assert.equal(reconciled.receipt?.cutoverId, observed.cutoverId);
+    assert.deepEqual(manager.startDirectCutover(input), reconciled);
+  } finally {
+    manager.close();
+    await f.cleanup();
+  }
+});
+
+test("C4 startup Carrier compatibility inventory excludes direct records but detects bound history", async () => {
+  const f = await fixture();
+  const manager = new DurableOperationManager(f.config);
+  try {
+    assert.equal(manager.store.hasLegacyBoundOperations(), false);
+    manager.startDirectCutover({
+      attemptKey: "c4-new-only",
+      currentIdentity: { serverInstanceId: "old", sourceCommit: "a".repeat(40), buildId: "old" },
+      expectedIdentity: { sourceCommit: "b".repeat(40), buildId: "new" },
+    });
+    assert.equal(manager.store.hasLegacyBoundOperations(), false);
+    const boundSync = manager.store.createOrReplay({
+      operationId: "op_1111111111111111",
+      attemptKey: "historical-bound-sync",
+      requestHash: "c".repeat(64),
+      kind: "dependency_sync",
+      scopeRoot: f.config.stateDir,
+      request: { version: "historical", workspaceRoot: f.config.stateDir },
+    });
+    assert.equal(manager.store.hasLegacyBoundOperations(), true);
+    manager.store.finish(boundSync.record.operationId, { status: "succeeded", retrySafe: false });
+    assert.equal(manager.store.hasLegacyBoundOperations(), false, "terminal dependency sync must not keep Carrier resident");
+
+    const boundCutover = manager.store.createOrReplay({
+      operationId: "op_2222222222222222",
+      attemptKey: "historical-bound-cutover",
+      requestHash: "d".repeat(64),
+      kind: "cutover_start",
+      scopeRoot: f.config.stateDir,
+      request: { version: "historical", coordinationBinding: {
+        leaseId: "lease-legacy", operationHandle: "op_2222222222222222",
+        requestHash: "d".repeat(64), ownerThread: "legacy-controller", pinnedLeaseVersion: 1,
+      } },
+    });
+    assert.equal(manager.store.hasLegacyBoundOperations(), true);
+    manager.store.finish(boundCutover.record.operationId, {
+      status: "succeeded", retrySafe: false, receipt: { lifecycleTerminal: true },
+    });
+    assert.equal(manager.store.hasLegacyBoundOperations(), false, "terminal cutover must not keep Carrier resident");
+  } finally {
+    manager.close();
+    await f.cleanup();
+  }
+});
+
 test("dependency_sync OWNER_DIRECT isolated mode does not require carrier authority", async () => {
   const f = await fixture();
   try {
@@ -437,6 +601,43 @@ test("dependency_sync OWNER_DIRECT isolated mode does not require carrier author
       assert.equal(witness?.requestHash, result.requestHash);
       assert.equal(witness?.frozenInputsUnchanged, true);
       assert.equal((result.request as Record<string, unknown>).ownerDirectIsolated, true);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("C4 checkout reconciliation rejects a forged isolated witness after lost process acknowledgement", async () => {
+  const f = await fixture();
+  try {
+    const project = join(f.root, "checkout");
+    await mkdir(project);
+    await writeFile(join(project, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0" }) + "\n");
+    await writeFile(join(project, "package-lock.json"), JSON.stringify({ name: "fixture", version: "1.0.0", lockfileVersion: 3, packages: {} }) + "\n");
+    await git(project, "init");
+    await git(project, "config", "user.email", "devspace@example.com");
+    await git(project, "config", "user.name", "DevSpace Test");
+    await git(project, "add", ".");
+    await git(project, "commit", "-m", "fixture");
+    const manager = new DurableOperationManager(f.config, async () => {
+      throw new Error("lost checkout process acknowledgement");
+    });
+    try {
+      const unknown = await manager.dependencySync({
+        attemptKey: "c4-checkout-no-witness",
+        workspaceId: "ws_single_checkout",
+        workspaceRoot: project,
+        recipe: "npm_ci",
+        ownerDirectExecution: true,
+      });
+      assert.equal(unknown.status, "outcome_unknown");
+      assert.equal(unknown.retrySafe, false);
+      assert.equal(unknown.request.ownerDirectExecution, true);
+      manager.store.recordDependencyTerminal(unknown.operationId, unknown.requestHash, "OWNER_DIRECT_ISOLATED", 0, true);
+      assert.throws(() => manager.reconcileOwnerDirectDependencySync(unknown.operationId), /No exact terminal witness exists/);
+      assert.equal(manager.store.getByOperationId(unknown.operationId)?.status, "outcome_unknown");
     } finally {
       manager.close();
     }
