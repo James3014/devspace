@@ -7610,9 +7610,25 @@ export function createServer(
   const reboundSessionIds = new Set<string>();
   const reboundTransportDisposals = new WeakSet<object>();
   const closedReboundSessionIds = new Set<string>();
-  notifyRegistryDisposal = (sessionId) => {
+  notifyRegistryDisposal = (sessionId, _transport, reason) => {
     carrierBindings?.forgetSession(sessionId);
     reboundSessionIds.delete(sessionId);
+    if (reason === "capacity_lru") {
+      logEvent(config.logging, "info", "mcp_session_closed", {
+        reason,
+        sessionIdPrefix: sessionIdPrefix(sessionId),
+      });
+    }
+  };
+  const logCapacityRejected = (req: Request, requestId: string | undefined, path: "rebound" | "initialize") => {
+    logEvent(config.logging, "warn", "mcp_session_capacity_rejected", {
+      requestId,
+      path,
+      ip: requestIp(req, config.logging.trustProxy),
+      host: req.header("host"),
+      userAgent: req.header("user-agent"),
+      ...transports.metrics(),
+    });
   };
   const reboundSessionTombstoneLimit = config.mcpSessionMaxSessions ?? 256;
   const rememberReboundSession = (sessionId: string) => {
@@ -7957,6 +7973,7 @@ export function createServer(
             server,
           });
           if (!registration.accepted) {
+            if (registration.reason === "capacity_exhausted") logCapacityRejected(req, requestId, "rebound");
             sendJsonRpcError(
               res,
               503,
@@ -7977,6 +7994,7 @@ export function createServer(
         }
       } else if (initializeRequest) {
         if (!transports.admitRegistration()) {
+          logCapacityRejected(req, requestId, "initialize");
           sendJsonRpcError(res, 503, -32004, "MCP session capacity exhausted; retry after a session becomes available.");
           return;
         }
