@@ -8,7 +8,7 @@ export interface McpSessionCloseResult {
   error?: unknown;
 }
 
-export type McpSessionDisposalReason = "capacity_eviction" | "idle_timeout" | "server_shutdown";
+export type McpSessionDisposalReason = "capacity_eviction" | "capacity_lru" | "idle_timeout" | "server_shutdown";
 
 export type McpSessionRegistrationResult =
   | { accepted: true; evicted: number }
@@ -38,6 +38,7 @@ export interface McpSessionMetrics {
   reusedRequests: number;
   idleCloses: number;
   capacityEvictions: number;
+  lruEvictions: number;
   capacityRejections: number;
   closeErrors: number;
   disposalCallbackErrors: number;
@@ -64,6 +65,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private reusedRequests = 0;
   private idleCloses = 0;
   private capacityEvictions = 0;
+  private lruEvictions = 0;
   private capacityRejections = 0;
   private closeErrors = 0;
   private disposalCallbackErrors = 0;
@@ -81,7 +83,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
 
   canAcceptRegistration(): boolean {
     if (this.maxSessions === undefined || this.sessions.size < this.maxSessions) return true;
-    return this.hasEligibleIdleSession(this.now());
+    return this.hasEvictableSession();
   }
 
   /**
@@ -106,6 +108,8 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     }
     const evicted: Array<{ sessionId: string; transport: TTransport }> =
       this.maxSessions !== undefined ? this.evictIdleToLimit() : [];
+    const lruEvicted =
+      this.maxSessions !== undefined && this.sessions.size >= this.maxSessions ? this.evictLruToLimit() : [];
     if (this.maxSessions !== undefined && this.sessions.size >= this.maxSessions) {
       this.capacityRejections += 1;
       void this.closeUnregisteredTransport(transport);
@@ -121,9 +125,10 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     });
     this.registrations += 1;
     this.capacityEvictions += evicted.length;
+    this.lruEvictions += lruEvicted.length;
     this.highWaterActiveSessions = Math.max(this.highWaterActiveSessions, this.sessions.size);
-    void this.closeAndRecord(evicted);
-    return { accepted: true, evicted: evicted.length };
+    void this.closeAndRecord([...evicted, ...lruEvicted]);
+    return { accepted: true, evicted: evicted.length + lruEvicted.length };
   }
 
   async closeUnregisteredTransport(transport: TTransport): Promise<{ error?: unknown }> {
@@ -210,11 +215,34 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return evicted;
   }
 
-  private hasEligibleIdleSession(now: number): boolean {
-    if (this.idleTimeoutMs === undefined) return false;
-    const cutoff = now - this.idleTimeoutMs;
+  /**
+   * Last-resort eviction at capacity: the least-recently-active session with no
+   * in-flight work, regardless of age. Runs only after idle eviction.
+   */
+  private evictLruToLimit(): Array<{ sessionId: string; transport: TTransport }> {
+    const evicted: Array<{ sessionId: string; transport: TTransport }> = [];
+    while (this.sessions.size >= this.maxSessions!) {
+      let lruId: string | undefined;
+      let lruActivity = Number.POSITIVE_INFINITY;
+      for (const [sessionId, entry] of this.sessions) {
+        if (entry.inFlight > 0 || entry.pendingClose) continue;
+        if (entry.lastActivityAt < lruActivity) {
+          lruActivity = entry.lastActivityAt;
+          lruId = sessionId;
+        }
+      }
+      if (lruId === undefined) break;
+      const entry = this.sessions.get(lruId)!;
+      this.notifyDispose(lruId, entry.transport, "capacity_lru");
+      this.sessions.delete(lruId);
+      evicted.push({ sessionId: lruId, transport: entry.transport });
+    }
+    return evicted;
+  }
+
+  private hasEvictableSession(): boolean {
     for (const entry of this.sessions.values()) {
-      if (entry.inFlight === 0 && !entry.pendingClose && entry.lastActivityAt <= cutoff) return true;
+      if (entry.inFlight === 0 && !entry.pendingClose) return true;
     }
     return false;
   }
@@ -290,6 +318,7 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
       reusedRequests: this.reusedRequests,
       idleCloses: this.idleCloses,
       capacityEvictions: this.capacityEvictions,
+      lruEvictions: this.lruEvictions,
       capacityRejections: this.capacityRejections,
       closeErrors: this.closeErrors,
       disposalCallbackErrors: this.disposalCallbackErrors,

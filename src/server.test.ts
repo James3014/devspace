@@ -155,6 +155,7 @@ test("health and identity expose aggregate MCP session lifecycle metrics", async
       "reusedRequests",
       "idleCloses",
       "capacityEvictions",
+      "lruEvictions",
       "capacityRejections",
       "closeErrors",
       "disposalCallbackErrors",

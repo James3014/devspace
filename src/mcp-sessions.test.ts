@@ -37,6 +37,7 @@ assert.deepEqual(registry.metrics(), {
   reusedRequests: 1,
   idleCloses: 0,
   capacityEvictions: 0,
+  lruEvictions: 0,
   capacityRejections: 0,
   closeErrors: 0,
   disposalCallbackErrors: 0,
@@ -157,6 +158,8 @@ boundedRegistry.register("middle", middle);
 boundedNow = 20;
 boundedRegistry.register("newest", newest);
 boundedNow = 30;
+// All resident sessions have in-flight work, so none is evictable.
+for (const id of ["oldest", "middle", "newest"]) assert.equal(boundedRegistry.beginRequest(id), true);
 const boundedOverflow = createTransport();
 assert.deepEqual(boundedRegistry.register("overflow", boundedOverflow), {
   accepted: false,
@@ -167,8 +170,6 @@ assert.equal(boundedRegistry.get("oldest"), oldest);
 assert.equal(oldest.closeCalls, 0);
 assert.equal(boundedRegistry.get("middle"), middle);
 
-boundedNow = 40;
-boundedRegistry.beginRequest("middle");
 boundedNow = 50;
 const boundedOverflowTwo = createTransport();
 assert.deepEqual(boundedRegistry.register("overflow-two", boundedOverflowTwo), {
@@ -179,7 +180,7 @@ assert.equal(boundedRegistry.get("oldest"), oldest);
 assert.equal(boundedRegistry.get("newest"), newest);
 assert.equal(boundedRegistry.get("middle"), middle);
 
-await boundedRegistry.endRequest("middle");
+for (const id of ["oldest", "middle", "newest"]) await boundedRegistry.endRequest(id);
 assert.equal(boundedRegistry.size, 3);
 assert.equal(boundedRegistry.get("middle"), middle);
 
@@ -260,6 +261,7 @@ assert.deepEqual(lifecycleRegistry.metrics(), {
   reusedRequests: 1,
   idleCloses: 0,
   capacityEvictions: 1,
+  lruEvictions: 0,
   capacityRejections: 1,
   closeErrors: 0,
   disposalCallbackErrors: 0,
@@ -478,6 +480,9 @@ const preflightRegistry = new McpSessionRegistry<FakeTransport>({
 let preflightNow = 0;
 preflightRegistry.register("preflight-resident", createTransport());
 preflightNow = 50;
+// A young idle resident is LRU-evictable, so the pre-check agrees with register().
+assert.equal(preflightRegistry.canAcceptRegistration(), true);
+assert.equal(preflightRegistry.beginRequest("preflight-resident"), true);
 assert.equal(preflightRegistry.admitRegistration(), false);
 assert.equal(preflightRegistry.metrics().capacityRejections, 1);
 const postPreflightTransport = createTransport();
@@ -556,3 +561,74 @@ closingRegistry.register("closing", createTransport());
 assert.equal(closingRegistry.beginRequest("closing"), true);
 void closingRegistry.closeAll();
 assert.equal(closingRegistry.acknowledgeToolsList("closing", currentSnapshot), false);
+
+// Issue #461: LRU eviction at capacity.
+{
+  const lruDisposals: Array<[string, string]> = [];
+  let lruNow = 0;
+  const lruRegistry = new McpSessionRegistry<FakeTransport>({
+    now: () => lruNow,
+    maxSessions: 256,
+    idleTimeoutMs: 1_800_000,
+    onDispose: (sessionId, _transport, reason) => lruDisposals.push([sessionId, reason]),
+  });
+  const lruTransports: FakeTransport[] = [];
+  for (let i = 0; i < 256; i += 1) {
+    lruNow = i;
+    const transport = createTransport();
+    lruTransports.push(transport);
+    assert.equal(lruRegistry.register(`lru-${i}`, transport).accepted, true);
+  }
+  lruNow = 1_000;
+  // Touch the first session so lru-1 becomes the least recently active.
+  assert.equal(lruRegistry.get("lru-0"), lruTransports[0]);
+  assert.equal(lruRegistry.admitRegistration(), true);
+  const lruNew = createTransport();
+  assert.deepEqual(lruRegistry.register("lru-new", lruNew), { accepted: true, evicted: 1 });
+  await Promise.resolve();
+  assert.equal(lruRegistry.size, 256);
+  assert.equal(lruRegistry.get("lru-1"), undefined);
+  assert.equal(lruTransports[1].closeCalls, 1);
+  assert.equal(lruTransports[0].closeCalls, 0);
+  assert.deepEqual(lruDisposals, [["lru-1", "capacity_lru"]]);
+  const lruMetrics = lruRegistry.metrics();
+  assert.equal(lruMetrics.lruEvictions, 1);
+  assert.equal(lruMetrics.capacityEvictions, 0);
+  assert.equal(lruMetrics.capacityRejections, 0);
+
+  // Every session in flight (or pending close): still rejected.
+  for (let i = 0; i < 256; i += 1) {
+    if (i === 1) continue;
+    assert.equal(lruRegistry.beginRequest(`lru-${i}`), true);
+  }
+  assert.equal(lruRegistry.beginRequest("lru-new"), true);
+  assert.equal(lruRegistry.admitRegistration(), false);
+  assert.equal(lruRegistry.metrics().capacityRejections, 1);
+  const lruRejected = createTransport();
+  assert.deepEqual(lruRegistry.register("lru-rejected", lruRejected), {
+    accepted: false,
+    reason: "capacity_exhausted",
+  });
+  assert.equal(lruRegistry.metrics().capacityRejections, 2);
+  assert.equal(lruRegistry.metrics().lruEvictions, 1);
+}
+
+{
+  // Idle path stays first and is counted as capacityEvictions, not lruEvictions.
+  let idleNow = 0;
+  const idleDisposals: Array<[string, string]> = [];
+  const idleRegistry = new McpSessionRegistry<FakeTransport>({
+    now: () => idleNow,
+    maxSessions: 2,
+    idleTimeoutMs: 100,
+    onDispose: (sessionId, _transport, reason) => idleDisposals.push([sessionId, reason]),
+  });
+  idleRegistry.register("idle-old", createTransport());
+  idleNow = 90;
+  idleRegistry.register("idle-young", createTransport());
+  idleNow = 150;
+  assert.deepEqual(idleRegistry.register("idle-new", createTransport()), { accepted: true, evicted: 1 });
+  assert.deepEqual(idleDisposals, [["idle-old", "capacity_eviction"]]);
+  assert.equal(idleRegistry.metrics().capacityEvictions, 1);
+  assert.equal(idleRegistry.metrics().lruEvictions, 0);
+}
