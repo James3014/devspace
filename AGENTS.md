@@ -133,3 +133,5 @@ Start at the boundary named by the problem and follow the data. Keep policy in D
 - For mutation work tracked by a repository-local GitHub Issue, run `nexus-certify issue-init --issue <N>` before relying on Issue-bound completion evidence, and run `nexus-certify issue-check --issue <N>` before claiming engineering completion.
 - This binding is Evidence Trust + Completion only. It does not select the execution lane, route, worker/model, Candidate acceptance, merge, release, deployment, or production authority.
 - DIRECT work remains transport-neutral. A Core mutation session is not required solely because repository files are being changed.
+
+New issues must be opened from the issue template so the Nexus Core evidence-universe marker is present (from the CLI: `gh issue create --template task.md`). After any change to `.nexus-core/config.toml`, regenerate the marker with `nexus-certify markers` and update the template. PRs bind to their issue with `<!-- NEXUS_CORE_ISSUE: N -->`.
