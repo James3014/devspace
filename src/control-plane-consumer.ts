@@ -83,6 +83,15 @@ export class ControlPlaneConsumer {
     if(!binding || binding.role!=="controller" || binding.requestHash!==subject.requestHash || subject.operation!=="cutover_start" || action.action!=="finish") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover finish requires exact controller binding");
     const lease=this.ownership.get(binding.leaseId);
     const now=(this.options.now??Date.now)();
+    if(lease && terminalReplay && !recoveryReceipt && lease.terminalState==="released") {
+      // Terminal replay after the finish itself released the lease: authority only, no lease mutation.
+      const approvedReplay=JSON.parse(JSON.stringify(action)) as CutoverLifecycleAction;
+      for(const value of Object.values(approvedReplay)) if(value&&typeof value==="object") Object.freeze(value);
+      if(this.options.approveCutoverLifecycle?.(context,Object.freeze({...subject}),Object.freeze(approvedReplay))!==true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","explicit cutover lifecycle approval required");
+      const rootPath=realpathSync.native(subject.workspaceRoot).replaceAll("\\","/");
+      if(lease.leaseId!==binding.leaseId || lease.operation!==subject.operation || lease.baseRevision!==subject.baseRevision || lease.operationHandle!==undefined || lease.operationState!=="finished" || lease.resource!==rootPath || lease.scope.length!==1 || lease.scope[0]!==rootPath || JSON.stringify(this.options.resolveEffectBinding(context,Object.freeze({...subject})))!==JSON.stringify(binding)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay released lease changed");
+      return {binding:{...binding},recovery:false};
+    }
     if(lease && Date.parse(lease.expiresAt)>now && !recoveryReceipt) return {binding:this.authorizeCutoverLifecycle(context,subject,action,!terminalReplay),recovery:false};
     if(terminalReplay!==!!recoveryReceipt) throw new ControlPlaneOwnershipError("CAS_CONFLICT","expired finish replay lacks exact recovery receipt");
     const approved=JSON.parse(JSON.stringify(action)) as CutoverLifecycleAction;
@@ -176,6 +185,13 @@ export class ControlPlaneConsumer {
     if (current.leaseId !== binding.leaseId || current.leaseVersion !== pinnedVersion || current.role !== binding.role || current.authorityVersion !== binding.authorityVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "effect completion authority changed");
     const lease = this.ownership.get(binding.leaseId);
     if (lease?.operationHandle !== subject.operationId || lease.version !== pinnedVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "operation pin changed");
+  }
+
+  /** Bound cutover finish: clears the operation pin and releases the lease in one ownership step chain (caller holds the store transaction). */
+  finishAndRelease(context: unknown, subject: EffectSubject, binding: EffectBinding, pinnedVersion: number) {
+    this.assertPinned(context, subject, binding, pinnedVersion);
+    const finished=this.ownership.finishOperation(context, binding.leaseId, pinnedVersion, subject.operationId);
+    return this.ownership.release(context, binding.leaseId, finished.version);
   }
 
   finish(context: unknown, subject: EffectSubject, binding: EffectBinding, pinnedVersion: number): void {

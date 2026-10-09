@@ -301,7 +301,7 @@ test("terminal hygiene releases the exact active prepared-replacement cutover le
     const terminalLease=f.store.ownership.get(acquired.leaseId)!;
     assert.equal(terminalLease.operationState,"finished");
     assert.equal(terminalLease.operationHandle,undefined);
-    assert.equal(terminalLease.terminalState,undefined);
+    assert.equal(terminalLease.terminalState,"released");
     assert.equal(manager.store.getByOperationId(start.operationId)?.receipt?.terminalRecordHash,terminalHash);
 
     const revoked=f.store.revokeLocal(approved.id,1);
@@ -311,15 +311,15 @@ test("terminal hygiene releases the exact active prepared-replacement cutover le
     const released=f.store.releaseClosedCutoverLeaseLocal({
       cutoverId,
       leaseId:acquired.leaseId,
-      expectedLeaseVersion:terminalLease.version,
+      expectedLeaseVersion:terminalLease.version-1,
       carrierId:approved.id,
       expectedCarrierVersion:2,
       expectedTerminalRecordHash:terminalHash,
       confirmCutoverId:cutoverId,
     });
-    assert.equal(released.replayed,false);
+    assert.equal(released.replayed,true);
     assert.equal(released.lease.terminalState,"released");
-    assert.equal(released.lease.version,terminalLease.version+1);
+    assert.equal(released.lease.version,terminalLease.version);
     assert.equal(released.lease.operationState,"finished");
     assert.equal(released.lease.operationHandle,undefined);
   } finally {
@@ -1881,10 +1881,12 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     const terminalLease=f.store.ownership.get(acquired.leaseId)!;
     assert.equal(terminalLease.operationState,"finished");
     assert.equal(terminalLease.operationHandle,undefined);
-    assert.equal(terminalLease.terminalState,undefined);
+    // #472: finishCutover itself releases the lease; release-terminal-lease is then an exact replay.
+    assert.equal(terminalLease.terminalState,"released");
+    const preReleaseVersion=terminalLease.version-1;
 
     assert.throws(()=>f.store.releaseClosedCutoverLeaseLocal({
-      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,
       carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
     }),/revoked/i);
 
@@ -1896,24 +1898,24 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     const beforeCutover=JSON.stringify(new CutoverStateStore(f.root).get());
     const beforeOperation=JSON.stringify(terminalOperation);
     for(const invalid of [
-      {leaseId:"lease_wrong",expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
-      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version+1,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
-      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:3,expectedTerminalRecordHash:terminalHash},
-      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:2,expectedTerminalRecordHash:"0".repeat(64)},
+      {leaseId:"lease_wrong",expectedLeaseVersion:preReleaseVersion,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,expectedCarrierVersion:3,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,expectedCarrierVersion:2,expectedTerminalRecordHash:"0".repeat(64)},
     ]) {
       assert.throws(()=>f.store.releaseClosedCutoverLeaseLocal({
         cutoverId,carrierId:approved.id,confirmCutoverId:cutoverId,...invalid,
       }));
-      assert.equal(f.store.ownership.get(acquired.leaseId)?.terminalState,undefined);
+      assert.equal(f.store.ownership.get(acquired.leaseId)?.terminalState,"released");
     }
 
     const released=f.store.releaseClosedCutoverLeaseLocal({
-      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,
       carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
     });
-    assert.equal(released.replayed,false);
+    assert.equal(released.replayed,true);
     assert.equal(released.lease.terminalState,"released");
-    assert.equal(released.lease.version,terminalLease.version+1);
+    assert.equal(released.lease.version,terminalLease.version);
     assert.equal(released.lease.operationState,"finished");
     assert.equal(released.lease.operationHandle,undefined);
     assert.equal(JSON.stringify(new CutoverStateStore(f.root).get()),beforeCutover);
@@ -1922,7 +1924,7 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     finalOperations.close();
 
     const replay=f.store.releaseClosedCutoverLeaseLocal({
-      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,
       carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
     });
     assert.equal(replay.replayed,true);
