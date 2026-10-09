@@ -85,7 +85,7 @@ import {
   probeTargetPackage,
 } from "./cutover-build-ready.js";
 import type { ExpectedCutoverIdentity } from "./cutover-state.js";
-import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
+import { performLocalBoundCutoverFinish, performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "cutover" | "carrier" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -872,6 +872,10 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     await runCutoverRestartBound(args.slice(1));
     return;
   }
+  if (subcommand === "finish-bound") {
+    await runCutoverFinishBound(args.slice(1));
+    return;
+  }
   if (subcommand === "release-terminal-lease") {
     runCutoverReleaseTerminalLease(args.slice(1));
     return;
@@ -880,7 +884,7 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-expired-drained|recover-capability-mismatch|recover-failed-activation|recover-unexpected-replacement|restart-bound|release-terminal-lease>");
+  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-expired-drained|recover-capability-mismatch|recover-failed-activation|recover-unexpected-replacement|restart-bound|finish-bound|release-terminal-lease>");
 }
 
 function printCutoverHelp(): void {
@@ -899,6 +903,7 @@ function printCutoverHelp(): void {
       "  devspace cutover recover-failed-activation --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover recover-unexpected-replacement --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --package-root <path> --confirm <id> [--json]",
+      "  devspace cutover finish-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --workspace-id <id> --agent-id <id> --confirm <id> [--json]",
       "  devspace cutover release-terminal-lease --cutover-id <id> --lease-id <id> --lease-version <n> --carrier <id> --carrier-version <n> --terminal-record-hash <sha256> --confirm <id> [--json]",
       "",
       "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
@@ -908,6 +913,39 @@ function printCutoverHelp(): void {
       "the cutover without replaying the restart.",
     ].join("\n"),
   );
+}
+
+function readCarrierCredentialIntent(
+  credentialFile: string,
+  carrierId: string,
+  version: number,
+  validityVersion: number,
+  purpose = "restart",
+): { credential: string } {
+  const stats = lstatSync(credentialFile);
+  if (!stats.isFile() || stats.isSymbolicLink() ||
+      (process.platform !== "win32" && ((stats.mode & 0o077) !== 0 ||
+        (typeof process.getuid === "function" && stats.uid !== process.getuid())))) {
+    throw new Error("Carrier credential intent file must be an owner-private regular file");
+  }
+  const intent = JSON.parse(readFileSync(credentialFile, "utf8")) as {
+    schema?: unknown;
+    carrierId?: unknown;
+    expectedVersion?: unknown;
+    expectedValidityVersion?: unknown;
+    expectedCredentialHash?: unknown;
+    credential?: unknown;
+  };
+  if (intent.schema !== "devspace.carrier_credential_rotation.v1" ||
+      intent.carrierId !== carrierId ||
+      intent.expectedVersion !== version ||
+      intent.expectedValidityVersion !== validityVersion ||
+      typeof intent.expectedCredentialHash !== "string" || !/^[a-f0-9]{64}$/.test(intent.expectedCredentialHash) ||
+      typeof intent.credential !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(intent.credential) ||
+      Object.keys(intent).sort().join(",") !== "carrierId,credential,expectedCredentialHash,expectedValidityVersion,expectedVersion,schema") {
+    throw new Error(`Carrier credential intent file does not match the requested bound ${purpose}`);
+  }
+  return { credential: intent.credential };
 }
 
 async function runCutoverRestartBound(args: string[]): Promise<void> {
@@ -943,29 +981,7 @@ async function runCutoverRestartBound(args: string[]): Promise<void> {
     throw new Error(usage);
   }
 
-  const stats = lstatSync(credentialFile);
-  if (!stats.isFile() || stats.isSymbolicLink() ||
-      (process.platform !== "win32" && ((stats.mode & 0o077) !== 0 ||
-        (typeof process.getuid === "function" && stats.uid !== process.getuid())))) {
-    throw new Error("Carrier credential intent file must be an owner-private regular file");
-  }
-  const intent = JSON.parse(readFileSync(credentialFile, "utf8")) as {
-    schema?: unknown;
-    carrierId?: unknown;
-    expectedVersion?: unknown;
-    expectedValidityVersion?: unknown;
-    expectedCredentialHash?: unknown;
-    credential?: unknown;
-  };
-  if (intent.schema !== "devspace.carrier_credential_rotation.v1" ||
-      intent.carrierId !== carrierId ||
-      intent.expectedVersion !== version ||
-      intent.expectedValidityVersion !== validityVersion ||
-      typeof intent.expectedCredentialHash !== "string" || !/^[a-f0-9]{64}$/.test(intent.expectedCredentialHash) ||
-      typeof intent.credential !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(intent.credential) ||
-      Object.keys(intent).sort().join(",") !== "carrierId,credential,expectedCredentialHash,expectedValidityVersion,expectedVersion,schema") {
-    throw new Error("Carrier credential intent file does not match the requested bound restart");
-  }
+  const intent = readCarrierCredentialIntent(credentialFile, carrierId, version!, validityVersion!);
 
   try {
     const result = await performLocalBoundCutoverRestart({
@@ -996,6 +1012,70 @@ async function runCutoverRestartBound(args: string[]): Promise<void> {
   }
 }
 
+
+async function runCutoverFinishBound(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let carrierId: string | undefined;
+  let version: number | undefined;
+  let validityVersion: number | undefined;
+  let credentialFile: string | undefined;
+  let workspaceId: string | undefined;
+  let agentId: string | undefined;
+  let confirmCutoverId: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--carrier") carrierId = value();
+    else if (argument === "--version") version = Number(value());
+    else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--credential-file") credentialFile = resolve(value());
+    else if (argument === "--workspace-id") workspaceId = value();
+    else if (argument === "--agent-id") agentId = value();
+    else if (argument === "--confirm") confirmCutoverId = value();
+    else throw new Error(`Unknown cutover finish-bound flag: ${argument}`);
+  }
+  const usage = "Usage: devspace cutover finish-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --workspace-id <id> --agent-id <id> --confirm <id> [--json]";
+  if (!cutoverId || !carrierId || !credentialFile || !workspaceId || !agentId || confirmCutoverId !== cutoverId ||
+      !Number.isSafeInteger(version) || (version ?? 0) < 1 ||
+      !Number.isSafeInteger(validityVersion) || (validityVersion ?? 0) < 1) {
+    throw new Error(usage);
+  }
+  const intent = readCarrierCredentialIntent(credentialFile, carrierId, version!, validityVersion!, "finish");
+  try {
+    const result = await performLocalBoundCutoverFinish({
+      config: loadConfig(),
+      cutoverId,
+      carrierId,
+      expectedCarrierVersion: version!,
+      expectedValidityVersion: validityVersion!,
+      carrierCredential: intent.credential,
+      confirmCutoverId,
+      workspaceId,
+      agentId,
+    });
+    const payload = {
+      cutoverId: result.record.cutoverId,
+      phase: result.record.phase,
+      liveIdentity: result.liveIdentity,
+      witnessWorkspaceId: workspaceId,
+      witnessAgentId: agentId,
+    };
+    if (json) {
+      printJson(payload);
+      return;
+    }
+    console.log(`Bound cutover finish ${payload.cutoverId}: phase=${payload.phase}; server=${result.liveIdentity.serverInstanceId}.`);
+  } finally {
+    try { unlinkSync(credentialFile); } catch {}
+  }
+}
 
 function runCutoverReleaseTerminalLease(args: string[]): void {
   let cutoverId: string | undefined;

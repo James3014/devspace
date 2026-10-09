@@ -115,6 +115,22 @@ for (const args of [
 
 
 for (const args of [
+  ["cutover", "finish-bound", "--cutover-id", "c"],
+  ["cutover", "finish-bound", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--credential-file", "/tmp/missing", "--workspace-id", "w", "--confirm", "c"],
+  ["cutover", "finish-bound", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--credential-file", "/tmp/missing", "--workspace-id", "w", "--agent-id", "a", "--confirm", "other"],
+  ["cutover", "finish-bound", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--credential", "forbidden-raw-secret", "--workspace-id", "w", "--agent-id", "a", "--confirm", "c"],
+]) {
+  assert.throws(
+    () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-bound-finish-test" } }),
+    (error: unknown) => {
+      const detail = error as { stderr?: string; status?: number };
+      return detail.status !== 0 && /Usage:|Unknown cutover finish-bound flag/.test(detail.stderr ?? "");
+    },
+  );
+}
+
+
+for (const args of [
   ["cutover", "recover-expired-drained", "--cutover-id", "c"],
   ["cutover", "recover-expired-drained", "--cutover-id", "c", "--carrier", "carrier", "--version", "0", "--validity-version", "1", "--confirm", "c"],
   ["cutover", "recover-expired-drained", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--confirm", "other"],

@@ -11,7 +11,7 @@ import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBindin
 import { openDatabase } from "./db/client.js";
 import { CUTOVER_ACTIVATION_BINDING_SCHEMA, CutoverStateStore, type CutoverActivationBinding } from "./cutover-state.js";
 import { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
-import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
+import { performLocalBoundCutoverFinish, performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
 function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   const root=realpathSync.native(mkdtempSync(join(tmpdir(),"carrier-test-"))).replaceAll("\\","/");
@@ -1719,6 +1719,112 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
     },dependencies);
     assert.equal(replay.scheduled,false);
     assert.equal(scheduled,1);
+  } finally {
+    f.close();
+  }
+});
+
+
+test("owner-local finish-bound closes a drained activated generation only for the exact live replacement", async () => {
+  const f=fixture();
+  try {
+    const context={clientId:"shared-oauth",sessionId:"cutover-finish-controller"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={
+      stateRoot:f.root,
+      attemptKey:"bound-local-finish",
+      currentIdentity:{serverInstanceId:"live-old",sourceCommit:f.contract.baseRevision,buildId:"old-build",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new-build",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+30000).toISOString(),
+      restart:{
+        buildReady:{verifiedBy:"independent",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact target package"},
+        actuator:"launchd-self" as const,
+        serviceLabel:"test.service",
+        launchdTarget:"gui/501/test.service",
+      },
+      finish:{workspaceId:"ws_test",agentId:"agt_test"},
+    };
+    const contract:CarrierContract={...f.contract,scope:[f.root],operations:["cutover_start"],expiresAt:new Date(f.clock()+60000).toISOString(),cutover};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
+    const config=loadConfig({
+      DEVSPACE_CONFIG_DIR:join(f.root,"config"),
+      DEVSPACE_ALLOWED_ROOTS:f.workspace,
+      DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),
+      DEVSPACE_STATE_DIR:f.root,
+      DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",
+      HOST:"127.0.0.1",
+      PORT:"7677",
+    });
+    const setup=new DurableOperationManager(config,undefined,f.store.readers);
+    const start=setup.startCutover(cutover,context);
+    const cutoverId=start.receipt!.cutoverId as string;
+    setup.drainCutover(cutoverId,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    setup.close();
+    f.store.forgetSession(context.sessionId);
+
+    const activationBinding={
+      schema:CUTOVER_ACTIVATION_BINDING_SCHEMA,
+      cutoverId,
+      sourceCommit:cutover.expectedIdentity.sourceCommit,
+      buildId:cutover.expectedIdentity.buildId,
+      releaseSha256:"e".repeat(64),
+      releasePath:join(f.root,"release-target"),
+      pointerPath:join(f.root,"current-release.json"),
+      boundAt:new Date(f.clock()).toISOString(),
+    };
+    new CutoverStateStore(f.root).recordActivationBinding(cutoverId,activationBinding);
+    const health=(over:{serverInstanceId?:string;buildId?:string}={})=>({
+      build:{
+        source_commit:cutover.expectedIdentity.sourceCommit,
+        build_id:over.buildId??cutover.expectedIdentity.buildId,
+        pid:4322,
+        release_sha256:activationBinding.releaseSha256,
+        release_path:activationBinding.releasePath,
+        activation_cutover_id:cutoverId,
+      },
+      capabilityManifest:{manifestSha256:cutover.expectedIdentity.capabilityManifestSha256},
+      mcp:{serverInstanceId:over.serverInstanceId??"live-new",cutoverMode:"normal",reconciliationRequired:false},
+    });
+    const pair={workspaceId:"ws_test",agentId:"agt_test"};
+    const witness=(p:{workspaceId:string;agentId:string})=>Promise.resolve({
+      workspaceQueryable:true,agentQueryable:true,agentReconciled:true,
+      witnessWorkspaceId:p.workspaceId,witnessAgentId:p.agentId,
+      workspaceSessions:1,agentSessions:1,witnessWorkspaceSessions:1,witnessAgentSessions:1,
+      witnessKind:"exact-pair",
+    });
+    const base={
+      config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,
+      carrierCredential:pairing.credential,confirmCutoverId:cutoverId,...pair,
+    };
+
+    // Negative: the old instance, or a wrong build, is never accepted as the replacement.
+    const drainedSnapshot=f.snapshot();
+    await assert.rejects(
+      performLocalBoundCutoverFinish(base,{readHealth:async()=>health({serverInstanceId:"live-old"}),reconcile:witness}),
+      /not the exact expected replacement/i,
+    );
+    await assert.rejects(
+      performLocalBoundCutoverFinish(base,{readHealth:async()=>health({buildId:"wrong-build"}),reconcile:witness}),
+      /not the exact expected replacement/i,
+    );
+    assert.equal(f.snapshot(),drainedSnapshot);
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+
+    // Negative: a wrong credential is refused before any state change.
+    await assert.rejects(
+      performLocalBoundCutoverFinish({...base,carrierCredential:"x".repeat(43)},{readHealth:async()=>health(),reconcile:witness}),
+      /credential/i,
+    );
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+
+    const closed=await performLocalBoundCutoverFinish(base,{readHealth:async()=>health(),reconcile:witness});
+    assert.equal(closed.record.phase,"closed");
+    assert.equal(closed.liveIdentity.serverInstanceId,"live-new");
+    const stored=new CutoverStateStore(f.root).get();
+    assert.equal(stored?.phase,"closed");
+    assert.equal(stored?.reconciliationReceipt?.witnessKind,"exact-pair");
   } finally {
     f.close();
   }
