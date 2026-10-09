@@ -1066,12 +1066,14 @@ async function runCutoverFinishBound(args: string[]): Promise<void> {
       liveIdentity: result.liveIdentity,
       witnessWorkspaceId: workspaceId,
       witnessAgentId: agentId,
+      leaseId: result.leaseId,
+      leaseTerminalState: result.leaseTerminalState ?? null,
     };
     if (json) {
       printJson(payload);
       return;
     }
-    console.log(`Bound cutover finish ${payload.cutoverId}: phase=${payload.phase}; server=${result.liveIdentity.serverInstanceId}.`);
+    console.log(`Bound cutover finish ${payload.cutoverId}: phase=${payload.phase}; server=${result.liveIdentity.serverInstanceId}; lease=${payload.leaseId ?? "none"}; leaseTerminal=${payload.leaseTerminalState ?? "none"}.`);
   } finally {
     try { unlinkSync(credentialFile); } catch {}
   }
