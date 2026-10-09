@@ -24,6 +24,7 @@ export interface DevspaceUserConfig {
   subagents?: StoredSubagentsConfig;
   mcpSessionIdleTimeoutMs?: number;
   mcpSessionMaxSessions?: number;
+  mcpSessionLruMinIdleMs?: number;
   mcpCutoverBuildReadyRoot?: string;
 }
 

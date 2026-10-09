@@ -164,6 +164,7 @@ const boundedOverflow = createTransport();
 assert.deepEqual(boundedRegistry.register("overflow", boundedOverflow), {
   accepted: false,
   reason: "capacity_exhausted",
+  rejectionCause: "all_in_flight",
 });
 assert.equal(boundedRegistry.size, 3);
 assert.equal(boundedRegistry.get("oldest"), oldest);
@@ -175,6 +176,7 @@ const boundedOverflowTwo = createTransport();
 assert.deepEqual(boundedRegistry.register("overflow-two", boundedOverflowTwo), {
   accepted: false,
   reason: "capacity_exhausted",
+  rejectionCause: "all_in_flight",
 });
 assert.equal(boundedRegistry.get("oldest"), oldest);
 assert.equal(boundedRegistry.get("newest"), newest);
@@ -242,7 +244,11 @@ assert.equal(lifecycleRegistry.size, 2);
 assert.equal(lifecycleRegistry.beginRequest("lifecycle-third"), true);
 const rejectedTransport = createTransport();
 const rejectedRegistration = lifecycleRegistry.register("lifecycle-rejected", rejectedTransport);
-assert.deepEqual(rejectedRegistration, { accepted: false, reason: "capacity_exhausted" });
+assert.deepEqual(rejectedRegistration, {
+  accepted: false,
+  reason: "capacity_exhausted",
+  rejectionCause: "all_in_flight",
+});
 assert.equal(lifecycleRegistry.size, 2);
 assert.equal(lifecycleRegistry.get("lifecycle-rejected"), undefined);
 await Promise.resolve();
@@ -476,11 +482,12 @@ const preflightRegistry = new McpSessionRegistry<FakeTransport>({
   now: () => preflightNow,
   maxSessions: 1,
   idleTimeoutMs: 100,
+  lruMinIdleMs: 40,
 });
 let preflightNow = 0;
 preflightRegistry.register("preflight-resident", createTransport());
 preflightNow = 50;
-// A young idle resident is LRU-evictable, so the pre-check agrees with register().
+// A resident idle past lruMinIdleMs is LRU-evictable, so the pre-check agrees with register().
 assert.equal(preflightRegistry.canAcceptRegistration(), true);
 assert.equal(preflightRegistry.beginRequest("preflight-resident"), true);
 assert.equal(preflightRegistry.admitRegistration(), false);
@@ -489,6 +496,7 @@ const postPreflightTransport = createTransport();
 assert.deepEqual(preflightRegistry.register("post-preflight", postPreflightTransport), {
   accepted: false,
   reason: "capacity_exhausted",
+  rejectionCause: "all_in_flight",
 });
 await Promise.resolve();
 assert.equal(preflightRegistry.metrics().capacityRejections, 2);
@@ -570,6 +578,7 @@ assert.equal(closingRegistry.acknowledgeToolsList("closing", currentSnapshot), f
     now: () => lruNow,
     maxSessions: 256,
     idleTimeoutMs: 1_800_000,
+    lruMinIdleMs: 500,
     onDispose: (sessionId, _transport, reason) => lruDisposals.push([sessionId, reason]),
   });
   const lruTransports: FakeTransport[] = [];
@@ -608,6 +617,7 @@ assert.equal(closingRegistry.acknowledgeToolsList("closing", currentSnapshot), f
   assert.deepEqual(lruRegistry.register("lru-rejected", lruRejected), {
     accepted: false,
     reason: "capacity_exhausted",
+    rejectionCause: "all_in_flight",
   });
   assert.equal(lruRegistry.metrics().capacityRejections, 2);
   assert.equal(lruRegistry.metrics().lruEvictions, 1);
@@ -631,4 +641,101 @@ assert.equal(closingRegistry.acknowledgeToolsList("closing", currentSnapshot), f
   assert.deepEqual(idleDisposals, [["idle-old", "capacity_eviction"]]);
   assert.equal(idleRegistry.metrics().capacityEvictions, 1);
   assert.equal(idleRegistry.metrics().lruEvictions, 0);
+}
+
+// Issue #467: LRU eviction at capacity requires a minimum idle age.
+{
+  const fillRegistry = (lruMinIdleMs: number, clock: { now: number }) => {
+    const registry = new McpSessionRegistry<FakeTransport>({
+      now: () => clock.now,
+      maxSessions: 256,
+      idleTimeoutMs: 1_800_000,
+      lruMinIdleMs,
+    });
+    const transports: FakeTransport[] = [];
+    for (let i = 0; i < 256; i += 1) {
+      const transport = createTransport();
+      transports.push(transport);
+      assert.equal(registry.register(`min-${i}`, transport).accepted, true);
+    }
+    return { registry, transports };
+  };
+
+  // (a) Young sessions stay protected.
+  {
+    const clock = { now: 0 };
+    const { registry, transports } = fillRegistry(60_000, clock);
+    clock.now = 10_000;
+    assert.equal(registry.canAcceptRegistration(), false);
+    assert.equal(registry.admitRegistration(), false);
+    assert.equal(registry.capacityRejectionCause(), "no_session_idle_min");
+    assert.equal(registry.metrics().capacityRejections, 1);
+    const rejected = createTransport();
+    assert.deepEqual(registry.register("min-new", rejected), {
+      accepted: false,
+      reason: "capacity_exhausted",
+      rejectionCause: "no_session_idle_min",
+    });
+    const metrics = registry.metrics();
+    assert.equal(metrics.capacityRejections, 2);
+    assert.equal(metrics.lruEvictions, 0);
+    assert.equal(metrics.capacityEvictions, 0);
+    assert.equal(registry.size, 256);
+    assert.equal(transports.every((t) => t.closeCalls === 0), true);
+  }
+
+  // (b) Sessions idle past the minimum are evicted LRU-first, no rejection.
+  {
+    const clock = { now: 0 };
+    const { registry, transports } = fillRegistry(60_000, clock);
+    clock.now = 90_000;
+    assert.equal(registry.admitRegistration(), true);
+    assert.deepEqual(registry.register("min-new", createTransport()), { accepted: true, evicted: 1 });
+    await Promise.resolve();
+    const metrics = registry.metrics();
+    assert.equal(metrics.lruEvictions, 1);
+    assert.equal(metrics.capacityRejections, 0);
+    assert.equal(transports[0].closeCalls, 1);
+    assert.equal(registry.get("min-0"), undefined);
+  }
+
+  // Boundary: exactly lruMinIdleMs idle is evictable; one tick younger is not.
+  {
+    const clock = { now: 0 };
+    const { registry } = fillRegistry(60_000, clock);
+    clock.now = 59_999;
+    assert.equal(registry.canAcceptRegistration(), false);
+    clock.now = 60_000;
+    assert.equal(registry.canAcceptRegistration(), true);
+  }
+
+  // (c) All in flight is reported distinctly from the young-session case.
+  {
+    const clock = { now: 0 };
+    const { registry } = fillRegistry(60_000, clock);
+    clock.now = 90_000;
+    for (let i = 0; i < 256; i += 1) assert.equal(registry.beginRequest(`min-${i}`), true);
+    clock.now = 200_000;
+    assert.equal(registry.admitRegistration(), false);
+    assert.equal(registry.capacityRejectionCause(), "all_in_flight");
+    assert.deepEqual(registry.register("min-new", createTransport()), {
+      accepted: false,
+      reason: "capacity_exhausted",
+      rejectionCause: "all_in_flight",
+    });
+    assert.equal(registry.metrics().lruEvictions, 0);
+  }
+
+  // Mixed: one in-flight old session plus young idle sessions is still "no_session_idle_min".
+  {
+    const clock = { now: 0 };
+    const { registry } = fillRegistry(60_000, clock);
+    clock.now = 100_000;
+    assert.equal(registry.beginRequest("min-0"), true);
+    // beginRequest refreshes min-0; all others are now old enough, so touch them young again.
+    for (let i = 1; i < 256; i += 1) assert.equal(registry.get(`min-${i}`) !== undefined, true);
+    clock.now = 110_000;
+    assert.equal(registry.capacityRejectionCause(), "no_session_idle_min");
+    assert.equal(registry.canAcceptRegistration(), false);
+  }
 }
