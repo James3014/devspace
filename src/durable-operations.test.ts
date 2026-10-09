@@ -12,6 +12,8 @@ import type { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { loadConfig } from "./config.js";
 import { CutoverStateStore } from "./cutover-state.js";
+import { openDatabase } from "./db/client.js";
+import { initializeControlPlaneOwnershipDatabase } from "./control-plane-ownership.js";
 import { canonicalizePath } from "./roots.js";
 import {
   DurableOperationError,
@@ -573,6 +575,47 @@ test("C4 cannot archive a closed Carrier generation while its durable lease term
       status: "succeeded", retrySafe: false,
       receipt: {cutoverId: existing.cutoverId, lifecycleTerminal: true, terminalRecordHash: cutoverTerminalRecordHash(state.get()!)},
     });
+    assert.throws(() => manager.startDirectCutover(next), /legacy.*lease.*terminal|terminal.*lease/i,
+      "a matching operation receipt cannot waive the original Carrier lease release");
+    assert.equal(state.get()?.cutoverId, existing.cutoverId);
+
+    const db = openDatabase(f.config.stateDir);
+    try {
+      initializeControlPlaneOwnershipDatabase(db.sqlite);
+      const now = new Date().toISOString();
+      db.sqlite.prepare(`insert into control_plane_resource_leases (
+        lease_id,repository_key,resource_kind,resource_id,resource,operation,scope_json,base_revision,
+        idempotency_key,owner_thread,grant_json,grant_version,version,terminal_state,expires_at,
+        created_at,updated_at,active_operation_handle,operation_state
+      ) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+        coordinationBinding.leaseId, "james3014/devspace", "filesystem", plan.stateRoot, plan.stateRoot,
+        "cutover_start", JSON.stringify([plan.stateRoot]), old.currentIdentity.sourceCommit,
+        old.attemptKey, coordinationBinding.ownerThread,
+        JSON.stringify({
+          repository: "james3014/devspace", goal: "legacy-closure-fixture",
+          coordinatorThread: coordinationBinding.ownerThread, evidenceHash: "fixture",
+        }),
+        1, 3, null, "2100-01-01T00:00:00.000Z", now, now, null, "finished",
+      );
+      assert.throws(() => manager.startDirectCutover(next), /legacy.*lease.*terminal|terminal.*lease/i,
+        "a finished operation with an unreleased state-root lease must remain recoverable");
+      db.sqlite.prepare("update control_plane_resource_leases set terminal_state='released', version=version+1 where lease_id=?")
+        .run(coordinationBinding.leaseId);
+      db.sqlite.prepare("update control_plane_resource_leases set owner_thread='wrong-owner' where lease_id=?")
+        .run(coordinationBinding.leaseId);
+      assert.throws(() => manager.startDirectCutover(next), /legacy.*lease.*terminal|terminal.*lease/i,
+        "released lease owned by another historical principal cannot authorize archival");
+      db.sqlite.prepare("update control_plane_resource_leases set owner_thread=? where lease_id=?")
+        .run(coordinationBinding.ownerThread, coordinationBinding.leaseId);
+      db.sqlite.prepare("update control_plane_resource_leases set resource='/wrong-resource' where lease_id=?")
+        .run(coordinationBinding.leaseId);
+      assert.throws(() => manager.startDirectCutover(next), /legacy.*lease.*terminal|terminal.*lease/i,
+        "released lease for another resource cannot authorize archival");
+      db.sqlite.prepare("update control_plane_resource_leases set resource=? where lease_id=?")
+        .run(plan.stateRoot, coordinationBinding.leaseId);
+    } finally {
+      db.close();
+    }
     const after = manager.startDirectCutover(next);
     assert.equal(after.status, "succeeded");
     assert.equal(state.get()?.directOperation?.operationId, after.operationId);

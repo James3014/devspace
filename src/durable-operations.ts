@@ -124,6 +124,33 @@ export class DurableOperationStore {
     this.database.close();
   }
 
+  /**
+   * Read-only historical Carrier lease projection. An OWNER_DIRECT store may
+   * never have initialized Carrier tables, so absence must fail closed without
+   * creating schema (especially while an atomic cutover preflight is running).
+   */
+  readHistoricalLease(leaseId: string) {
+    const table = this.database.sqlite.prepare(
+      "select 1 from sqlite_master where type='table' and name='control_plane_resource_leases'",
+    ).get();
+    if (!table) return undefined;
+    return this.database.sqlite.prepare(`
+      select lease_id, owner_thread, operation, base_revision, resource, scope_json,
+        terminal_state, operation_state, active_operation_handle
+      from control_plane_resource_leases where lease_id=? limit 1
+    `).get(leaseId) as {
+      lease_id: string;
+      owner_thread: string;
+      operation: string;
+      base_revision: string;
+      resource: string;
+      scope_json: string;
+      terminal_state: string | null;
+      operation_state: string | null;
+      active_operation_handle: string | null;
+    } | undefined;
+  }
+
   createOwnershipStore(options: ControlPlaneConsumerOptions): ControlPlaneOwnershipStore {
     return new ControlPlaneOwnershipStore(this.database.sqlite, {
       ...options,
@@ -634,7 +661,27 @@ export class DurableOperationManager {
         (operation.status !== "succeeded" && operation.status !== "failed")) {
       throw new DurableOperationError(
         "RECONCILIATION_REQUIRED",
-        "Closed legacy Carrier-bound cutover cannot be archived until its exact terminal operation and lease are durable.",
+        "Closed legacy Carrier-bound cutover cannot be archived until its exact terminal operation is durable.",
+        operation,
+      );
+    }
+    // The old Carrier finish on deployed releases could record the terminal
+    // operation without releasing the state-root lease. Archiving its only
+    // active journal would strand the legacy release-terminal-lease recovery.
+    const lease = this.store.readHistoricalLease(binding.leaseId);
+    if (!lease ||
+        lease.lease_id !== binding.leaseId ||
+        !["released", "expired_reconciled"].includes(lease.terminal_state ?? "") ||
+        lease.operation_state !== "finished" ||
+        lease.active_operation_handle !== null ||
+        lease.owner_thread !== binding.ownerThread ||
+        lease.operation !== "cutover_start" ||
+        lease.base_revision !== operation.request.baseRevision ||
+        lease.resource !== stateRoot ||
+        lease.scope_json !== JSON.stringify([stateRoot])) {
+      throw new DurableOperationError(
+        "RECONCILIATION_REQUIRED",
+        "Closed legacy Carrier lease is not terminal; release or reconcile its exact lease before a new direct cutover.",
         operation,
       );
     }
