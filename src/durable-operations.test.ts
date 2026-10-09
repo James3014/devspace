@@ -17,6 +17,7 @@ import {
   DurableOperationError,
   DurableOperationManager,
   DurableOperationStore,
+  cutoverTerminalRecordHash,
   planCutoverStart,
   hashJson,
   type CommandRunner,
@@ -477,6 +478,69 @@ test("C4 refuses to downgrade a persisted Carrier-bound cutover into new OWNER_D
     assert.equal(new CutoverStateStore(f.config.stateDir).get()?.directOperation, undefined);
     assert.equal(new CutoverStateStore(f.config.stateDir).get()?.cutoverId, bound.cutoverId);
     assert.throws(() => manager.reconcileDirectCutoverStart(attempt.operationId), /no retry is authorized/);
+  } finally {
+    manager.close();
+    await f.cleanup();
+  }
+});
+
+test("C4 cannot archive a closed Carrier generation while its durable lease terminalization is incomplete", async () => {
+  const f = await fixture();
+  const manager = new DurableOperationManager(f.config);
+  try {
+    const old = {
+      attemptKey: "legacy-closed-awaiting-ack",
+      currentIdentity: {serverInstanceId: "bound-owner", sourceCommit: "a".repeat(40), buildId: "old"},
+      expectedIdentity: {sourceCommit: "b".repeat(40), buildId: "old-target"},
+    };
+    const plan = planCutoverStart(f.config.stateDir, old);
+    const coordinationBinding = {
+      leaseId: "lease-legacy-closed",
+      pinnedLeaseVersion: 3,
+      operationHandle: plan.operationId,
+      requestHash: plan.requestHash,
+      ownerThread: "legacy-controller",
+    };
+    const bound = manager.store.createOrReplay({
+      operationId: plan.operationId, attemptKey: old.attemptKey,
+      requestHash: plan.requestHash, kind: "cutover_start",
+      scopeRoot: plan.stateRoot, request: {...plan.request, coordinationBinding},
+    });
+    assert.equal(bound.record.status, "started");
+    const state = new CutoverStateStore(f.config.stateDir);
+    const existing = state.begin({
+      oldServerIdentity: old.currentIdentity,
+      expectedNewIdentity: old.expectedIdentity,
+      coordinationBinding,
+    });
+    state.close(existing.cutoverId, {
+      closedByServerInstanceId: "replacement-bound", workspaceQueryable: true,
+      agentQueryable: true, agentReconciled: true, reconciledAt: new Date().toISOString(),
+    });
+    assert.equal(state.get()?.phase, "closed");
+    const next = {
+      attemptKey: "c4-new-after-terminal",
+      currentIdentity: {serverInstanceId: "replacement-bound", sourceCommit: "b".repeat(40), buildId: "old-target"},
+      expectedIdentity: {sourceCommit: "c".repeat(40), buildId: "new-target"},
+    };
+    assert.throws(() => manager.startDirectCutover(next), /bound.*terminal|legacy.*terminal|lifecycle.*terminal/i);
+    assert.equal(state.get()?.cutoverId, existing.cutoverId, "legacy recovery must remain physically addressable");
+    const nextId = planCutoverStart(f.config.stateDir, next).operationId;
+    assert.equal(manager.store.getByOperationId(nextId), undefined, "no new intent may be poisoned before legacy terminalization");
+    manager.store.finish(plan.operationId, {
+      status: "succeeded", retrySafe: false,
+      receipt: {cutoverId: existing.cutoverId, lifecycleTerminal: true, terminalRecordHash: "0".repeat(64)},
+    });
+    assert.throws(() => manager.startDirectCutover(next), /bound.*terminal|legacy.*terminal|digest|hash/i);
+    assert.equal(state.get()?.cutoverId, existing.cutoverId);
+    manager.store.finish(plan.operationId, {
+      status: "succeeded", retrySafe: false,
+      receipt: {cutoverId: existing.cutoverId, lifecycleTerminal: true, terminalRecordHash: cutoverTerminalRecordHash(state.get()!)},
+    });
+    const after = manager.startDirectCutover(next);
+    assert.equal(after.status, "succeeded");
+    assert.equal(state.get()?.directOperation?.operationId, after.operationId);
+    assert.notEqual(state.get()?.cutoverId, existing.cutoverId);
   } finally {
     manager.close();
     await f.cleanup();

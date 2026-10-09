@@ -610,6 +610,32 @@ export class DurableOperationManager {
   }
 
   /**
+   * A closed Carrier-bound cutover can still have an unfinished SQLite/lease
+   * terminalization after its file is closed. Archiving that file prematurely
+   * would strand the original generation and make bound recovery impossible.
+   */
+  private assertLegacyBoundCutoverIsTerminal(stateRoot: string): void {
+    const existing = new CutoverStateStore(stateRoot).get();
+    if (!existing?.coordinationBinding || existing.phase !== "closed") return;
+    const binding = existing.coordinationBinding;
+    const operation = this.store.getByOperationId(binding.operationHandle);
+    if (!operation || operation.kind !== "cutover_start" ||
+        operation.scopeRoot !== stateRoot ||
+        operation.requestHash !== binding.requestHash ||
+        !isDeepStrictEqual(operation.request.coordinationBinding, binding) ||
+        operation.receipt?.cutoverId !== existing.cutoverId ||
+        operation.receipt?.lifecycleTerminal !== true ||
+        operation.receipt?.terminalRecordHash !== cutoverTerminalRecordHash(existing) ||
+        (operation.status !== "succeeded" && operation.status !== "failed")) {
+      throw new DurableOperationError(
+        "RECONCILIATION_REQUIRED",
+        "Closed legacy Carrier-bound cutover cannot be archived until its exact terminal operation and lease are durable.",
+        operation,
+      );
+    }
+  }
+
+  /**
    * New cutovers are DevSpace-native effects, not Carrier-governed actions.
    * The intent is durably recorded before the cutover file is written; the
    * two independent stores are tied by an exact operation/request digest.
@@ -619,6 +645,9 @@ export class DurableOperationManager {
     const { snapshot, stateRoot, operationId } = planned;
     const request = { ...planned.request, ownerDirect: true };
     const requestHash = hashJson(request);
+    // This is a pre-intent admission gate: known historical recovery blockers
+    // must not poison a new direct attempt with an outcome_unknown record.
+    this.assertLegacyBoundCutoverIsTerminal(stateRoot);
     const intent = this.store.createOrReplay({
       operationId,
       attemptKey: snapshot.attemptKey,
@@ -633,6 +662,9 @@ export class DurableOperationManager {
         if (!isDeepStrictEqual(this.store.getByOperationId(operationId), intent.record)) {
           throw new ControlPlaneOwnershipError("CAS_CONFLICT", "direct cutover intent changed before file write");
         }
+        // Recheck under the durable transaction immediately before changing
+        // the separate cutover file, including late terminal receipt changes.
+        this.assertLegacyBoundCutoverIsTerminal(stateRoot);
         const controller = new McpCutoverController(new CutoverStateStore(stateRoot), snapshot.currentIdentity);
         controller.begin(snapshot.expectedIdentity, snapshot.expiresAt, undefined, { operationId, requestHash });
         return this.reconcileDirectCutoverStart(operationId);
