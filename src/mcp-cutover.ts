@@ -6,6 +6,7 @@ import type { SelfRestartActuator } from "./cutover-restart.js";
 import type {
   BuildReadyReceipt,
   CutoverCoordinationBinding,
+  CutoverDirectOperationBinding,
   CutoverBindingRepairReceipt,
   CutoverActivationBinding,
   CutoverDrainEvidence,
@@ -193,12 +194,13 @@ export class McpCutoverController {
     private readonly now: () => number = Date.now,
   ) {}
 
-  begin(expectedNewIdentity: ExpectedCutoverIdentity, expiresAt?: string, coordinationBinding?: CutoverCoordinationBinding): DurableCutoverRecord {
+  begin(expectedNewIdentity: ExpectedCutoverIdentity, expiresAt?: string, coordinationBinding?: CutoverCoordinationBinding, directOperation?: CutoverDirectOperationBinding): DurableCutoverRecord {
     return this.store.begin({
       oldServerIdentity: this.currentIdentity,
       expectedNewIdentity,
       expiresAt,
       coordinationBinding,
+      directOperation,
     });
   }
 

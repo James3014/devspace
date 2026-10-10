@@ -3,7 +3,7 @@ import type { SelfRestartActuator } from "./cutover-restart.js";
 import type { CompletionSelection } from "./current-completion-matrix.js";
 import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
-import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding, type CutoverActivationBinding } from "./cutover-state.js";
+import { CutoverStateError, CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding, type CutoverActivationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput, type TakeoverInput, type ReconciliationReceipt } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
@@ -124,6 +124,33 @@ export class DurableOperationStore {
     this.database.close();
   }
 
+  /**
+   * Read-only historical Carrier lease projection. An OWNER_DIRECT store may
+   * never have initialized Carrier tables, so absence must fail closed without
+   * creating schema (especially while an atomic cutover preflight is running).
+   */
+  readHistoricalLease(leaseId: string) {
+    const table = this.database.sqlite.prepare(
+      "select 1 from sqlite_master where type='table' and name='control_plane_resource_leases'",
+    ).get();
+    if (!table) return undefined;
+    return this.database.sqlite.prepare(`
+      select lease_id, owner_thread, operation, base_revision, resource, scope_json,
+        terminal_state, operation_state, active_operation_handle
+      from control_plane_resource_leases where lease_id=? limit 1
+    `).get(leaseId) as {
+      lease_id: string;
+      owner_thread: string;
+      operation: string;
+      base_revision: string;
+      resource: string;
+      scope_json: string;
+      terminal_state: string | null;
+      operation_state: string | null;
+      active_operation_handle: string | null;
+    } | undefined;
+  }
+
   createOwnershipStore(options: ControlPlaneConsumerOptions): ControlPlaneOwnershipStore {
     return new ControlPlaneOwnershipStore(this.database.sqlite, {
       ...options,
@@ -198,6 +225,21 @@ export class DurableOperationStore {
           "select * from durable_operations order by updated_at desc",
         ).all()) as DurableOperationRow[];
     return rows.map(rowToRecord);
+  }
+
+  /** Lightweight startup query; historical records remain immutable. */
+  hasLegacyBoundOperations(): boolean {
+    return this.database.sqlite.prepare(`
+      select 1 from durable_operations
+      where (kind = 'cutover_start'
+             and json_type(request_json, '$.coordinationBinding') = 'object'
+             and (status != 'succeeded' or json_extract(receipt_json, '$.lifecycleTerminal') is not 1))
+         or (kind = 'dependency_sync'
+             and status in ('started', 'outcome_unknown')
+             and json_extract(request_json, '$.ownerDirectIsolated') is not 1
+             and json_extract(request_json, '$.ownerDirectExecution') is not 1)
+      limit 1
+    `).get() !== undefined;
   }
 
   getByAttempt(scopeRoot: string, attemptKey: string): DurableOperationRecord | undefined {
@@ -330,8 +372,11 @@ export interface DependencySyncInput {
    * Trusted server-side admission only. Callers cannot set this through MCP.
    * Allows OWNER_DIRECT frozen dependency sync without a carrier only for a
    * DevSpace-managed isolated worktree already admitted for this conversation.
+   * Kept as a persisted discriminator for older direct operations.
    */
   ownerDirectIsolated?: boolean;
+  /** Trusted server-admitted, single-conversation checkout; never caller-supplied. */
+  ownerDirectExecution?: boolean;
 }
 
 export type CommandRunner = (
@@ -591,6 +636,155 @@ export class DurableOperationManager {
     });
   }
 
+  /**
+   * Known occupied generations must reject a new cutover before its durable
+   * attempt is created. A closed Carrier-bound generation also needs an exact
+   * terminal receipt before its file can be archived for the next generation.
+   */
+  private assertCutoverFenceAvailable(stateRoot: string): void {
+    const existing = new CutoverStateStore(stateRoot).get();
+    if (existing && existing.phase !== "closed") {
+      throw new CutoverStateError(
+        `Unresolved cutover ${existing.cutoverId} already owns the durable cutover fence.`,
+      );
+    }
+    if (!existing?.coordinationBinding) return;
+    const binding = existing.coordinationBinding;
+    const operation = this.store.getByOperationId(binding.operationHandle);
+    if (!operation || operation.kind !== "cutover_start" ||
+        operation.scopeRoot !== stateRoot ||
+        operation.requestHash !== binding.requestHash ||
+        !isDeepStrictEqual(operation.request.coordinationBinding, binding) ||
+        operation.receipt?.cutoverId !== existing.cutoverId ||
+        operation.receipt?.lifecycleTerminal !== true ||
+        operation.receipt?.terminalRecordHash !== cutoverTerminalRecordHash(existing) ||
+        (operation.status !== "succeeded" && operation.status !== "failed")) {
+      throw new DurableOperationError(
+        "RECONCILIATION_REQUIRED",
+        "Closed legacy Carrier-bound cutover cannot be archived until its exact terminal operation is durable.",
+        operation,
+      );
+    }
+    // The old Carrier finish on deployed releases could record the terminal
+    // operation without releasing the state-root lease. Archiving its only
+    // active journal would strand the legacy release-terminal-lease recovery.
+    const lease = this.store.readHistoricalLease(binding.leaseId);
+    if (!lease ||
+        lease.lease_id !== binding.leaseId ||
+        !["released", "expired_reconciled"].includes(lease.terminal_state ?? "") ||
+        lease.operation_state !== "finished" ||
+        lease.active_operation_handle !== null ||
+        lease.owner_thread !== binding.ownerThread ||
+        lease.operation !== "cutover_start" ||
+        lease.base_revision !== operation.request.baseRevision ||
+        lease.resource !== stateRoot ||
+        lease.scope_json !== JSON.stringify([stateRoot])) {
+      throw new DurableOperationError(
+        "RECONCILIATION_REQUIRED",
+        "Closed legacy Carrier lease is not terminal; release or reconcile its exact lease before a new direct cutover.",
+        operation,
+      );
+    }
+  }
+
+  /**
+   * New cutovers are DevSpace-native effects, not Carrier-governed actions.
+   * The intent is durably recorded before the cutover file is written; the
+   * two independent stores are tied by an exact operation/request digest.
+   */
+  startDirectCutover(input: CutoverStartInput): DurableOperationRecord {
+    const planned = planCutoverStart(this.config.stateDir, input);
+    const { snapshot, stateRoot, operationId } = planned;
+    const request = { ...planned.request, ownerDirect: true };
+    const requestHash = hashJson(request);
+    // Admit a genuinely new attempt only if no older generation owns the
+    // physical cutover fence. An already-persisted attempt bypasses this
+    // preflight so that exact lost-ACK replay can still reconcile its own
+    // active generation without ever starting another effect.
+    const intent = this.store.atomic(() => {
+      if (!this.store.getByAttempt(stateRoot, snapshot.attemptKey)) {
+        this.assertCutoverFenceAvailable(stateRoot);
+      }
+      return this.store.createOrReplay({
+        operationId,
+        attemptKey: snapshot.attemptKey,
+        requestHash,
+        kind: "cutover_start",
+        scopeRoot: stateRoot,
+        request,
+      });
+    });
+    if (!intent.created) return this.reconcileDirectCutoverStart(operationId);
+    try {
+      return this.store.atomic(() => {
+        if (!isDeepStrictEqual(this.store.getByOperationId(operationId), intent.record)) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT", "direct cutover intent changed before file write");
+        }
+        // Recheck under the durable transaction immediately before changing
+        // the separate cutover file, including late terminal receipt changes.
+        // A genuinely racing effect may still be unknown; never blind retry it.
+        this.assertCutoverFenceAvailable(stateRoot);
+        const controller = new McpCutoverController(new CutoverStateStore(stateRoot), snapshot.currentIdentity);
+        controller.begin(snapshot.expectedIdentity, snapshot.expiresAt, undefined, { operationId, requestHash });
+        return this.reconcileDirectCutoverStart(operationId);
+      });
+    } catch (error) {
+      return this.store.atomic(() => {
+        if (!isDeepStrictEqual(this.store.getByOperationId(operationId), intent.record)) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT", "late direct cutover result cannot replace newer durable state");
+        }
+        return this.store.finish(operationId, {
+          status: "outcome_unknown",
+          retrySafe: false,
+          errorCode: "RECONCILIATION_REQUIRED",
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+  }
+
+  reconcileDirectCutoverStart(operationId: string): DurableOperationRecord {
+    return this.store.atomic(() => {
+      const record = this.store.getByOperationId(operationId);
+      if (!record || record.kind !== "cutover_start" ||
+          record.scopeRoot !== canonicalizePath(this.config.stateDir) ||
+          record.request.ownerDirect !== true || record.request.coordinationBinding !== undefined ||
+          record.request.stateRoot !== record.scopeRoot ||
+          typeof record.request.baseRevision !== "string" ||
+          hashJson(record.request) !== record.requestHash) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT", "direct cutover intent or resource identity is invalid");
+      }
+      const expectedBinding = { operationId, requestHash: record.requestHash };
+      const verifiedReceipt = record.receipt &&
+        isDeepStrictEqual(record.receipt.directOperation, expectedBinding) &&
+        record.receipt.startVerified === true &&
+        typeof record.receipt.cutoverId === "string";
+      // A terminally recorded start can be replayed after its generation has
+      // closed/archived. This returns only prior evidence, never a new effect.
+      if (record.status === "succeeded" && verifiedReceipt) return record;
+      const observed = new CutoverStateStore(record.scopeRoot).get();
+      if (!observed || observed.coordinationBinding !== undefined ||
+          !isDeepStrictEqual(observed.directOperation, expectedBinding) ||
+          !isDeepStrictEqual(observed.oldServerIdentity, record.request.currentIdentity) ||
+          !isDeepStrictEqual(observed.expectedNewIdentity, record.request.expectedIdentity) ||
+          observed.expiresAt !== record.request.expiresAt) {
+        throw new DurableOperationError(
+          "RECONCILIATION_REQUIRED",
+          "direct cutover lacks exact persisted operation-to-file correlation; no retry is authorized",
+          record,
+        );
+      }
+      if (!isDeepStrictEqual(this.store.getByOperationId(operationId), record)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT", "direct cutover intent changed during physical readback");
+      }
+      return this.store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt: { cutoverId: observed.cutoverId, directOperation: expectedBinding, startVerified: true, lifecycleTerminal: false },
+      });
+    });
+  }
+
   startCutover(input: CutoverStartInput, context?: unknown): DurableOperationRecord {
     if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host authority");
     const {snapshot,stateRoot,request,requestHash,operationId,subject} = planCutoverStart(this.config.stateDir,input);
@@ -821,6 +1015,7 @@ export class DurableOperationManager {
       recipe: input.recipe,
       frozenInputs: before,
       ...(input.ownerDirectIsolated === true ? { ownerDirectIsolated: true } : {}),
+      ...(input.ownerDirectExecution === true ? { ownerDirectExecution: true } : {}),
     };
     const requestHash = hashJson(request);
     const operationId = stableOperationId("dependency_sync", workspaceRoot, input.attemptKey);
@@ -829,15 +1024,15 @@ export class DurableOperationManager {
   }
 
   async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
-    const ownerDirectIsolated = input.ownerDirectIsolated === true;
-    if (!ownerDirectIsolated && !this.consumer) {
-      throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
+    const ownerDirect = input.ownerDirectIsolated === true || input.ownerDirectExecution === true;
+    if (!ownerDirect && !this.consumer) {
+      throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "historical bound dependency sync requires trusted host authority from its original reader");
     }
     const consumer = this.consumer;
     const {subject, request, workspaceRoot, frozenInputs, before, baseRevision, requestHash, operationId} = await this.planDependencySync(input);
-    const directWitnessId = "OWNER_DIRECT_ISOLATED";
+    const directWitnessId = input.ownerDirectExecution === true ? "OWNER_DIRECT_CHECKOUT" : "OWNER_DIRECT_ISOLATED";
     const prepared = this.store.atomic(() => {
-      if (ownerDirectIsolated) {
+      if (ownerDirect) {
         const value = this.store.createOrReplay({
           operationId,
           attemptKey: input.attemptKey,
@@ -866,7 +1061,7 @@ export class DurableOperationManager {
     if (!created) return replayResult(record);
 
     const finish = (patch: Parameters<DurableOperationStore["finish"]>[1]) => this.store.atomic(() => {
-      if (!ownerDirectIsolated) {
+      if (!ownerDirect) {
         consumer!.finish(consumerContext, subject, binding!, pinnedVersion!);
       }
       return this.store.finish(operationId, patch);
@@ -875,7 +1070,7 @@ export class DurableOperationManager {
       if (await readGitHead(workspaceRoot) !== baseRevision || hashJson(await hashFiles(workspaceRoot, frozenInputs)) !== hashJson(before)) {
         throw new Error("Frozen dependency input or base revision changed before launch");
       }
-      if (!ownerDirectIsolated) {
+      if (!ownerDirect) {
         consumer!.assertPinned(consumerContext, subject, binding!, pinnedVersion!);
       }
       const command = dependencyCommand(input.recipe);
@@ -886,7 +1081,7 @@ export class DurableOperationManager {
       this.store.recordDependencyTerminal(
         operationId,
         requestHash,
-        ownerDirectIsolated ? directWitnessId : binding!.leaseId,
+        ownerDirect ? directWitnessId : binding!.leaseId,
         result.exitCode,
         frozenInputsUnchanged,
       );
@@ -929,16 +1124,18 @@ export class DurableOperationManager {
       if (
         !record ||
         record.kind !== "dependency_sync" ||
-        record.request.ownerDirectIsolated !== true
+        record.request.ownerDirectIsolated !== true &&
+        record.request.ownerDirectExecution !== true
       ) {
-        throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "owner-direct isolated reconciliation is not authorized for this operation");
+        throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "owner-direct dependency reconciliation is not authorized for this operation");
       }
       if (record.status === "succeeded" || record.status === "failed") return record;
       const witness = this.store.readDependencyTerminal(operationId);
+      const expectedWitnessId = record.request.ownerDirectExecution === true ? "OWNER_DIRECT_CHECKOUT" : "OWNER_DIRECT_ISOLATED";
       if (
         !witness ||
         witness.requestHash !== record.requestHash ||
-        witness.leaseId !== "OWNER_DIRECT_ISOLATED"
+        witness.leaseId !== expectedWitnessId
       ) {
         throw new DurableOperationError(
           "RECONCILIATION_REQUIRED",
@@ -951,7 +1148,7 @@ export class DurableOperationManager {
         retrySafe: false,
         receipt: {
           reconciliation: {
-            mode: "OWNER_DIRECT_ISOLATED",
+            mode: expectedWitnessId,
             requestHash: witness.requestHash,
             exitCode: witness.exitCode,
             frozenInputsUnchanged: witness.frozenInputsUnchanged,
@@ -985,10 +1182,14 @@ export class DurableOperationManager {
   async reconcile(operationId: string, consumerContext?: unknown): Promise<DurableOperationRecord> {
     const record = this.store.getByOperationId(operationId);
     if (!record) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
-    if (record.kind === "cutover_start") return this.reconcileCutoverStart(operationId,consumerContext);
+    if (record.kind === "cutover_start") {
+      return record.request.ownerDirect === true
+        ? this.reconcileDirectCutoverStart(operationId)
+        : this.reconcileCutoverStart(operationId, consumerContext);
+    }
     if (record.kind === "git_push") return await this.reconcileGitPush(operationId);
     if (record.kind === "dependency_sync") {
-      if (record.request.ownerDirectIsolated === true) {
+      if (record.request.ownerDirectIsolated === true || record.request.ownerDirectExecution === true) {
         return this.reconcileOwnerDirectDependencySync(operationId);
       }
       if (!this.consumer || typeof record.request.baseRevision !== "string") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires revision-bound host authority");

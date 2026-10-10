@@ -437,6 +437,8 @@ function printHelp(): void {
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace models          List available models in catalog",
       "  devspace models refresh  Refresh current provider model catalog and bump generation",
+      "",
+      "Legacy Carrier administration (persisted bound recovery only; not needed for new direct execution):",
       "  devspace carrier inspect <pending-id>",
       "  devspace carrier show <carrier-id>",
       "  devspace carrier reauthorize <carrier-id> --validity-version <version> --until <ISO expiry>",

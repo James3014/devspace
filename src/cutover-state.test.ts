@@ -1182,6 +1182,35 @@ for (const missing of ["witnessCutoverId", "witnessServerInstanceId", "witnessEx
 
 const coordinationBinding = {leaseId:"lease-one",pinnedLeaseVersion:2,operationHandle:"operation-one",requestHash:"a".repeat(64),ownerThread:"controller-one"};
 
+test("C4 direct correlation cannot be malformed, mixed with Carrier, or changed during drain", () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-c4-direct-correlation-"));
+  try {
+    const store = new CutoverStateStore(root);
+    const directOperation = { operationId: "op_" + "a".repeat(16), requestHash: "b".repeat(64) };
+    const base = { oldServerIdentity: oldIdentity, expectedNewIdentity: { sourceCommit: "target", buildId: "target" } };
+    assert.throws(() => store.begin({ ...base, coordinationBinding, directOperation }), /cannot mix/i);
+    assert.throws(() => store.begin({ ...base, directOperation: { ...directOperation, requestHash: "bad" } }), /malformed direct/i);
+    assert.deepEqual(readdirSync(root), []);
+    const created = store.begin({ ...base, directOperation });
+    assert.equal(created.coordinationBinding, undefined);
+    assert.deepEqual(new CutoverStateStore(root).get()?.directOperation, directOperation);
+    store.recordDrain(created.cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
+    const active = join(root, "cutover", "active");
+    const drain = join(active, readdirSync(active).find(name => name.startsWith("drained-"))!);
+    const original = readFileSync(drain, "utf8");
+    for (const tamper of [undefined, { ...directOperation, requestHash: "c".repeat(64) }]) {
+      const changed = JSON.parse(original);
+      if (tamper) changed.directOperation = tamper; else delete changed.directOperation;
+      writeFileSync(drain, JSON.stringify(changed));
+      assert.throws(() => new CutoverStateStore(root).get(), /correlation changed/i);
+      writeFileSync(drain, original);
+    }
+    assert.deepEqual(new CutoverStateStore(root).get()?.directOperation, directOperation);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("coordination binding is validated before writes and survives restart and drain", () => {
   const root=mkdtempSync(join(tmpdir(),"devspace-cutover-correlation-"));
   try {
