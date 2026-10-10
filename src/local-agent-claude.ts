@@ -120,6 +120,7 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
 
         const items: unknown[] = [];
         let observedModel: string | undefined;
+        let observedModelConflict = false;
         for (;;) {
           let next: IteratorResult<unknown>;
           try {
@@ -151,12 +152,25 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
           await callbacks?.onStreamActivity?.();
           items.push(message);
           const record = asRecord(message);
-          if (typeof record?.model === "string" && !observedModel) {
-            observedModel = record.model;
-            void callbacks?.onModelAttestation?.({
-              observedModel,
-              attestationSource: "claude_stream",
-            });
+          // Only a primary assistant Message carries the provider's response
+          // model. system/init.model is launch metadata, and subagent replies
+          // are not evidence for this agent's turn.
+          const assistantModel = claudeAssistantResponseModel(record);
+          if (assistantModel && !observedModelConflict) {
+            if (observedModel === undefined) {
+              observedModel = assistantModel;
+              await callbacks?.onModelAttestation?.({
+                observedModel,
+                attestationSource: "claude_assistant_response",
+              });
+            } else if (assistantModel !== observedModel) {
+              // One observed id cannot safely represent conflicting response ids.
+              observedModelConflict = true;
+              await callbacks?.onModelAttestation?.({
+                observedModel: null,
+                attestationSource: "claude_assistant_response_conflict",
+              });
+            }
           }
           if (typeof record?.session_id === "string") {
             const previousSessionId = this.providerSessionId;
@@ -193,8 +207,10 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
             providerSessionId: this.providerSessionId ?? null,
             finalResponse,
             items,
-            observedModel,
-            attestationSource: observedModel ? "claude_stream" : undefined,
+            observedModel: observedModelConflict ? null : observedModel,
+            attestationSource: observedModelConflict
+              ? "claude_assistant_response_conflict"
+              : observedModel ? "claude_assistant_response" : undefined,
           };
         }
       },
@@ -216,6 +232,16 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
     this.inputQueue.close();
     this.query.close();
   }
+}
+
+function claudeAssistantResponseModel(message: Record<string, unknown> | undefined): string | undefined {
+  if (message?.type !== "assistant" || message.parent_tool_use_id !== null) return undefined;
+  const response = asRecord(message.message);
+  if (response?.type !== "message" || response.role !== "assistant" || typeof response.id !== "string") {
+    return undefined;
+  }
+  const model = typeof response.model === "string" ? response.model.trim() : "";
+  return model.length > 0 ? model : undefined;
 }
 
 export class ClaudeLocalAgentDriver implements LocalAgentDriver {
