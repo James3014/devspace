@@ -225,6 +225,11 @@ await closeOnlyRuntime.close();
     { sessionId, configId: "model", value: requestedModel },
   ]);
   assert.equal(calls.filter(({ method }) => method === "session/prompt").length, 1);
+  // The matching config readback proves route selection, not which model
+  // physically served the turn, so it must not become an observed model.
+  if (routeResult.isErr()) throw routeResult.error;
+  assert.equal(routeResult.value.observedModel, undefined);
+  assert.equal(routeResult.value.attestationSource, undefined);
 }
 
 // ACP output retention keeps authoritative assistant text separate from bounded
@@ -774,7 +779,7 @@ const grokConnection = {
           },
         };
       }
-      if (method === "session/set_model") return {};
+      if (method === "session/set_model") return { models: { currentModelId: "grok-4.5", availableModels: [] } };
       if (method === "session/prompt") {
         grokQueues.get(input?.sessionId ?? "")?.values.push({
           update: {
@@ -814,6 +819,9 @@ const grokResult = await grokRuntime.run({
 assert.equal(grokResult.isOk(), true);
 if (grokResult.isErr()) throw grokResult.error;
 assert.equal(grokResult.value.finalResponse, "Grok response");
+// set_model's currentModelId is selection state, not provider response identity.
+assert.equal(grokResult.value.observedModel, undefined);
+assert.equal(grokResult.value.attestationSource, undefined);
 assert.deepEqual(
   grokRequests.filter(({ method }) => method === "session/set_model").map(({ params }) => params),
   [{ sessionId: "grok_session_1", modelId: "grok-4.5", _meta: { reasoningEffort: "low" } }],

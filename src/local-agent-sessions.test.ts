@@ -1249,9 +1249,16 @@ test("HerdR request-only execution never reports proven scope or unknown overall
       writePaths: ["src/message.txt"],
       maxFiles: 1,
       dispatchIntent,
+      directSelection: {
+        provider: "agy",
+        model: "requested-model",
+        writeMode: "allowed",
+      },
     },
     lifecycleKind: "detached_worker_v2",
   });
+  // Unknown model-named fields from a HerdR bridge or its result are metadata
+  // unless the protocol defines a physical model readback with provenance.
   const handle: HerdrExternalHandle = {
     schemaVersion: 1,
     runtimeKind: "HERDR",
@@ -1269,7 +1276,8 @@ test("HerdR request-only execution never reports proven scope or unknown overall
     dispatchIntentHash,
     launchTimestamp: new Date().toISOString(),
     enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
-  };
+    observedModel: "requested-model",
+  } as HerdrExternalHandle;
 
   try {
     manager.bindHerdrExternalHandle(record.id, handle);
@@ -1284,7 +1292,8 @@ test("HerdR request-only execution never reports proven scope or unknown overall
     assert.equal(await (manager as any).settleHerdrTurn(claimed.current, handle, {
       status: "done",
       finalResponse: "no repository changes",
-    }), true);
+      observedModel: "requested-model",
+    } as HerdrPromptResult), true);
 
     const status = await manager.getAgentStatus({
       workspaceId: "ws-herdr-request-only",
@@ -1294,6 +1303,11 @@ test("HerdR request-only execution never reports proven scope or unknown overall
     assert.equal(status.status, "idle");
     assert.equal(status.scopeState, "UNKNOWN");
     assert.equal(status.effectPolicyStatus?.overallEnforcement, "REQUEST_ONLY_NOT_ENFORCED");
+    assert.equal(status.modelAttestation?.requestedModel, "requested-model");
+    assert.equal(status.modelAttestation?.resolvedModel, undefined);
+    assert.equal(status.modelAttestation?.observedModel, null);
+    assert.equal(status.modelAttestation?.attestationSource, "metadata_only");
+    assert.equal(status.modelAttestation?.attestationState, "ATTESTATION_UNAVAILABLE");
 
     const clean = await manager.reconcileAgent({
       workspaceId: "ws-herdr-request-only",

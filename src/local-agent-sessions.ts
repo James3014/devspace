@@ -866,12 +866,13 @@ export class LocalAgentSessionManager {
       : verifierUnknown ? "VERIFIER_OUTCOME_UNKNOWN" : verifierFailed ? "VERIFIER_FAILED" : undefined;
     const requestedModel = record.executionContract?.directSelection?.model;
     const resolvedModel = record.model ?? undefined;
-    const observedModel = (promptResult as any)?.observedModel ?? (handle as any)?.observedModel ?? null;
     const modelAttestation = computeModelAttestation({
       requestedModel,
       resolvedModel,
-      observedModel,
-      attestationSource: observedModel ? "herdr_observed" : undefined,
+      // HerdR's handle and prompt result expose requested/configuration data, not
+      // a documented physical model readback. Unknown model-named properties
+      // must not be promoted to provider identity evidence.
+      observedModel: null,
     });
     const failureClassification = isError ? classifyDispatchFailure({
       ...record,
@@ -4470,6 +4471,13 @@ function providerEffectKnowledge(record: LocalAgentRecord): ProviderEffectKnowle
   return "unknown";
 }
 
+const LEGACY_UNPROVEN_ATTESTATION_SOURCES = new Set([
+  "agy_json_output",
+  "claude_stream",
+  "herdr_observed",
+  "acp_session_metadata",
+]);
+
 /**
  * P2-A: Computes model attestation state comparing requested/resolved model to physically observed model.
  */
@@ -4494,9 +4502,19 @@ export function computeModelAttestation(params: {
   }
 
   const expected = resolvedModel ?? requestedModel;
-  const matches = expected !== undefined
-    ? observedModel.trim().toLowerCase() === expected.trim().toLowerCase()
-    : true;
+  if (expected === undefined) {
+    // A physical observation without a requested/resolved target compares
+    // nothing, so it is recorded but never reported as MATCH.
+    return {
+      requestedModel,
+      resolvedModel,
+      observedModel,
+      attestationSource: attestationSource ?? "provider_reported",
+      attestationState: "ATTESTATION_UNAVAILABLE",
+      attestedAt: now,
+    };
+  }
+  const matches = observedModel.trim().toLowerCase() === expected.trim().toLowerCase();
 
   return {
     requestedModel,
@@ -4701,17 +4719,22 @@ function recordToStatusOutput(
   // P2-A: Model attestation
   if (record.lifecycleState?.modelAttestation) {
     const attestation = record.lifecycleState.modelAttestation;
-    // Older Agy adapters treated JSON keys as provider identity even though
-    // their provenance was never established. Keep the stored record intact
-    // for audit, but never expose that legacy claim as physical attestation.
-    output.modelAttestation = attestation.attestationSource === "agy_json_output"
+    // Older adapters labelled launch/configuration metadata or unproven fields
+    // as provider identity. Keep the stored record intact for audit, but never
+    // expose that legacy claim (or a MATCH that had no target) as attestation.
+    output.modelAttestation = attestation.attestationSource !== undefined
+        && LEGACY_UNPROVEN_ATTESTATION_SOURCES.has(attestation.attestationSource)
       ? {
           ...attestation,
           observedModel: null,
           attestationSource: "metadata_only",
           attestationState: "ATTESTATION_UNAVAILABLE",
         }
-      : attestation;
+      : attestation.attestationState === "MATCH"
+          && attestation.requestedModel === undefined
+          && attestation.resolvedModel === undefined
+        ? { ...attestation, attestationState: "ATTESTATION_UNAVAILABLE" }
+        : attestation;
   } else if (record.model || record.executionContract?.directSelection?.model) {
     const requested = record.executionContract?.directSelection?.model;
     const resolved = record.model;
