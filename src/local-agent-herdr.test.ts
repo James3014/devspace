@@ -645,6 +645,212 @@ test("HerdrThinGateway enforces N-ATTEST by leaving effectiveModel undefined wit
   assert.equal(handle.effectiveEffort, undefined);
 });
 
+type HerdrCanaryGateway = Pick<HerdrThinGateway, "promptExternalAgent" | "reconcileExternalAgent" | "stopExternalAgent">;
+
+// Stops the exact started handle at most once on every post-start exit, while
+// the caller's durable store is still open. A body failure stays primary.
+async function withHerdrStopOnce(
+  gateway: HerdrCanaryGateway,
+  handle: HerdrExternalHandle,
+  body: (stop: () => Promise<void>) => Promise<void>,
+): Promise<void> {
+  let stopAttempted = false;
+  const stop = async () => {
+    if (stopAttempted) return;
+    stopAttempted = true;
+    await gateway.stopExternalAgent(handle);
+  };
+  try {
+    await body(stop);
+  } catch (error) {
+    if (!stopAttempted) {
+      try {
+        await stop();
+      } catch (stopError) {
+        throw new AggregateError([error, stopError], "HerdR canary failed and its cleanup stop also failed.");
+      }
+    }
+    throw error;
+  }
+  await stop();
+}
+
+async function runOpenCodeCanaryAfterStart(gateway: HerdrCanaryGateway, handle: HerdrExternalHandle, worktreePath: string): Promise<void> {
+  await withHerdrStopOnce(gateway, handle, async (stop) => {
+    assert.equal(handle.runtimeKind, HERDR_RUNTIME_KIND);
+    assert.equal(handle.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
+    assert.equal(handle.canonicalWorktreePath, worktreePath);
+    assert.equal(handle.effectiveModel, undefined); // A6 / N-ATTEST
+
+    const nonce = `OPENCODE-REAL-MUTATION-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Prompt OpenCode to create a file with exact nonce. If the account's
+    // shared free quota is exhausted, the canary still proves the regression
+    // is fixed when the provider returns QUOTA_CAPACITY rather than the old
+    // "free tier can only be used from within OpenCode" client-identity 403.
+    let promptRes;
+    try {
+      promptRes = await gateway.promptExternalAgent(
+        handle,
+        `Create a file named oc_canary.txt containing exact text:\n${nonce}\nDo not ask questions.`,
+        { timeoutMs: 60_000 },
+      );
+    } catch (error: any) {
+      if (error?.code !== "PROVIDER_CAPACITY_ERROR") throw error;
+      const providerMessage = String(error?.providerMessage ?? error?.message ?? "");
+      assert.doesNotMatch(providerMessage, /free tier can only be used from within OpenCode/i);
+      assert.match(providerMessage, /FreeUsageLimitError|Rate limit exceeded|Free usage/i);
+      await stop();
+      return;
+    }
+    assert.ok(promptRes.status === "done" || promptRes.status === "idle");
+    assert.ok(promptRes.turnNonce);
+
+    // Independently verify physical file exists and contains exact nonce (A4)
+    const filePath = join(worktreePath, "oc_canary.txt");
+    const fileContent = readFileSync(filePath, "utf-8");
+    assert.ok(fileContent.includes(nonce), `Expected ${fileContent} to contain nonce ${nonce}`);
+
+    // Reconcile physical completion
+    const reconcileRes = await gateway.reconcileExternalAgent(handle, ["oc_canary.txt"], true, promptRes);
+    assert.equal(reconcileRes.completionStatus, "COMPLETED");
+    assert.equal(reconcileRes.physicalEffect, "PRESENT");
+    assert.deepEqual(reconcileRes.changedPaths, ["oc_canary.txt"]);
+
+    // Clean up
+    await stop();
+  });
+}
+
+async function runAgyCanaryAfterStart(gateway: HerdrCanaryGateway, handle: HerdrExternalHandle, worktreePath: string): Promise<void> {
+  await withHerdrStopOnce(gateway, handle, async (stop) => {
+    assert.equal(handle.runtimeKind, HERDR_RUNTIME_KIND);
+    assert.equal(handle.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
+    assert.equal(handle.canonicalWorktreePath, worktreePath);
+    assert.equal(handle.effectiveModel, undefined); // A6 / N-ATTEST
+
+    const nonce = `AGY-REAL-MUTATION-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    // Prompt Agy to create a file with exact nonce
+    const promptRes = await gateway.promptExternalAgent(
+      handle,
+      `Create a file named agy_canary.txt containing exact text:\n${nonce}\nDo not ask questions.`,
+      { timeoutMs: 60_000 },
+    );
+
+    if (promptRes.status === "blocked" || promptRes.rawStatus === "BLOCKED_ON_PERMISSION_ADMISSION") {
+      // Truthfully blocked on permission admission during prompt
+      const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
+      assert.equal(reconcileRes.completionStatus, "NOT_COMPLETE");
+      assert.equal(reconcileRes.executionState, "BLOCKED");
+      await stop();
+      return;
+    }
+
+    // If file was not created by worker due to lack of permission admission:
+    const filePath = join(worktreePath, "agy_canary.txt");
+    if (!existsSync(filePath)) {
+      const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
+      // F5: If live identity is verified and process settled idle/done without mutating, completionStatus is NOT_COMPLETE.
+      // If live identity was lost/unknown, completionStatus is truthfully OUTCOME_UNKNOWN.
+      assert.ok(
+        reconcileRes.completionStatus === "NOT_COMPLETE" || reconcileRes.completionStatus === "OUTCOME_UNKNOWN",
+        `Expected NOT_COMPLETE or OUTCOME_UNKNOWN, got ${reconcileRes.completionStatus}`,
+      );
+      assert.equal(reconcileRes.physicalEffect, "ABSENT");
+      await stop();
+      return;
+    }
+
+    assert.ok(promptRes.status === "done" || promptRes.status === "idle");
+    assert.ok(promptRes.turnNonce);
+
+    // Independently verify physical file exists and contains exact nonce (A4 - ZERO test-authored writeFileSync!)
+    const fileContent = readFileSync(filePath, "utf-8");
+    assert.ok(fileContent.includes(nonce), `Expected ${fileContent} to contain nonce ${nonce}`);
+
+    // Reconcile physical completion
+    const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
+    assert.equal(reconcileRes.completionStatus, "COMPLETED");
+    assert.equal(reconcileRes.physicalEffect, "PRESENT");
+    assert.deepEqual(reconcileRes.changedPaths, ["agy_canary.txt"]);
+
+    // Clean up
+    await stop();
+  });
+}
+
+// Synthetic cleanup witnesses for the live canaries above: no HerdR socket or
+// provider is involved. Every post-start exit must stop the exact started
+// handle once, while the canary's durable store is still open.
+function syntheticCanaryGateway(worktreePath: string, overrides: Partial<HerdrCanaryGateway> = {}) {
+  const stops: HerdrExternalHandle[] = [];
+  const handle = {
+    runtimeKind: HERDR_RUNTIME_KIND,
+    enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    canonicalWorktreePath: worktreePath,
+    agentId: "agt_synthetic_canary",
+  } as unknown as HerdrExternalHandle;
+  const gateway: HerdrCanaryGateway = {
+    promptExternalAgent: async () => ({ status: "done", turnNonce: "turn-synthetic" }) as any,
+    reconcileExternalAgent: async () => ({ completionStatus: "COMPLETED", physicalEffect: "PRESENT", changedPaths: [] }) as any,
+    stopExternalAgent: async (stopped) => { stops.push(stopped); },
+    ...overrides,
+  };
+  return { gateway, handle, stops };
+}
+
+test("HerdR live canary harness stops the started handle exactly once on every post-start exit", async () => {
+  const worktreePath = mkdtempSync(join(tmpdir(), "devspace-synthetic-canary-"));
+  try {
+    for (const run of [runOpenCodeCanaryAfterStart, runAgyCanaryAfterStart]) {
+      // Non-capacity prompt failure.
+      const promptFailure = syntheticCanaryGateway(worktreePath, {
+        promptExternalAgent: async () => { throw new Error("synthetic prompt failure"); },
+      });
+      await assert.rejects(run(promptFailure.gateway, promptFailure.handle, worktreePath), /synthetic prompt failure/);
+      assert.deepEqual(promptFailure.stops, [promptFailure.handle], `${run.name}: prompt failure must stop`);
+
+      // Physical verification throws after a "done" prompt (the w2F leak path).
+      const reconcileFailure = syntheticCanaryGateway(worktreePath, {
+        reconcileExternalAgent: async () => { throw new Error("synthetic reconcile failure"); },
+      });
+      await assert.rejects(run(reconcileFailure.gateway, reconcileFailure.handle, worktreePath));
+      assert.deepEqual(reconcileFailure.stops, [reconcileFailure.handle], `${run.name}: verification failure must stop`);
+
+      // A failing stop is attempted once and never retried by cleanup.
+      const stopFailure = syntheticCanaryGateway(worktreePath, {
+        promptExternalAgent: async () => { throw new Error("synthetic prompt failure"); },
+      });
+      let stopAttempts = 0;
+      stopFailure.gateway.stopExternalAgent = async () => {
+        stopAttempts += 1;
+        throw new Error("synthetic stop failure");
+      };
+      await assert.rejects(run(stopFailure.gateway, stopFailure.handle, worktreePath));
+      assert.equal(stopAttempts, 1, `${run.name}: stop must not be retried`);
+    }
+
+    // Body paths that already stop must not stop twice.
+    const capacity = syntheticCanaryGateway(worktreePath, {
+      promptExternalAgent: async () => {
+        throw Object.assign(new Error("FreeUsageLimitError"), { code: "PROVIDER_CAPACITY_ERROR" });
+      },
+    });
+    await runOpenCodeCanaryAfterStart(capacity.gateway, capacity.handle, worktreePath);
+    assert.deepEqual(capacity.stops, [capacity.handle]);
+
+    const blocked = syntheticCanaryGateway(worktreePath, {
+      promptExternalAgent: async () => ({ status: "blocked" }) as any,
+      reconcileExternalAgent: async () => ({ completionStatus: "NOT_COMPLETE", executionState: "BLOCKED" }) as any,
+    });
+    await runAgyCanaryAfterStart(blocked.gateway, blocked.handle, worktreePath);
+    assert.deepEqual(blocked.stops, [blocked.handle]);
+  } finally {
+    rmSync(worktreePath, { recursive: true, force: true });
+  }
+});
+
 test("HerdrThinGateway live canary with OpenCode on isolated worktree", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-canary-oc-store-"));
   const store = new LocalAgentStore(stateDir);
@@ -703,48 +909,7 @@ test("HerdrThinGateway live canary with OpenCode on isolated worktree", async ()
       writeMode: "allowed",
     });
 
-    assert.equal(handle.runtimeKind, HERDR_RUNTIME_KIND);
-    assert.equal(handle.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
-    assert.equal(handle.canonicalWorktreePath, worktreePath);
-    assert.equal(handle.effectiveModel, undefined); // A6 / N-ATTEST
-
-    const nonce = `OPENCODE-REAL-MUTATION-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    // Prompt OpenCode to create a file with exact nonce. If the account's
-    // shared free quota is exhausted, the canary still proves the regression
-    // is fixed when the provider returns QUOTA_CAPACITY rather than the old
-    // "free tier can only be used from within OpenCode" client-identity 403.
-    let promptRes;
-    try {
-      promptRes = await gateway.promptExternalAgent(
-        handle,
-        `Create a file named oc_canary.txt containing exact text:\n${nonce}\nDo not ask questions.`,
-        { timeoutMs: 60_000 },
-      );
-    } catch (error: any) {
-      if (error?.code !== "PROVIDER_CAPACITY_ERROR") throw error;
-      const providerMessage = String(error?.providerMessage ?? error?.message ?? "");
-      assert.doesNotMatch(providerMessage, /free tier can only be used from within OpenCode/i);
-      assert.match(providerMessage, /FreeUsageLimitError|Rate limit exceeded|Free usage/i);
-      await gateway.stopExternalAgent(handle);
-      return;
-    }
-    assert.ok(promptRes.status === "done" || promptRes.status === "idle");
-    assert.ok(promptRes.turnNonce);
-
-    // Independently verify physical file exists and contains exact nonce (A4)
-    const filePath = join(worktreePath, "oc_canary.txt");
-    const fileContent = readFileSync(filePath, "utf-8");
-    assert.ok(fileContent.includes(nonce), `Expected ${fileContent} to contain nonce ${nonce}`);
-
-    // Reconcile physical completion
-    const reconcileRes = await gateway.reconcileExternalAgent(handle, ["oc_canary.txt"], true, promptRes);
-    assert.equal(reconcileRes.completionStatus, "COMPLETED");
-    assert.equal(reconcileRes.physicalEffect, "PRESENT");
-    assert.deepEqual(reconcileRes.changedPaths, ["oc_canary.txt"]);
-
-    // Clean up
-    await gateway.stopExternalAgent(handle);
+    await runOpenCodeCanaryAfterStart(gateway, handle, worktreePath);
   } finally {
     store.close();
     rmSync(stateDir, { recursive: true, force: true });
@@ -824,59 +989,7 @@ test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
       return;
     }
 
-    assert.equal(handle.runtimeKind, HERDR_RUNTIME_KIND);
-    assert.equal(handle.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
-    assert.equal(handle.canonicalWorktreePath, worktreePath);
-    assert.equal(handle.effectiveModel, undefined); // A6 / N-ATTEST
-
-    const nonce = `AGY-REAL-MUTATION-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    // Prompt Agy to create a file with exact nonce
-    const promptRes = await gateway.promptExternalAgent(
-      handle,
-      `Create a file named agy_canary.txt containing exact text:\n${nonce}\nDo not ask questions.`,
-      { timeoutMs: 60_000 },
-    );
-
-    if (promptRes.status === "blocked" || promptRes.rawStatus === "BLOCKED_ON_PERMISSION_ADMISSION") {
-      // Truthfully blocked on permission admission during prompt
-      const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
-      assert.equal(reconcileRes.completionStatus, "NOT_COMPLETE");
-      assert.equal(reconcileRes.executionState, "BLOCKED");
-      await gateway.stopExternalAgent(handle);
-      return;
-    }
-
-    // If file was not created by worker due to lack of permission admission:
-    const filePath = join(worktreePath, "agy_canary.txt");
-    if (!existsSync(filePath)) {
-      const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
-      // F5: If live identity is verified and process settled idle/done without mutating, completionStatus is NOT_COMPLETE.
-      // If live identity was lost/unknown, completionStatus is truthfully OUTCOME_UNKNOWN.
-      assert.ok(
-        reconcileRes.completionStatus === "NOT_COMPLETE" || reconcileRes.completionStatus === "OUTCOME_UNKNOWN",
-        `Expected NOT_COMPLETE or OUTCOME_UNKNOWN, got ${reconcileRes.completionStatus}`,
-      );
-      assert.equal(reconcileRes.physicalEffect, "ABSENT");
-      await gateway.stopExternalAgent(handle);
-      return;
-    }
-
-    assert.ok(promptRes.status === "done" || promptRes.status === "idle");
-    assert.ok(promptRes.turnNonce);
-
-    // Independently verify physical file exists and contains exact nonce (A4 - ZERO test-authored writeFileSync!)
-    const fileContent = readFileSync(filePath, "utf-8");
-    assert.ok(fileContent.includes(nonce), `Expected ${fileContent} to contain nonce ${nonce}`);
-
-    // Reconcile physical completion
-    const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
-    assert.equal(reconcileRes.completionStatus, "COMPLETED");
-    assert.equal(reconcileRes.physicalEffect, "PRESENT");
-    assert.deepEqual(reconcileRes.changedPaths, ["agy_canary.txt"]);
-
-    // Clean up
-    await gateway.stopExternalAgent(handle);
+    await runAgyCanaryAfterStart(gateway, handle, worktreePath);
   } finally {
     store.close();
     rmSync(stateDir, { recursive: true, force: true });
