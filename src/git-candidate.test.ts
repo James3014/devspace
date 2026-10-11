@@ -633,7 +633,7 @@ test("pushCandidate reconciles expected remote SHA after initial readback failur
     const commit = await commitCandidate({ workspaceId: "ws", workspaceRoot: f.worktreeDir, expectedHead: f.worktreeHead, message: "push reconcile", paths: ["push-reconcile.txt"] });
     let readbacks = 0;
     const gitRunner = async (args: string[], cwd: string) => {
-      if (args[0] === "ls-remote" && readbacks++ === 0) throw new Error("injected initial remote readback failure");
+      if (args[0] === "ls-remote" && args.includes("--heads") && readbacks++ === 0) throw new Error("injected initial remote readback failure");
       return { stdout: runGitRaw(args, cwd), stderr: "" };
     };
     const result = await pushCandidate({ workspaceRoot: f.worktreeDir, expectedHead: commit.commitSha, remote: "origin", branch: "reconciled-readback", gitRunner } as Parameters<typeof pushCandidate>[0]);
@@ -651,7 +651,7 @@ test("pushCandidate preserves EFFECT_UNKNOWN when push succeeds but both readbac
     const commit = await commitCandidate({ workspaceId: "ws", workspaceRoot: f.worktreeDir, expectedHead: f.worktreeHead, message: "push unknown", paths: ["push-unknown.txt"] });
     let readbacks = 0;
     const gitRunner = async (args: string[], cwd: string) => {
-      if (args[0] === "ls-remote") {
+      if (args[0] === "ls-remote" && args.includes("--heads")) {
         readbacks += 1;
         throw new Error(`injected remote readback failure ${readbacks}`);
       }
@@ -672,6 +672,62 @@ test("pushCandidate preserves EFFECT_UNKNOWN when push succeeds but both readbac
     );
     assert.equal(readbacks, 2);
     assert.equal(runGitRaw(["rev-parse", "refs/heads/unknown-readback"], f.bareDir), commit.commitSha);
+  } finally {
+    f.clean();
+  }
+});
+
+test("pushCandidate - denies non-conventional remote default branch without local origin/HEAD", async () => {
+  const f = setupGitFixture();
+  try {
+    // Remote default is 'production'; the local clone never learned refs/remotes/origin/HEAD.
+    runGitRaw(["symbolic-ref", "HEAD", "refs/heads/production"], f.bareDir);
+    runGitRaw(["branch", "production", "main"], f.bareDir);
+    runGitRaw(["remote", "set-head", "origin", "--delete"], f.cloneDir);
+    runGitRaw(["remote", "set-head", "origin", "--delete"], f.worktreeDir);
+    assert.throws(() => runGitRaw(["symbolic-ref", "refs/remotes/origin/HEAD"], f.worktreeDir));
+    writeFileSync(join(f.worktreeDir, "p.txt"), "candidate\n");
+    const commit = await commitCandidate({ workspaceId: "ws", workspaceRoot: f.worktreeDir, expectedHead: f.worktreeHead, message: "unreviewed", paths: ["p.txt"] });
+    const before = runGitRaw(["rev-parse", "refs/heads/production"], f.bareDir);
+    await assert.rejects(
+      pushCandidate({ workspaceRoot: f.worktreeDir, expectedHead: commit.commitSha, remote: "origin", branch: "production" }),
+      (err: any) => {
+        assert.equal(err.code, "GIT_PROTECTED_BRANCH");
+        return true;
+      },
+    );
+    assert.equal(runGitRaw(["rev-parse", "refs/heads/production"], f.bareDir), before, "remote default branch must be untouched");
+    // Positive path: a non-default branch still pushes.
+    const ok = await pushCandidate({ workspaceRoot: f.worktreeDir, expectedHead: commit.commitSha, remote: "origin", branch: "feature-x" });
+    assert.equal(ok.pushedSha, commit.commitSha);
+  } finally {
+    f.clean();
+  }
+});
+
+test("pushCandidate - fails closed when remote default branch is undeterminable", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.worktreeDir, "q.txt"), "candidate\n");
+    const commit = await commitCandidate({ workspaceId: "ws", workspaceRoot: f.worktreeDir, expectedHead: f.worktreeHead, message: "undeterminable", paths: ["q.txt"] });
+    for (const mode of ["throw", "empty"] as const) {
+      const gitRunner = async (args: string[], cwd: string) => {
+        if (args[0] === "ls-remote" && args.includes("--symref")) {
+          if (mode === "throw") throw new Error("injected symref lookup failure");
+          return { stdout: "", stderr: "" };
+        }
+        return { stdout: runGitRaw(args, cwd), stderr: "" };
+      };
+      await assert.rejects(
+        pushCandidate({ workspaceRoot: f.worktreeDir, expectedHead: commit.commitSha, remote: "origin", branch: "some-feature", gitRunner } as Parameters<typeof pushCandidate>[0]),
+        (err: any) => {
+          assert.equal(err.code, "GIT_EXECUTION_ERROR");
+          assert.match(err.message, /default branch/);
+          return true;
+        },
+      );
+      assert.throws(() => runGitRaw(["rev-parse", "refs/heads/some-feature"], f.bareDir), "nothing may be pushed");
+    }
   } finally {
     f.clean();
   }
