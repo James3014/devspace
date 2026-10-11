@@ -2,7 +2,7 @@ import { realpathSync } from "node:fs";
 import { isDeepStrictEqual } from "node:util";
 import type { ServerConfig } from "./config.js";
 import { CarrierBindingStore } from "./carrier-binding.js";
-import { DurableOperationManager } from "./durable-operations.js";
+import { DurableOperationManager, DurableOperationStore } from "./durable-operations.js";
 import {
   CutoverBuildNotReadyError,
   probeBuildReady,
@@ -316,7 +316,17 @@ export async function performLocalBoundCutoverFinish(
       ()=>dependencies.reconcile ? dependencies.reconcile(pair) : reconcileExactPair(input.config,pair),
       local.context,
     );
-    return {record:closed,liveIdentity:health.identity};
+    const leaseId=closed.coordinationBinding?.leaseId;
+    let leaseTerminalState:string|undefined;
+    if(leaseId) {
+      const readOnly=new DurableOperationStore(input.config.stateDir).createOwnershipStore({
+        resolveOwnerContext:()=>undefined,
+        resolveEffectBinding:()=>undefined,
+        verifyGrantEvidence:()=>false,
+      } as never);
+      leaseTerminalState=readOnly.get(leaseId)?.terminalState;
+    }
+    return {record:closed,liveIdentity:health.identity,leaseId,leaseTerminalState};
   } finally {
     manager.close();
     bindings.close();

@@ -763,7 +763,10 @@ export class DurableOperationManager {
       if(!closed||closed.phase!=="closed"||closed.cutoverId!==cutoverId||!isDeepStrictEqual(closed.coordinationBinding,current.file.coordinationBinding)||!validWitness(receipt)||receipt?.closedByServerInstanceId!==identity.serverInstanceId||!Number.isFinite(Date.parse(receipt.reconciledAt))||Date.parse(receipt.reconciledAt)>Date.now()) throw new ControlPlaneOwnershipError("CAS_CONFLICT","closed file lacks exact terminal witness");
       if(current.replay) return closed;
       const expiredLeaseRecovery=current.recovery ? consumer.reconcileCutoverFinish(context,current.subject,action,current.binding,JSON.stringify({kind:"cutover_terminal",cutoverId,requestHash:current.subject.requestHash,terminalRecordHash:digest(closed)})) : undefined;
-      if(!current.recovery) consumer.finish(context,current.subject,current.binding,current.binding.leaseVersion);
+      if(!current.recovery) {
+        const released=consumer.finishAndRelease(context,current.subject,current.binding,current.binding.leaseVersion);
+        if(released.terminalState!=="released"||released.operationHandle!==undefined) throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish did not release the state-root lease");
+      }
       if(!isDeepStrictEqual(cutoverStore.get(),closed)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal file changed during final authority check");
       if(!isDeepStrictEqual(this.store.getByOperationId(current.intent.operationId),current.intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal intent changed during final authority check");
       this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,lifecycleTerminal:true,terminalRecordHash:digest(closed),lifecycleAction:action,...(expiredLeaseRecovery?{expiredLeaseRecovery}:{})}});
