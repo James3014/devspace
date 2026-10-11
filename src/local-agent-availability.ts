@@ -154,7 +154,7 @@ export function resolveAgyExecutable(env: NodeJS.ProcessEnv = process.env): stri
   const resolvedPath = resolveCommand("agy", env);
   if (resolvedPath) return resolvedPath;
 
-  const fallback = "/Users/jameschen/.local/bin/agy";
+  const fallback = join(env.HOME ?? homedir(), ".local", "bin", "agy");
   if (executableExists(fallback)) {
     return fallback;
   }
