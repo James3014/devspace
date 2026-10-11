@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { lstat, readFile, readlink } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { lstat, readdir, readFile, readlink } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { PathStateFingerprint, ScopeBaseline, ScopeState } from "./local-agent-contract.js";
 
 /**
@@ -148,6 +148,11 @@ export async function inspectWorkspacePhysicalState(workspaceRoot: string): Prom
       trackedRels,
       untrackedRels,
     );
+    // Physical effects that `git diff` / `ls-files --exclude-standard` cannot
+    // see: .git hooks/config and gitignored files. They are fingerprinted
+    // under keys that are NOT in `changedPaths`, so a clean workspace still
+    // reports no changed paths, but computeWorkerDelta can detect mutations.
+    Object.assign(state.fingerprints, await computeGuardedFingerprints(workspaceRoot));
   } else {
     state.changedPaths = Array.from(new Set([...tracked, ...untracked])).sort();
   }
@@ -238,6 +243,133 @@ async function computePathFingerprints(
     fingerprints[rel] = { kind, contentHash, size, gitStateHash };
   }
   return fingerprints;
+}
+
+/** Marker key proving a fingerprint map includes guarded (hidden-state) coverage. */
+export const GUARD_COVERAGE_KEY = ".git/<devspace-guard-coverage>";
+const GUARD_GIT_STATE = "guard";
+const GUARD_FILE_CONTENT_LIMIT = 1024 * 1024;
+const GUARD_DIR_ENTRY_LIMIT = 20_000;
+
+function guardFingerprint(contentHash: string, size: number): PathStateFingerprint {
+  return { kind: "untracked", contentHash, size, gitStateHash: GUARD_GIT_STATE };
+}
+
+/**
+ * Fingerprint one guarded entry without following symlinks. Files up to 1 MiB
+ * are content-hashed; larger files and directory trees (bounded walk) are
+ * hashed over path, size and mtime. Returns undefined when absent/unreadable.
+ */
+async function fingerprintGuardedEntry(absolutePath: string): Promise<PathStateFingerprint | undefined> {
+  try {
+    const info = await lstat(absolutePath);
+    if (info.isSymbolicLink()) {
+      const target = await readlink(absolutePath);
+      return guardFingerprint(createHash("sha256").update(`link:${target}`).digest("hex"), Buffer.byteLength(target));
+    }
+    if (info.isFile()) {
+      if (info.size <= GUARD_FILE_CONTENT_LIMIT) {
+        const content = await readFile(absolutePath);
+        return guardFingerprint(createHash("sha256").update(content).digest("hex"), content.length);
+      }
+      return guardFingerprint(
+        createHash("sha256").update(`large:${info.size}:${info.mtimeMs}`).digest("hex"),
+        info.size,
+      );
+    }
+    if (info.isDirectory()) {
+      const hash = createHash("sha256");
+      let count = 0;
+      let total = 0;
+      const walk = async (dir: string, relDir: string): Promise<void> => {
+        let names: string[];
+        try {
+          names = (await readdir(dir)).sort();
+        } catch {
+          hash.update(`unreadable:${relDir}\0`);
+          return;
+        }
+        for (const name of names) {
+          if (count >= GUARD_DIR_ENTRY_LIMIT) {
+            hash.update("truncated\0");
+            return;
+          }
+          count++;
+          const child = join(dir, name);
+          const rel = `${relDir}/${name}`;
+          let childInfo;
+          try {
+            childInfo = await lstat(child);
+          } catch {
+            hash.update(`gone:${rel}\0`);
+            continue;
+          }
+          total += childInfo.size;
+          hash.update(`${rel}:${childInfo.isDirectory() ? "d" : childInfo.isSymbolicLink() ? "l" : "f"}:${childInfo.size}:${childInfo.mtimeMs}\0`);
+          if (childInfo.isDirectory()) await walk(child, rel);
+        }
+      };
+      await walk(absolutePath, "");
+      return guardFingerprint(hash.digest("hex"), total);
+    }
+    return guardFingerprint(createHash("sha256").update(`other:${info.mode}`).digest("hex"), 0);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Fingerprints for state invisible to git diff/status: `.git/config`,
+ * `.git/config.worktree`, every file in `.git/hooks`, and gitignored files or
+ * directories. Keys are workspace-relative (ignored entries) or `.git/...`.
+ */
+async function computeGuardedFingerprints(workspaceRoot: string): Promise<Record<string, PathStateFingerprint>> {
+  const guarded: Record<string, PathStateFingerprint> = {
+    [GUARD_COVERAGE_KEY]: guardFingerprint(createHash("sha256").update("guard-v1").digest("hex"), 0),
+  };
+
+  const dirs = await runGit(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], workspaceRoot);
+  const [gitDirRaw, commonDirRaw] = dirs.ok ? splitLines(dirs.stdout) : [];
+  const gitDir = gitDirRaw ? resolve(workspaceRoot, gitDirRaw) : undefined;
+  const commonDir = commonDirRaw ? resolve(workspaceRoot, commonDirRaw) : gitDir;
+
+  const entries: Array<[string, string]> = [];
+  if (commonDir) entries.push([".git/config", join(commonDir, "config")]);
+  if (gitDir) entries.push([".git/config.worktree", join(gitDir, "config.worktree")]);
+  if (commonDir) {
+    const hooksDir = join(commonDir, "hooks");
+    try {
+      for (const name of (await readdir(hooksDir)).sort()) {
+        entries.push([`.git/hooks/${name}`, join(hooksDir, name)]);
+      }
+    } catch {
+      // No hooks directory.
+    }
+  }
+  for (const [key, absolutePath] of entries) {
+    const fingerprint = await fingerprintGuardedEntry(absolutePath);
+    if (fingerprint) guarded[key] = fingerprint;
+  }
+
+  const ignored = await runGit(
+    ["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"],
+    workspaceRoot,
+  );
+  if (ignored.ok) {
+    const root = resolve(workspaceRoot);
+    for (const raw of ignored.stdout.split("\0").filter(Boolean)) {
+      const rel = raw.replace(/\/$/, "");
+      const absolutePath = resolve(root, rel);
+      if (!isContainedWithin(root, absolutePath)) continue;
+      const fingerprint = await fingerprintGuardedEntry(absolutePath);
+      if (fingerprint) guarded[rel] = fingerprint;
+    }
+  } else {
+    // Cannot enumerate ignored files: drop the coverage marker so attribution
+    // degrades to UNKNOWN instead of claiming complete observation.
+    delete guarded[GUARD_COVERAGE_KEY];
+  }
+  return guarded;
 }
 
 /**
@@ -403,8 +535,15 @@ export function computeWorkerDelta(
   const baselinePaths = [...(baseline.changedPaths ?? [])].sort();
   const baselineSet = new Set(baselinePaths);
 
+  // Hidden-state (hooks/config/ignored) mutations are worker-caused changes
+  // too, and are merged into every non-baseline-less result below.
+  const guard = computeGuardedDelta(current, baseline);
+
   if (baselinePaths.length === 0) {
-    return { changedPaths: currentPaths, attribution: "KNOWN" };
+    return {
+      changedPaths: [...new Set([...currentPaths, ...guard.changed])].sort(),
+      attribution: guard.complete ? "KNOWN" : "UNKNOWN",
+    };
   }
 
   const baselineFingerprints = baseline.fingerprints ?? {};
@@ -455,10 +594,48 @@ export function computeWorkerDelta(
     if (!currentSet.has(path) && baselineByPath.has(path)) changed.add(path);
   }
 
+  for (const path of guard.changed) changed.add(path);
+
   return {
     changedPaths: [...changed].sort(),
-    attribution: fullyAttributable ? "KNOWN" : "UNKNOWN",
+    attribution: fullyAttributable && guard.complete ? "KNOWN" : "UNKNOWN",
   };
+}
+
+/**
+ * Compare guarded (hidden-state) fingerprints: entries whose key is not a
+ * changed path of its own snapshot. `complete` is false when either snapshot
+ * lacks guard coverage, because hidden mutations then cannot be excluded.
+ */
+function computeGuardedDelta(
+  current: WorkspacePhysicalState,
+  baseline: ScopeBaseline,
+): { changed: string[]; complete: boolean } {
+  const guardedOf = (fingerprints: Record<string, PathStateFingerprint> | undefined, changedPaths: string[] | undefined) => {
+    const dirty = new Set(changedPaths ?? []);
+    const out = new Map<string, PathStateFingerprint>();
+    for (const [key, value] of Object.entries(fingerprints ?? {})) {
+      if (!dirty.has(key)) out.set(key, value);
+    }
+    return out;
+  };
+  const base = guardedOf(baseline.fingerprints, baseline.changedPaths);
+  const cur = guardedOf(current.fingerprints, current.changedPaths);
+  // Baselines persisted before hidden-state coverage existed carry no guarded
+  // fingerprints, so there is nothing to compare; they keep legacy attribution.
+  if (!base.has(GUARD_COVERAGE_KEY)) return { changed: [], complete: true };
+  // Baseline observed hidden state but the current snapshot could not: unknown.
+  if (!cur.has(GUARD_COVERAGE_KEY)) return { changed: [], complete: false };
+  const changed: string[] = [];
+  for (const [key, value] of cur) {
+    if (key === GUARD_COVERAGE_KEY) continue;
+    const before = base.get(key);
+    if (!before || !fingerprintsEqual(before, value)) changed.push(key);
+  }
+  for (const key of base.keys()) {
+    if (key !== GUARD_COVERAGE_KEY && !cur.has(key)) changed.push(key);
+  }
+  return { changed, complete: true };
 }
 
 function isCompleteFingerprint(fingerprint: PathStateFingerprint | undefined): boolean {

@@ -4473,3 +4473,62 @@ test("Wave 3 enforcement receipt readback rejects tampered native surface or too
     "provider-native or unknown tool ids cannot be smuggled into durable enforcement evidence",
   );
 });
+
+// ─── Hidden-state (hooks/config/ignored) scope observation ───────────────────
+
+test("scope observer detects .git hook/config and ignored-file writes outside writePaths", async () => {
+  const f = setupGitFixture();
+  try {
+    mkdirSync(join(f.repo, "docs"), { recursive: true });
+    writeFileSync(join(f.repo, ".gitignore"), ".env\nbuild/\n");
+    writeFileSync(join(f.repo, "docs", "a.md"), "a\n");
+    runGitRaw(["add", "-A"], f.repo);
+    runGitRaw(["commit", "-m", "seed scope fixture"], f.repo);
+
+    const baseline = baselineFromState(await inspectWorkspacePhysicalState(f.repo));
+
+    // Untouched workspace: clean, KNOWN, WITHIN_SCOPE (honest positive path).
+    const clean = await inspectWorkspacePhysicalState(f.repo);
+    const cleanDelta = computeWorkerDelta(clean, baseline);
+    assert.deepEqual(clean.changedPaths, []);
+    assert.deepEqual(cleanDelta.changedPaths, []);
+    assert.equal(cleanDelta.attribution, "KNOWN");
+    assert.equal(classifyScopeState(cleanDelta.changedPaths, ["docs"]).scopeState, "WITHIN_SCOPE");
+
+    // In-scope write is still WITHIN_SCOPE.
+    writeFileSync(join(f.repo, "docs", "a.md"), "edited\n");
+    const inScope = computeWorkerDelta(await inspectWorkspacePhysicalState(f.repo), baseline);
+    assert.deepEqual(inScope.changedPaths, ["docs/a.md"]);
+    assert.equal(classifyScopeState(inScope.changedPaths, ["docs"]).scopeState, "WITHIN_SCOPE");
+    runGitRaw(["checkout", "--", "docs/a.md"], f.repo);
+
+    const cases: Array<[string, () => void]> = [
+      [".git/hooks/pre-commit", () => writeFileSync(join(f.repo, ".git", "hooks", "pre-commit"), "#!/bin/sh\nexit 0\n", { mode: 0o755 })],
+      [".git/config", () => runGitRaw(["config", "core.hooksPath", "/tmp/attacker-hooks"], f.repo)],
+      [".env", () => writeFileSync(join(f.repo, ".env"), "API_KEY=overwritten\n")],
+      ["build", () => { mkdirSync(join(f.repo, "build")); writeFileSync(join(f.repo, "build", "out.js"), "x"); }],
+    ];
+    for (const [expected, mutate] of cases) {
+      mutate();
+      const delta = computeWorkerDelta(await inspectWorkspacePhysicalState(f.repo), baseline);
+      assert.ok(delta.changedPaths.includes(expected), `${expected} must be observed, got ${JSON.stringify(delta.changedPaths)}`);
+      const scope = classifyScopeState(delta.changedPaths, ["docs"]);
+      assert.equal(scope.scopeState, "SCOPE_VIOLATION", expected);
+      assert.ok(scope.unexpectedPaths.includes(expected));
+    }
+  } finally {
+    f.clean();
+  }
+});
+
+test("scope observer degrades attribution to UNKNOWN when current hidden-state coverage is lost", async () => {
+  const f = setupGitFixture();
+  try {
+    const baseline = baselineFromState(await inspectWorkspacePhysicalState(f.repo));
+    const current = await inspectWorkspacePhysicalState(f.repo);
+    const withoutCoverage = { ...current, fingerprints: {} };
+    assert.equal(computeWorkerDelta(withoutCoverage, baseline).attribution, "UNKNOWN");
+  } finally {
+    f.clean();
+  }
+});
