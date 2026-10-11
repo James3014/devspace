@@ -311,16 +311,23 @@ CANARY="$(curl -s -o /dev/null -w '%{http_code}' -X POST --max-time 8 http://127
 row "verify" "healthz normal, closed, public identity, canary 404"
 
 # ---------- 10. hygiene ----------
+ckpt "10-hygiene"
+if node "$R/dist/cli.js" carrier revoke "$CID" --version "$CVER" >/dev/null 2>&1; then row "carrier revoked" "$CID"
+else row "carrier revoke" "FAILED (revoke manually: carrier revoke $CID --version $CVER)"; fi
+
 ckpt "10a-release-lease"
 # finishCutover closes the generation but leaves the state-root effect lease un-released; the next
 # prepareEffect would then fail with "overlapping resource scope is already leased". Release it now
 # with the closed record's terminal hash (cutoverTerminalRecordHash over the stored record).
+# Must run after the revoke above: release-terminal-lease requires the exact revoked root carrier at
+# its current version.
 LEASE_JSON=$(node "$R/dist/cli.js" cutover status --json 2>/dev/null || true)
 LEASE_ID=$(printf '%s' "$LEASE_JSON" | python3 -c 'import sys,json;d=json.load(sys.stdin);a=d.get("active") or {};print((a.get("coordinationBinding") or {}).get("leaseId") or "")' 2>/dev/null || true)
 CLOSED_ID=$(printf '%s' "$LEASE_JSON" | python3 -c 'import sys,json;d=json.load(sys.stdin);a=d.get("active") or {};print(a.get("cutoverId") or "")' 2>/dev/null || true)
 if [ -n "$LEASE_ID" ] && [ -n "$CLOSED_ID" ]; then
   LEASE_VER=$(python3 -c "import sqlite3;c=sqlite3.connect('file:$STATE_DIR/devspace.sqlite?mode=ro',uri=True);r=c.execute('select version,terminal_state from control_plane_resource_leases where lease_id=?',('$LEASE_ID',)).fetchone();print(r[0] if r and not r[1] else '')" 2>/dev/null || true)
   if [ -n "$LEASE_VER" ]; then
+    REL_CVER=$(python3 -c "import sqlite3;c=sqlite3.connect('file:$STATE_DIR/devspace.sqlite?mode=ro',uri=True);r=c.execute('select version from carrier_bindings where id=? and revoked=1',('$CID',)).fetchone();print(r[0] if r else '')" 2>/dev/null || true)
     TRH_SCRIPT=$(mktemp /tmp/m5-trh.XXXXXX.mjs)
     cat > "$TRH_SCRIPT" <<NODE
 const { loadConfig } = await import("file://$R/dist/config.js");
@@ -330,19 +337,15 @@ const s = new CutoverStateStore(loadConfig().stateDir); const f = s.get();
 console.log(cutoverTerminalRecordHash(f)); try { s.close?.(); } catch {} process.exit(0);
 NODE
     TRH=$(perl -e 'alarm 40; exec @ARGV' node "$TRH_SCRIPT" < /dev/null 2>/dev/null || true); rm -f "$TRH_SCRIPT"
-    if [ -n "$TRH" ] && node "$R/dist/cli.js" cutover release-terminal-lease --cutover-id "$CLOSED_ID" --lease-id "$LEASE_ID" --lease-version "$LEASE_VER" --carrier "$CID" --carrier-version "$CVER" --terminal-record-hash "$TRH" --confirm "$CLOSED_ID" --json >/dev/null 2>&1; then
+    if [ -n "$TRH" ] && [ -n "$REL_CVER" ] && node "$R/dist/cli.js" cutover release-terminal-lease --cutover-id "$CLOSED_ID" --lease-id "$LEASE_ID" --lease-version "$LEASE_VER" --carrier "$CID" --carrier-version "$REL_CVER" --terminal-record-hash "$TRH" --confirm "$CLOSED_ID" --json >/dev/null 2>&1; then
       row "lease released" "$LEASE_ID (v$LEASE_VER)"
     else
-      row "lease release" "FAILED: run cutover release-terminal-lease --cutover-id $CLOSED_ID --lease-id $LEASE_ID --lease-version $LEASE_VER --carrier $CID --carrier-version <current> --terminal-record-hash <cutoverTerminalRecordHash> --confirm $CLOSED_ID"
+      row "lease release" "FAILED: run cutover release-terminal-lease --cutover-id $CLOSED_ID --lease-id $LEASE_ID --lease-version $LEASE_VER --carrier $CID --carrier-version ${REL_CVER:-<revoked-version>} --terminal-record-hash <cutoverTerminalRecordHash> --confirm $CLOSED_ID"
     fi
   else
     row "lease" "already terminal"
   fi
 fi
-
-ckpt "10-hygiene"
-if node "$R/dist/cli.js" carrier revoke "$CID" --version "$CVER" >/dev/null 2>&1; then row "carrier revoked" "$CID"
-else row "carrier revoke" "FAILED (revoke manually: carrier revoke $CID --version $CVER)"; fi
 
 trap - ERR
 echo; echo "== m5-cutover summary =="; printf '%s\n' "${SUMMARY[@]}"; echo "receipt: $RECEIPT"
