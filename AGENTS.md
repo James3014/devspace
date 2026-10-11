@@ -134,6 +134,8 @@ Start at the boundary named by the problem and follow the data. Keep policy in D
 - This binding is Evidence Trust + Completion only. It does not select the execution lane, route, worker/model, Candidate acceptance, merge, release, deployment, or production authority.
 - DIRECT work remains transport-neutral. A Core mutation session is not required solely because repository files are being changed.
 
+New issues must be opened from the issue template so the Nexus Core evidence-universe marker is present (from the CLI: `gh issue create --template task.md`). After any change to `.nexus-core/config.toml`, regenerate the marker with `nexus-certify markers` and update the template. PRs bind to their issue with `<!-- NEXUS_CORE_ISSUE: N -->`.
+
 ## Handoff
 
 `HANDOFF.md` at the repository root is the shared progress log for every agent (Claude, Codex, others) and every device. It records state only; it grants no authority and never overrides this file, Issues, or Task Cards.
