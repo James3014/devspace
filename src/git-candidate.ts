@@ -639,6 +639,41 @@ export async function pushCandidate(options: {
     );
   }
 
+  // The local refs/remotes/<remote>/HEAD symref may be absent or stale, so ask
+  // the remote authoritatively. Fail closed when the default is undeterminable.
+  let authoritativeDefault: string | undefined;
+  try {
+    const { stdout } = await runGit(["ls-remote", "--symref", remote, "HEAD"], resolvedWorkspaceRoot, 15000);
+    const match = /^ref:\s+refs\/heads\/(\S+)\s+HEAD\s*$/m.exec(stdout);
+    authoritativeDefault = match?.[1];
+  } catch {
+    authoritativeDefault = undefined;
+  }
+  if (!authoritativeDefault) {
+    // A verified-empty remote has no born default branch yet, so no existing
+    // default can be overwritten; any other undeterminable state fails closed.
+    let remoteIsEmpty = false;
+    try {
+      const { stdout } = await runGit(["ls-remote", remote], resolvedWorkspaceRoot, 15000);
+      remoteIsEmpty = stdout.trim() === "";
+    } catch {
+      remoteIsEmpty = false;
+    }
+    if (remoteIsEmpty) authoritativeDefault = "";
+  }
+  if (authoritativeDefault === undefined) {
+    throw new GitCandidateError(
+      "GIT_EXECUTION_ERROR",
+      `Could not determine the default branch of remote '${remote}'; push denied because the default branch cannot be excluded.`,
+    );
+  }
+  if (authoritativeDefault && branch === authoritativeDefault) {
+    throw new GitCandidateError(
+      "GIT_PROTECTED_BRANCH",
+      `Pushing to remote default branch '${branch}' is denied.`,
+    );
+  }
+
   // 6. Push exact SHA: refs push remote expectedHead:refs/heads/<branch>
   try {
     await runGit(["push", remote, `${expectedHead}:refs/heads/${branch}`], resolvedWorkspaceRoot, 60000);

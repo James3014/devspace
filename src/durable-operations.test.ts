@@ -112,7 +112,7 @@ test("git_push preserves one durable attempt across lost acknowledgement and del
         await execFileAsync("git", args, { cwd });
         throw new Error("injected lost acknowledgement after remote accepted push");
       }
-      if (args[0] === "ls-remote" && firstReadback) {
+      if (args[0] === "ls-remote" && args.includes("--heads") && firstReadback) {
         firstReadback = false;
         return { stdout: "", stderr: "" };
       }
