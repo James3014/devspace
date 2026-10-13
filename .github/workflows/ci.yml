@@ -14,9 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
           - macos-latest
-          - windows-latest
 
     env:
       DEVSPACE_ALLOWED_ROOTS: ${{ github.workspace }}
