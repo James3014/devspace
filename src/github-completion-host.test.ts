@@ -193,6 +193,6 @@ describe("readHeadCheckRuns (Nexus-new #2068)", () => {
 
   it("bridge parse_head_check_runs validates payloads (python unittest)", () => {
     const script = fileURLToPath(new URL("../scripts/test_github_completion_bridge.py", import.meta.url));
-    execFileSync("python3", ["-I", script], { stdio: "pipe" });
+    execFileSync("python3", ["-I", "-B", script], { stdio: "pipe" });
   });
 });
