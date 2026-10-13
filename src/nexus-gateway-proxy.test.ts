@@ -396,6 +396,12 @@ try {
     for (const forbiddenKey of ["workspaceId", "cwd", "repo", "repository", "remote", "branch", "execution_lane", "executionLane", "internal", "completion"]) {
       assert.ok(!properties.includes(forbiddenKey), `public schema must NOT contain ${forbiddenKey}`);
     }
+    // #1384: the completion action's generation budget matches the Nexus-new loop maximum (5).
+    const completionTool = schemaPayload.result.tools.find((tool: { name: string }) => tool.name === "github_complete_pull_request");
+    assert.ok(completionTool, "github_complete_pull_request must be advertised");
+    assert.equal(completionTool.inputSchema.properties?.maxGenerations?.maximum, 5);
+    assert.equal(completionTool.inputSchema.properties?.maxGenerations?.minimum, 1);
+    assert.match(completionTool.description, /at most 5 non-force PR integration generations/);
     await schemaBoundary.close();
   }
 
