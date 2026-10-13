@@ -199,7 +199,7 @@ def main() -> int:
         initial_evidence=evidence,
         request=request,
         port=HostPort(),
-        max_generations=int(start.get("max_generations", 3)),
+        max_generations=int(start.get("max_generations", 5)),
         max_elapsed_seconds=float(start.get("max_elapsed_seconds", 2700.0)),
         git_root=nexus_root,
     )

@@ -20,6 +20,13 @@ const FULL_SHA = /^[0-9a-f]{40}$/;
 const SAFE_PATH = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))(?!.*\\)(?!.*[\u0000-\u001f\u007f]).+$/;
 const REPOSITORY = "James3014/Nexus-new";
 const DEFAULT_BRANCH = "main";
+/**
+ * Mirrors Nexus-new `MAX_INTEGRATION_GENERATIONS` /
+ * `DEFAULT_MAX_INTEGRATION_GENERATIONS` in
+ * `nexus/orchestrator/github_completion_loop.py` (#1384). The host must not
+ * advertise or enforce a tighter budget than the loop it drives.
+ */
+export const MAX_COMPLETION_INTEGRATION_GENERATIONS = 5;
 const COMPLETION_TARGET = {
   remoteName: "origin",
   repository: REPOSITORY,
@@ -75,6 +82,10 @@ function positiveInt(value: unknown, name: string, maximum: number): number {
   return value;
 }
 
+export function parseCompletionGeneration(value: unknown): number {
+  return positiveInt(value, "generation", MAX_COMPLETION_INTEGRATION_GENERATIONS);
+}
+
 export function isTransientRequiredChecksDecision(
   decision: Awaited<ReturnType<typeof evaluateRequiredChecks>>,
 ): boolean {
@@ -111,8 +122,8 @@ export function parseGitHubCompletionToolInput(raw: Record<string, unknown>): Gi
     throw new Error("ownerConfirmation must be exactly true");
   }
   const maxGenerations = raw.maxGenerations === undefined
-    ? 3
-    : positiveInt(raw.maxGenerations, "maxGenerations", 3);
+    ? MAX_COMPLETION_INTEGRATION_GENERATIONS
+    : positiveInt(raw.maxGenerations, "maxGenerations", MAX_COMPLETION_INTEGRATION_GENERATIONS);
   const maxElapsedSeconds = raw.maxElapsedSeconds === undefined
     ? 2700
     : positiveInt(raw.maxElapsedSeconds, "maxElapsedSeconds", 2700);
@@ -272,7 +283,7 @@ class CompletionHostPort {
     const baseSha = normalizeSha(params.base_sha, "base_sha");
     const baseTreeSha = normalizeSha(params.base_tree_sha, "base_tree_sha");
     const expectedHead = normalizeSha(params.expected_pr_head_sha, "expected_pr_head_sha");
-    const generation = positiveInt(params.generation, "generation", 3);
+    const generation = parseCompletionGeneration(params.generation);
     const target = await this.target();
     const pr = await this.transport.getPullRequest(REPOSITORY, this.prNumber);
     if (pr.state !== "OPEN" || pr.isDraft) {
@@ -368,7 +379,7 @@ class CompletionHostPort {
 
   private async readRequiredChecks(params: Record<string, unknown>): Promise<Record<string, unknown>> {
     const headSha = normalizeSha(params.head_sha, "checks_head_sha");
-    const generation = positiveInt(params.generation, "generation", 3);
+    const generation = parseCompletionGeneration(params.generation);
     const timeoutSeconds = typeof params.timeout_seconds === "number"
       ? Math.max(0, Math.min(params.timeout_seconds, 2700))
       : 2700;
