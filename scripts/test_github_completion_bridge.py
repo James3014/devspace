@@ -2,6 +2,8 @@
 """Unit tests for parse_head_check_runs in github_completion_bridge.py (Nexus-new #2068)."""
 
 import importlib.util
+import os
+import sys
 import unittest
 from pathlib import Path
 
@@ -64,6 +66,49 @@ class ParseHeadCheckRuns(unittest.TestCase):
         for bad in [None, [], {}, {"check_runs": None}, {"check_runs": ["x"]}]:
             with self.assertRaises(RuntimeError):
                 self.parse(bad)
+
+
+def _load_real_observation():
+    """Import the real HeadCheckRunObservation from a Nexus-new checkout.
+
+    Root: $NEXUS_NEW_ROOT or ~/workspace/Nexus-new. Returns (cls, None) or
+    (None, reason) when it cannot be imported (the contract test then skips).
+    """
+    root = Path(os.environ.get("NEXUS_NEW_ROOT", Path.home() / "workspace" / "Nexus-new"))
+    if not (root / "nexus" / "orchestrator" / "github_completion_loop.py").is_file():
+        return None, f"no Nexus-new checkout at {root}"
+    sys.path.insert(0, str(root))
+    try:
+        from nexus.orchestrator.github_completion_loop import HeadCheckRunObservation  # noqa: PLC0415
+    except Exception as exc:  # noqa: BLE001 - any import failure means skip
+        return None, f"cannot import HeadCheckRunObservation from {root}: {type(exc).__name__}: {exc}"
+    return HeadCheckRunObservation, None
+
+
+REAL_OBS, REAL_SKIP_REASON = _load_real_observation()
+
+
+class RealModelContract(unittest.TestCase):
+    """Feeds host-shaped payloads through the REAL Nexus-new model (no fake)."""
+
+    def setUp(self):
+        if REAL_OBS is None:
+            print(f"SKIP RealModelContract: {REAL_SKIP_REASON}", file=sys.stderr)
+            self.skipTest(REAL_SKIP_REASON)
+
+    def test_realistic_mix_validates_with_real_model(self):
+        payload = {"check_runs": [
+            run(name="Exact-base impact gate", workflow_path=".github/workflows/pytest.yml"),
+            run(name="Trusted impact gate (default branch)",
+                workflow_path=".github/workflows/trusted-impact-gate.yml"),
+            run(name="third-party-scan", app_id=7, app_slug="other-app", workflow_path=""),
+        ]}
+        out = bridge.parse_head_check_runs(payload, SHA, REAL_OBS)
+        self.assertEqual([o.app_id for o in out], [15368, 15368, 7])
+        self.assertEqual(
+            [o.workflow_path for o in out],
+            [".github/workflows/pytest.yml", ".github/workflows/trusted-impact-gate.yml", ""],
+        )
 
 
 if __name__ == "__main__":

@@ -241,6 +241,29 @@ describe("readHeadCheckRuns (Nexus-new #2068)", () => {
     assert.deepEqual(t.wfCalls, [1, 2]);
   });
 
+  it("resolves several check runs sharing one pull_request_target suite (real Nexus-new shape)", async () => {
+    // Real data (PR head cae34255): pull_request_target workflow runs carry the PR head_sha,
+    // and one suite (trusted-impact-gate.yml) backs three check runs.
+    const suite = { id: 104027917083 };
+    const t = pagedTransport(
+      [{ total: 3, runs: [
+        run(1, { name: "Trusted impact controller (default branch)", check_suite: suite }),
+        run(2, { name: "Unprivileged impact executor (exact head)", check_suite: suite }),
+        run(3, { name: "Exact-base impact gate" }),
+      ] }],
+      [{ total: 2, runs: [
+        wf(0, { check_suite_id: 104027917083, path: ".github/workflows/trusted-impact-gate.yml", event: "pull_request_target" }),
+        wf(3, { path: ".github/workflows/pytest.yml", event: "pull_request" }),
+      ] }],
+    );
+    const out = await readHeadCheckRuns(t, "o/r", SHA);
+    assert.deepEqual(out.map((r) => r.workflow_path), [
+      ".github/workflows/trusted-impact-gate.yml",
+      ".github/workflows/trusted-impact-gate.yml",
+      ".github/workflows/pytest.yml",
+    ]);
+  });
+
   it("fails closed when an Actions run's workflow cannot be resolved", async () => {
     await assert.rejects(
       () => readHeadCheckRuns(pagedTransport([{ total: 1, runs: [run(1)] }], [{ total: 0, runs: [] }]), "o/r", SHA),
