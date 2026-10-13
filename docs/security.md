@@ -136,7 +136,7 @@ It never exposes raw DevSpace workspace, edit, write, or shell tools, and
   `run_github_completion_loop()` caller through a JSON-lines host bridge. The
   Python caller cannot merge `main` directly: its CAS merge port is routed back
   into the existing `git_merge_pull_request` core. Integration generations are
-  same-repository, non-force PR-branch updates and are capped at 3 generations
+  same-repository, non-force PR-branch updates and are capped at 5 generations
   and 2700 seconds. Any affected semantic/authority/test/transport dimension
   fails closed for fresh Candidate acceptance.
 
