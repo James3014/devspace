@@ -198,7 +198,7 @@ test("P2-A: requested/resolved metadata is not fabricated as physical model atte
   }
 });
 
-test("P2-A: legacy Agy JSON model claims fail closed on status read without rewriting durable history", async () => {
+test("P2-A: legacy unproven model claims fail closed on status read without rewriting durable history", async () => {
   const { projectRoot, manager, cleanup } = setupEnv();
   try {
     const started = await manager.startAgent({
@@ -212,6 +212,11 @@ test("P2-A: legacy Agy JSON model claims fail closed on status read without rewr
     const store = (manager as any).store as LocalAgentStore;
     const sqlite = (store as any).database.sqlite;
 
+    // Each source labelled launch/configuration metadata or an unproven field
+    // as observed identity: Agy JSON keys, Claude system/init.model, HerdR
+    // model-named properties, and ACP session configuration readbacks.
+    const legacySources = ["agy_json_output", "claude_stream", "herdr_observed", "acp_session_metadata"];
+    for (const attestationSource of legacySources)
     for (const attestationState of ["MATCH", "MODEL_ATTESTATION_MISMATCH"] as const) {
       const record = store.getById(started.agentId)!;
       const lifecycleState = {
@@ -220,7 +225,7 @@ test("P2-A: legacy Agy JSON model claims fail closed on status read without rewr
           requestedModel: "claude-opus-4-6",
           resolvedModel: "claude-opus-4-6",
           observedModel: attestationState === "MATCH" ? "claude-opus-4-6" : "gemini-3.8-flash",
-          attestationSource: "agy_json_output",
+          attestationSource,
           attestationState,
           attestedAt: "2026-10-05T00:00:00.000Z",
         },
@@ -242,6 +247,29 @@ test("P2-A: legacy Agy JSON model claims fail closed on status read without rewr
       });
       assert.deepEqual(store.getById(started.agentId)?.lifecycleState?.modelAttestation, lifecycleState.modelAttestation);
     }
+
+    // A stored MATCH with no requested/resolved target compared nothing.
+    const record = store.getById(started.agentId)!;
+    const untargeted = {
+      ...record.lifecycleState,
+      modelAttestation: {
+        observedModel: "claude-opus-4-6",
+        attestationSource: "claude_assistant_response",
+        attestationState: "MATCH",
+        attestedAt: "2026-10-05T00:00:00.000Z",
+      },
+    };
+    sqlite.prepare("update local_agent_sessions set lifecycle_state=? where id=?")
+      .run(JSON.stringify(untargeted), started.agentId);
+    const untargetedStatus = await manager.getAgentStatus({
+      workspaceId: "ws_p2_legacy_agy_attestation",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.deepEqual(untargetedStatus.modelAttestation, {
+      ...untargeted.modelAttestation,
+      attestationState: "ATTESTATION_UNAVAILABLE",
+    });
   } finally {
     cleanup();
   }
@@ -502,7 +530,7 @@ test("P2 follow-up (Item A): model attestation compares provider-reported identi
       requestedModel: "claude-opus-4-6",
       resolvedModel: "claude-opus-4-6",
       observedModel: "claude-opus-4-6",
-      attestationSource: "claude_stream",
+      attestationSource: "claude_assistant_response",
     });
     assert.equal(match.attestationState, "MATCH");
     assert.equal(match.observedModel, "claude-opus-4-6");
@@ -513,6 +541,16 @@ test("P2 follow-up (Item A): model attestation compares provider-reported identi
       observedModel: null,
     });
     assert.equal(unavailable.attestationState, "ATTESTATION_UNAVAILABLE");
+
+    // An observed model with no requested/resolved target has nothing to
+    // match: keep the physical observation, but never report MATCH.
+    const untargeted = computeModelAttestation({
+      observedModel: "claude-opus-4-6",
+      attestationSource: "claude_assistant_response",
+    });
+    assert.equal(untargeted.attestationState, "ATTESTATION_UNAVAILABLE");
+    assert.equal(untargeted.observedModel, "claude-opus-4-6");
+    assert.equal(untargeted.attestationSource, "claude_assistant_response");
 
     // 2. Integration via store finishTurnCAS
     const store = (manager as any).store as LocalAgentStore;

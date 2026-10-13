@@ -52,6 +52,22 @@ class FakeClaudeQuery implements ClaudeQueryLike, AsyncIterator<unknown> {
   }
 }
 
+function scriptedClaudeQuery(events: unknown[]): ClaudeQueryLike {
+  let index = 0;
+  return {
+    [Symbol.asyncIterator]() {
+      return {
+        next: async () => index < events.length
+          ? { done: false as const, value: events[index++] }
+          : { done: true as const, value: undefined },
+      };
+    },
+    close() {},
+    async setPermissionMode() {},
+    async applyFlagSettings() {},
+  };
+}
+
 const context: LocalAgentRuntimeContext = {
   agentId: "agt_claude",
   provider: "claude",
@@ -220,6 +236,153 @@ await assert.rejects(
   TypeError,
   "programmer defects must not be reclassified as provider failures",
 );
+
+// A system/init model is the CLI's selected-session metadata, not a response
+// from the provider for this turn. It must never create a physical attestation.
+{
+  const initOnly = await new ClaudeLocalAgentDriver(async () => scriptedClaudeQuery([
+    { type: "system", subtype: "init", session_id: "claude-init-only", model: "sonnet" },
+    { type: "result", session_id: "claude-init-only", result: "done" },
+  ])).createRuntime(context);
+  assert.equal(initOnly.isOk(), true);
+  if (initOnly.isErr()) throw initOnly.error;
+
+  const attestations: unknown[] = [];
+  const run = await initOnly.value.run({ prompt: "init witness", workspaceRoot: "/tmp/project" }, {
+    onModelAttestation: (attestation) => { attestations.push(attestation); },
+  });
+  assert.equal(run.isOk(), true);
+  if (run.isErr()) throw run.error;
+  assert.equal(run.value.observedModel, undefined);
+  assert.deepEqual(attestations, []);
+}
+
+// A subagent can return a real assistant Message with its own model, but it is
+// not evidence for the primary model selected for this agent turn.
+{
+  const subagentOnly = await new ClaudeLocalAgentDriver(async () => scriptedClaudeQuery([
+    {
+      type: "assistant",
+      parent_tool_use_id: "toolu_spawned_subagent",
+      message: {
+        id: "msg_subagent_response",
+        type: "message",
+        role: "assistant",
+        model: "claude-haiku-5-20261001",
+        content: [{ type: "text", text: "subagent response" }],
+      },
+      session_id: "claude-subagent-only",
+    },
+    { type: "result", session_id: "claude-subagent-only", result: "done" },
+  ])).createRuntime(context);
+  assert.equal(subagentOnly.isOk(), true);
+  if (subagentOnly.isErr()) throw subagentOnly.error;
+
+  const attestations: unknown[] = [];
+  const run = await subagentOnly.value.run({ prompt: "subagent witness", workspaceRoot: "/tmp/project" }, {
+    onModelAttestation: (attestation) => { attestations.push(attestation); },
+  });
+  assert.equal(run.isOk(), true);
+  if (run.isErr()) throw run.error;
+  assert.equal(run.value.observedModel, undefined);
+  assert.deepEqual(attestations, []);
+}
+
+// The nested assistant Message is the Claude response object and carries its
+// returned model id. Persist the attestation callback before resolving the run.
+{
+  const responseModel = "claude-sonnet-5-20261001";
+  const providerResponse = await new ClaudeLocalAgentDriver(async () => scriptedClaudeQuery([
+    { type: "system", subtype: "init", session_id: "claude-response", model: "sonnet" },
+    {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: {
+        id: "msg_provider_response",
+        type: "message",
+        role: "assistant",
+        model: responseModel,
+        content: [{ type: "text", text: "provider response" }],
+      },
+      session_id: "claude-response",
+    },
+    { type: "result", session_id: "claude-response", result: "done" },
+  ])).createRuntime(context);
+  assert.equal(providerResponse.isOk(), true);
+  if (providerResponse.isErr()) throw providerResponse.error;
+
+  let callbackCompleted = false;
+  const attestations: Array<{ observedModel: string | null; attestationSource?: string }> = [];
+  const run = await providerResponse.value.run({ prompt: "response witness", workspaceRoot: "/tmp/project" }, {
+    onModelAttestation: async (attestation) => {
+      // A macrotask delay proves the run awaits persistence, not just a microtask.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      attestations.push(attestation);
+      callbackCompleted = true;
+    },
+  });
+  assert.equal(run.isOk(), true);
+  if (run.isErr()) throw run.error;
+  assert.equal(run.value.observedModel, responseModel);
+  assert.equal(run.value.attestationSource, "claude_assistant_response");
+  assert.equal(callbackCompleted, true);
+  assert.deepEqual(attestations, [{
+    observedModel: responseModel,
+    attestationSource: "claude_assistant_response",
+  }]);
+}
+
+// Conflicting primary response ids cannot be reduced to the last id: a later
+// matching response must not erase an earlier mismatch and yield MATCH.
+{
+  const requestedModel = "claude-sonnet-5-20261001";
+  const conflict = await new ClaudeLocalAgentDriver(async () => scriptedClaudeQuery([
+    {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: {
+        id: "msg_first_model",
+        type: "message",
+        role: "assistant",
+        model: "claude-haiku-5-20261001",
+        content: [{ type: "text", text: "first response" }],
+      },
+      session_id: "claude-conflicting-models",
+    },
+    {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: {
+        id: "msg_second_model",
+        type: "message",
+        role: "assistant",
+        model: requestedModel,
+        content: [{ type: "text", text: "second response" }],
+      },
+      session_id: "claude-conflicting-models",
+    },
+    { type: "result", session_id: "claude-conflicting-models", result: "done" },
+  ])).createRuntime(context);
+  assert.equal(conflict.isOk(), true);
+  if (conflict.isErr()) throw conflict.error;
+
+  const attestations: Array<{ observedModel: string | null; attestationSource?: string }> = [];
+  const run = await conflict.value.run({
+    prompt: "conflicting model witness",
+    workspaceRoot: "/tmp/project",
+    model: requestedModel,
+  }, {
+    onModelAttestation: (attestation) => { attestations.push(attestation); },
+  });
+  assert.equal(run.isOk(), true);
+  if (run.isErr()) throw run.error;
+  assert.equal(run.value.observedModel, null);
+  assert.equal(run.value.attestationSource, "claude_assistant_response_conflict");
+  assert.deepEqual(attestations, [
+    { observedModel: "claude-haiku-5-20261001", attestationSource: "claude_assistant_response" },
+    { observedModel: null, attestationSource: "claude_assistant_response_conflict" },
+  ]);
+}
 
 // ── Controlled macOS ordering witness (Issue #15 Residual proof gap B) ──
 // Prove: prompt accepted -> first session_id observed/persisted -> first possible tool/side effect
