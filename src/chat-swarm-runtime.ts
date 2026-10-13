@@ -131,6 +131,7 @@ interface ProvisionReceipt {
   schema: typeof PROVISION_RECEIPT_SCHEMA;
   disposition:
     | "PREPARED"
+    | "CARRIER_OBSERVED"
     | "CARRIER_CREATED"
     | "BOOTSTRAPPING"
     | "BOUND"
@@ -218,6 +219,10 @@ export interface ChatSwarmManagedCarrierAdapter extends ChatSwarmCarrierAdapter 
     projectUrl: string;
     deadlineAt: string;
   }): Promise<ManagedConversationEvidence>;
+  resolveProvisionIdentity?(input: {
+    conversationUrl: string;
+    deadlineAt: string;
+  }): Promise<ManagedConversationEvidence>;
   bootstrap(input: {
     operationId: string;
     swarmId: string;
@@ -244,6 +249,10 @@ export interface MacWebDriver {
   preflight(): Promise<RuntimePreflight>;
   createManagedConversation(
     projectUrl: string,
+    deadlineAt: string,
+  ): Promise<ManagedConversationEvidence>;
+  resolveManagedConversationIdentity?(
+    conversationUrl: string,
     deadlineAt: string,
   ): Promise<ManagedConversationEvidence>;
   sendPrompt(
@@ -379,7 +388,8 @@ function profileId(path: string): string {
   return createHash("sha256").update(resolve(path)).digest("hex");
 }
 function runtimeProvisionLeaseMs(config: ChatSwarmRuntimeConfig): number {
-  return config.operationTimeoutMs * 2 + config.bootstrapWaitMs;
+  const boundedOperationPhases = config.transport === "opencli" ? 3 : 2;
+  return config.operationTimeoutMs * boundedOperationPhases + config.bootstrapWaitMs;
 }
 function slotAttemptKey(swarmId: string, runtimeSlot: number): string {
   return `chat-swarm-runtime-slot:${swarmId}:${runtimeSlot}`;
@@ -673,6 +683,62 @@ export class ChatSwarmRuntimeStore {
       .prepare("update durable_operations set status='started',updated_at=? where operation_id=? and kind=? and scope_root=? and status='prepared'")
       .run(nowIso(), operationId, PROVISION_KIND, this.scopeRoot);
     return result.changes === 1;
+  }
+
+  markCarrierObserved(
+    operationId: string,
+    evidence: ManagedConversationEvidence,
+  ): ManagedCarrierSlot {
+    assertFingerprint(evidence.conversationFingerprint, "conversation fingerprint");
+    const tx = this.database.sqlite.transaction(() => {
+      const operation = this.requireProvision(operationId);
+      if (operation.status === "outcome_unknown") {
+        throw new ChatSwarmError(
+          "RECONCILIATION_REQUIRED",
+          "provision outcome is unknown; do not create another carrier",
+        );
+      }
+      if (operation.status !== "started") {
+        throw new ChatSwarmError("INVALID_STATE", "provision operation is not active");
+      }
+      const conflicting = this.getSlotByFingerprint(evidence.conversationFingerprint);
+      if (
+        conflicting &&
+        (conflicting.swarmId !== operation.request.swarmId ||
+          conflicting.runtimeSlot !== operation.request.runtimeSlot)
+      ) {
+        throw new ChatSwarmError(
+          "OWNERSHIP_CONFLICT",
+          "conversation is already managed by another runtime slot",
+        );
+      }
+      const observedAt = nowIso();
+      const receipt: ProvisionReceipt = {
+        schema: PROVISION_RECEIPT_SCHEMA,
+        disposition: "CARRIER_OBSERVED",
+        conversationUrl: evidence.conversationUrl,
+        conversationFingerprint: evidence.conversationFingerprint,
+        remoteMayContinue: true,
+        observedAt,
+      };
+      this.updateProvision(operationId, "started", receipt);
+      const slot = this.getSlot(operation.request.swarmId, operation.request.runtimeSlot)!;
+      this.updateSlotReceipt(
+        slot,
+        {
+          schema: SLOT_RECEIPT_SCHEMA,
+          generation: operation.request.generation,
+          state: "PROVISIONING",
+          conversationUrl: evidence.conversationUrl,
+          conversationFingerprint: evidence.conversationFingerprint,
+          lastOperationId: operationId,
+          updatedAt: observedAt,
+        },
+        "started",
+      );
+      return this.getSlot(operation.request.swarmId, operation.request.runtimeSlot)!;
+    });
+    return tx.immediate();
   }
 
   markCarrierCreated(
@@ -1496,6 +1562,18 @@ export class OpenCliMacWebDriver implements MacWebDriver {
     if (!conversationUrl) {
       throw new Error("OpenCLI did not return a ChatGPT conversation URL");
     }
+    return {
+      conversationUrl,
+      conversationFingerprint: conversationFingerprintFromUrl(conversationUrl),
+      appBinding: "UNKNOWN",
+    };
+  }
+
+  async resolveManagedConversationIdentity(
+    conversationUrl: string,
+    deadlineAt: string,
+  ): Promise<ManagedConversationEvidence> {
+    const probePrompt = this.peerIdentityProbePrompt();
     await this.waitForConversationIdle(conversationUrl, deadlineAt);
     const authenticatedPeerFingerprint = this.peerFingerprintFromDetail(
       await this.detail(conversationUrl, deadlineAt),
@@ -2345,6 +2423,10 @@ export function conversationFingerprintFromUrl(value: string): string {
 export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter {
   readonly kind = "mac_web_chatgpt";
   readonly configHash: string;
+  readonly resolveProvisionIdentity?: (input: {
+    conversationUrl: string;
+    deadlineAt: string;
+  }) => Promise<ManagedConversationEvidence>;
 
   constructor(
     readonly config: ChatSwarmRuntimeConfig,
@@ -2363,6 +2445,13 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
       appLabel: config.appLabel,
       kind: this.kind,
     });
+    if (this.driver.resolveManagedConversationIdentity) {
+      this.resolveProvisionIdentity = (input) =>
+        this.driver.resolveManagedConversationIdentity!(
+          input.conversationUrl,
+          input.deadlineAt,
+        );
+    }
   }
 
   capabilities() {
@@ -2646,7 +2735,11 @@ export class ChatSwarmRuntimeManager {
           continue;
         }
         operation = this.registry.getProvision(operation.operationId)!;
-      } else if (operation.status === "started" && !prepared.created) {
+      } else if (
+        operation.status === "started" &&
+        !prepared.created &&
+        !operation.receipt?.conversationUrl
+      ) {
         await this.waitForPeerInvocation(slot).catch(() => undefined);
         continue;
       }
@@ -2670,7 +2763,38 @@ export class ChatSwarmRuntimeManager {
           );
           break;
         }
-        slot = this.registry.markCarrierCreated(operation.operationId, evidence);
+        if (this.adapter.resolveProvisionIdentity) {
+          slot = this.registry.markCarrierObserved(operation.operationId, evidence);
+        } else {
+          slot = this.registry.markCarrierCreated(operation.operationId, evidence);
+        }
+        operation = this.registry.getProvision(operation.operationId)!;
+      }
+
+      if (
+        operation.status === "started" &&
+        operation.receipt?.conversationUrl &&
+        this.adapter.resolveProvisionIdentity
+      ) {
+        let resolvedEvidence: ManagedConversationEvidence;
+        try {
+          resolvedEvidence = await this.adapter.resolveProvisionIdentity({
+            conversationUrl: operation.receipt.conversationUrl,
+            deadlineAt: new Date(
+              Date.now() + this.runtimeConfig.operationTimeoutMs,
+            ).toISOString(),
+          });
+        } catch (error) {
+          this.registry.markProvisionUnknown(
+            operation.operationId,
+            error instanceof Error ? error.message : String(error),
+          );
+          break;
+        }
+        slot = this.registry.markCarrierCreated(
+          operation.operationId,
+          resolvedEvidence,
+        );
         operation = this.registry.getProvision(operation.operationId)!;
       }
 
