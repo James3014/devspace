@@ -410,6 +410,39 @@ export interface GitHubCompletionTransport extends GitHubPullRequestTransport {
   compareChangedFiles(repo: string, oldSha: string, newSha: string): Promise<string[]>;
   getPullRequestReviewState(repo: string, prNumber: number): Promise<PullRequestReviewState>;
   isPlatformApprovalRequired(repo: string, branch: string): Promise<boolean>;
+  /**
+   * One page of `GET /repos/{repo}/commits/{sha}/check-runs?filter=latest`.
+   * Rejects on any API error or malformed body; never returns an empty page
+   * to represent a failure.
+   */
+  getCheckRunsPage(
+    repo: string,
+    headSha: string,
+    page: number,
+    perPage: number,
+  ): Promise<CheckRunsPageView>;
+  /**
+   * One page of `GET /repos/{repo}/actions/runs?head_sha={sha}`. Rejects on any
+   * API error or malformed body.
+   */
+  getWorkflowRunsPage(
+    repo: string,
+    headSha: string,
+    page: number,
+    perPage: number,
+  ): Promise<WorkflowRunsPageView>;
+}
+
+/** Raw (unvalidated) Actions workflow-run page. */
+export interface WorkflowRunsPageView {
+  totalCount: number;
+  workflowRuns: unknown[];
+}
+
+/** Raw (unvalidated) check-run page; the completion host validates each run. */
+export interface CheckRunsPageView {
+  totalCount: number;
+  checkRuns: unknown[];
 }
 
 /**
@@ -713,6 +746,52 @@ export class GhCliGitHubTransport implements GitHubCompletionTransport {
         appSlug: app && typeof app.slug === "string" ? app.slug : null,
       };
     });
+  }
+
+  async getCheckRunsPage(
+    repo: string,
+    headSha: string,
+    page: number,
+    perPage: number,
+  ): Promise<CheckRunsPageView> {
+    const body = await this.apiJson([
+      "api",
+      `repos/${repo}/commits/${headSha}/check-runs?filter=latest&per_page=${perPage}&page=${page}`,
+    ]);
+    if (!body || Array.isArray(body)) throw new Error("CHECK_RUNS_RESPONSE_INVALID");
+    const record = body as { total_count?: unknown; check_runs?: unknown };
+    if (
+      typeof record.total_count !== "number"
+      || !Number.isInteger(record.total_count)
+      || record.total_count < 0
+      || !Array.isArray(record.check_runs)
+    ) {
+      throw new Error("CHECK_RUNS_RESPONSE_INVALID");
+    }
+    return { totalCount: record.total_count, checkRuns: record.check_runs };
+  }
+
+  async getWorkflowRunsPage(
+    repo: string,
+    headSha: string,
+    page: number,
+    perPage: number,
+  ): Promise<WorkflowRunsPageView> {
+    const body = await this.apiJson([
+      "api",
+      `repos/${repo}/actions/runs?head_sha=${headSha}&per_page=${perPage}&page=${page}`,
+    ]);
+    if (!body || Array.isArray(body)) throw new Error("WORKFLOW_RUNS_RESPONSE_INVALID");
+    const record = body as { total_count?: unknown; workflow_runs?: unknown };
+    if (
+      typeof record.total_count !== "number"
+      || !Number.isInteger(record.total_count)
+      || record.total_count < 0
+      || !Array.isArray(record.workflow_runs)
+    ) {
+      throw new Error("WORKFLOW_RUNS_RESPONSE_INVALID");
+    }
+    return { totalCount: record.total_count, workflowRuns: record.workflow_runs };
   }
 
   async getCommitStatus(repo: string, headSha: string): Promise<CommitStatusEvidence[]> {

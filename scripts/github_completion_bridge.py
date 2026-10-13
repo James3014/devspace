@@ -24,6 +24,41 @@ def _recv() -> dict[str, Any]:
     return value
 
 
+def parse_head_check_runs(result: Any, head_sha: str, observation_cls: Any) -> tuple[Any, ...]:
+    """Validate the host's check-run payload; fail closed on any irregularity.
+
+    Each run must carry its own head_sha equal to the requested one.  App
+    ``app_id`` (int) and ``workflow_path`` (str, "" for non-Actions apps) are
+    passed straight into the observation so the loop can pin the app/workflow.
+    """
+    if not isinstance(head_sha, str) or len(head_sha) != 40 or any(
+        c not in "0123456789abcdef" for c in head_sha
+    ):
+        raise RuntimeError("HEAD_CHECK_RUNS_HEAD_SHA_INVALID")
+    if not isinstance(result, dict) or not isinstance(result.get("check_runs"), list):
+        raise RuntimeError("HEAD_CHECK_RUNS_RESPONSE_INVALID")
+    observations = []
+    for item in result["check_runs"]:
+        if not isinstance(item, dict) or item.get("head_sha") != head_sha:
+            raise RuntimeError("HEAD_CHECK_RUNS_HEAD_SHA_MISMATCH")
+        app_id = item.get("app_id")
+        if not isinstance(app_id, int) or isinstance(app_id, bool):
+            raise RuntimeError("HEAD_CHECK_RUNS_APP_ID_INVALID")
+        if not isinstance(item.get("workflow_path"), str):
+            raise RuntimeError("HEAD_CHECK_RUNS_WORKFLOW_PATH_INVALID")
+        observations.append(
+            observation_cls(
+                name=item.get("name"),
+                status=item.get("status"),
+                conclusion=item.get("conclusion"),
+                head_sha=item.get("head_sha"),
+                app_id=app_id,
+                workflow_path=item["workflow_path"],
+            )
+        )
+    return tuple(observations)
+
+
 def main() -> int:
     start = _recv()
     if start.get("type") != "start":
@@ -44,6 +79,7 @@ def main() -> int:
         CasMergeResult,
         CasMergeStatus,
         DimensionRevalidationReceipt,
+        HeadCheckRunObservation,
         IntegrationMaterializationResult,
         PostMergeReconciliationResult,
         make_dimension_revalidation_receipt,
@@ -148,6 +184,10 @@ def main() -> int:
                 },
             )
             return tuple(CheckResult.model_validate(item) for item in result["checks"])
+
+        def read_head_check_runs(self, *, head_sha):
+            result = self._call("read_head_check_runs", {"head_sha": head_sha})
+            return parse_head_check_runs(result, head_sha, HeadCheckRunObservation)
 
         def read_reviews(self):
             result = self._call("read_reviews")
