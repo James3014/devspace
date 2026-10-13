@@ -305,7 +305,7 @@ export function registerRepositoryIntelligenceArtifactTool(
     {
       title: "Repository Intelligence artifact",
       description:
-        "Read and canonically verify one exact-head Repository Intelligence GitHub Actions artifact. snapshotKind=event returns PR-event timing only. snapshotKind=terminal returns evidence that the observed external check/status set was terminal and stable after quiescence; it still does not prove required-check completeness, Candidate acceptance, approval, merge readiness, release, or runtime activation.",
+        "Read and canonically verify one exact-head Repository Intelligence GitHub Actions artifact. snapshotKind=event returns PR-event timing only. snapshotKind=terminal is DEPRECATED (2026-10-13): the terminal RIE CI job was removed from all repositories, so no new terminal artifacts are produced and only artifacts from earlier PRs can still be read. It returns evidence that the observed external check/status set was terminal and stable after quiescence; it still does not prove required-check completeness, Candidate acceptance, approval, merge readiness, release, or runtime activation.",
       inputSchema: {
         workspaceId: z.string().min(1).describe(
           "Workspace to use. Reuse the current project's workspaceId.",
@@ -320,7 +320,7 @@ export function registerRepositoryIntelligenceArtifactTool(
           "Exact pull-request head SHA expected inside the artifact.",
         ),
         snapshotKind: z.enum(["event", "terminal"]).optional().describe(
-          "Artifact timing kind. Defaults to event for backward compatibility.",
+          "Artifact timing kind. Defaults to event for backward compatibility. terminal is deprecated: the terminal CI job was removed on 2026-10-13, so only historical artifacts exist.",
         ),
       },
       _meta: {},
