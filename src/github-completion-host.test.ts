@@ -99,12 +99,33 @@ describe("readHeadCheckRuns (Nexus-new #2068)", () => {
     conclusion: "success",
     head_sha: SHA,
     app: { id: 15368, slug: "github-actions" },
+    check_suite: { id: 1000 + n },
     ...over,
   });
-  const pagedTransport = (pages: Array<{ total: number; runs: unknown[] } | Error>) => {
+  const wf = (n: number, over: Record<string, unknown> = {}) => ({
+    id: 5000 + n,
+    check_suite_id: 1000 + n,
+    path: ".github/workflows/pytest.yml",
+    head_sha: SHA,
+    ...over,
+  });
+  type WfPage = { total: number; runs: unknown[] } | Error;
+  const defaultWf = (count: number): WfPage[] => [{ total: count, runs: Array.from({ length: count }, (_, i) => wf(i + 1)) }];
+  const pagedTransport = (pages: Array<{ total: number; runs: unknown[] } | Error>, wfPages?: WfPage[]) => {
     const calls: Array<[string, string, number, number]> = [];
+    const wfCalls: number[] = [];
+    const wfSource = wfPages ?? defaultWf(pages.reduce((n, p) => n + (p instanceof Error ? 0 : p.runs.length), 0));
     return {
       calls,
+      wfCalls,
+      getWorkflowRunsPage: async (_repo: string, sha: string, page: number, _perPage: number) => {
+        assert.equal(sha, SHA);
+        wfCalls.push(page);
+        const entry = wfSource[page - 1];
+        if (!entry) throw new Error("unexpected extra workflow page");
+        if (entry instanceof Error) throw entry;
+        return { totalCount: entry.total, workflowRuns: entry.runs };
+      },
       getCheckRunsPage: async (repo: string, sha: string, page: number, perPage: number) => {
         calls.push([repo, sha, page, perPage]);
         const entry = pages[page - 1];
@@ -119,13 +140,15 @@ describe("readHeadCheckRuns (Nexus-new #2068)", () => {
     const t = pagedTransport([
       { total: 3, runs: [run(1), run(2)] },
       { total: 3, runs: [run(3, { app: { id: 7, slug: "other" } })] },
-    ]);
+    ], defaultWf(2));
     const out = await readHeadCheckRuns(t, "o/r", SHA);
     assert.deepEqual(out.map((r) => r.name), ["check-1", "check-2", "check-3"]);
     assert.deepEqual(t.calls.map((c) => c[2]), [1, 2]);
     assert.equal(out[0].app_slug, "github-actions");
     assert.equal(out[0].app_id, 15368);
+    assert.equal(out[0].workflow_path, ".github/workflows/pytest.yml");
     assert.equal(out[2].app_id, 7);
+    assert.equal(out[2].workflow_path, "");
     assert.equal(out[0].head_sha, SHA);
   });
 
@@ -180,15 +203,74 @@ describe("readHeadCheckRuns (Nexus-new #2068)", () => {
     );
   });
 
-  it("keeps a null conclusion and null app identity", async () => {
+  it("keeps a null conclusion", async () => {
     const out = await readHeadCheckRuns(
-      pagedTransport([{ total: 1, runs: [run(1, { status: "in_progress", conclusion: null, app: null })] }]),
+      pagedTransport([{ total: 1, runs: [run(1, { status: "in_progress", conclusion: null })] }]),
       "o/r",
       SHA,
     );
     assert.equal(out[0].conclusion, null);
-    assert.equal(out[0].app_slug, null);
-    assert.equal(out[0].app_id, null);
+  });
+
+  it("requires an integer app_id on every run", async () => {
+    for (const app of [null, { slug: "x" }, { id: "1", slug: "x" }]) {
+      await assert.rejects(
+        () => readHeadCheckRuns(pagedTransport([{ total: 1, runs: [run(1, { app })] }]), "o/r", SHA),
+        /APP_ID_INVALID/,
+      );
+    }
+  });
+
+  it("does not query workflow runs when no run is from GitHub Actions", async () => {
+    const t = pagedTransport([{ total: 1, runs: [run(1, { app: { id: 7, slug: "other" } })] }], []);
+    const out = await readHeadCheckRuns(t, "o/r", SHA);
+    assert.equal(out[0].workflow_path, "");
+    assert.deepEqual(t.wfCalls, []);
+  });
+
+  it("paginates workflow runs and maps check_suite_id to path", async () => {
+    const t = pagedTransport(
+      [{ total: 2, runs: [run(1), run(2)] }],
+      [
+        { total: 2, runs: [wf(1, { path: ".github/workflows/a.yml" })] },
+        { total: 2, runs: [wf(2, { path: ".github/workflows/b.yml" })] },
+      ],
+    );
+    const out = await readHeadCheckRuns(t, "o/r", SHA);
+    assert.deepEqual(out.map((r) => r.workflow_path), [".github/workflows/a.yml", ".github/workflows/b.yml"]);
+    assert.deepEqual(t.wfCalls, [1, 2]);
+  });
+
+  it("fails closed when an Actions run's workflow cannot be resolved", async () => {
+    await assert.rejects(
+      () => readHeadCheckRuns(pagedTransport([{ total: 1, runs: [run(1)] }], [{ total: 0, runs: [] }]), "o/r", SHA),
+      /WORKFLOW_UNRESOLVED/,
+    );
+    await assert.rejects(
+      () => readHeadCheckRuns(pagedTransport([{ total: 1, runs: [run(1, { check_suite: null })] }]), "o/r", SHA),
+      /CHECK_SUITE_ID_INVALID/,
+    );
+  });
+
+  it("fails closed on workflow-run API error, SHA mismatch, bad path or conflicting paths", async () => {
+    const one = [{ total: 1, runs: [run(1)] }];
+    await assert.rejects(() => readHeadCheckRuns(pagedTransport(one, [new Error("HTTP 503")]), "o/r", SHA), /HTTP 503/);
+    await assert.rejects(
+      () => readHeadCheckRuns(pagedTransport(one, [{ total: 1, runs: [wf(1, { head_sha: "b".repeat(40) })] }]), "o/r", SHA),
+      /WORKFLOW_RUN_HEAD_SHA_MISMATCH/,
+    );
+    await assert.rejects(
+      () => readHeadCheckRuns(pagedTransport(one, [{ total: 1, runs: [wf(1, { path: "" })] }]), "o/r", SHA),
+      /WORKFLOW_RUN_PATH_INVALID/,
+    );
+    await assert.rejects(
+      () => readHeadCheckRuns(pagedTransport(one, [{ total: 2, runs: [wf(1), wf(1, { id: 9, path: ".github/workflows/x.yml" })] }]), "o/r", SHA),
+      /WORKFLOW_PATH_CONFLICT/,
+    );
+    await assert.rejects(
+      () => readHeadCheckRuns(pagedTransport(one, [{ total: 2, runs: [wf(1)] }, { total: 2, runs: [] }]), "o/r", SHA),
+      /PAGINATION_INCOMPLETE/,
+    );
   });
 
   it("bridge parse_head_check_runs validates payloads (python unittest)", () => {

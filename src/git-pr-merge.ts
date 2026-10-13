@@ -421,6 +421,22 @@ export interface GitHubCompletionTransport extends GitHubPullRequestTransport {
     page: number,
     perPage: number,
   ): Promise<CheckRunsPageView>;
+  /**
+   * One page of `GET /repos/{repo}/actions/runs?head_sha={sha}`. Rejects on any
+   * API error or malformed body.
+   */
+  getWorkflowRunsPage(
+    repo: string,
+    headSha: string,
+    page: number,
+    perPage: number,
+  ): Promise<WorkflowRunsPageView>;
+}
+
+/** Raw (unvalidated) Actions workflow-run page. */
+export interface WorkflowRunsPageView {
+  totalCount: number;
+  workflowRuns: unknown[];
 }
 
 /** Raw (unvalidated) check-run page; the completion host validates each run. */
@@ -753,6 +769,29 @@ export class GhCliGitHubTransport implements GitHubCompletionTransport {
       throw new Error("CHECK_RUNS_RESPONSE_INVALID");
     }
     return { totalCount: record.total_count, checkRuns: record.check_runs };
+  }
+
+  async getWorkflowRunsPage(
+    repo: string,
+    headSha: string,
+    page: number,
+    perPage: number,
+  ): Promise<WorkflowRunsPageView> {
+    const body = await this.apiJson([
+      "api",
+      `repos/${repo}/actions/runs?head_sha=${headSha}&per_page=${perPage}&page=${page}`,
+    ]);
+    if (!body || Array.isArray(body)) throw new Error("WORKFLOW_RUNS_RESPONSE_INVALID");
+    const record = body as { total_count?: unknown; workflow_runs?: unknown };
+    if (
+      typeof record.total_count !== "number"
+      || !Number.isInteger(record.total_count)
+      || record.total_count < 0
+      || !Array.isArray(record.workflow_runs)
+    ) {
+      throw new Error("WORKFLOW_RUNS_RESPONSE_INVALID");
+    }
+    return { totalCount: record.total_count, workflowRuns: record.workflow_runs };
   }
 
   async getCommitStatus(repo: string, headSha: string): Promise<CommitStatusEvidence[]> {

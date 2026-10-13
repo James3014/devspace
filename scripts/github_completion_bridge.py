@@ -28,8 +28,8 @@ def parse_head_check_runs(result: Any, head_sha: str, observation_cls: Any) -> t
     """Validate the host's check-run payload; fail closed on any irregularity.
 
     Each run must carry its own head_sha equal to the requested one.  App
-    identity (app_slug/app_id) is kept out of the frozen, extra="forbid"
-    observation model and is returned separately via ``HostPort.last_head_check_run_apps``.
+    ``app_id`` (int) and ``workflow_path`` (str, "" for non-Actions apps) are
+    passed straight into the observation so the loop can pin the app/workflow.
     """
     if not isinstance(head_sha, str) or len(head_sha) != 40 or any(
         c not in "0123456789abcdef" for c in head_sha
@@ -41,12 +41,19 @@ def parse_head_check_runs(result: Any, head_sha: str, observation_cls: Any) -> t
     for item in result["check_runs"]:
         if not isinstance(item, dict) or item.get("head_sha") != head_sha:
             raise RuntimeError("HEAD_CHECK_RUNS_HEAD_SHA_MISMATCH")
+        app_id = item.get("app_id")
+        if not isinstance(app_id, int) or isinstance(app_id, bool):
+            raise RuntimeError("HEAD_CHECK_RUNS_APP_ID_INVALID")
+        if not isinstance(item.get("workflow_path"), str):
+            raise RuntimeError("HEAD_CHECK_RUNS_WORKFLOW_PATH_INVALID")
         observations.append(
             observation_cls(
                 name=item.get("name"),
                 status=item.get("status"),
                 conclusion=item.get("conclusion"),
                 head_sha=item.get("head_sha"),
+                app_id=app_id,
+                workflow_path=item["workflow_path"],
             )
         )
     return tuple(observations)
@@ -82,8 +89,6 @@ def main() -> int:
     class HostPort:
         def __init__(self) -> None:
             self._next_id = 1
-            # App identity per observed check-run (slug/id), for optional app pinning.
-            self.last_head_check_run_apps: tuple[dict[str, Any], ...] = ()
 
         def _call(self, method: str, params: dict[str, Any] | None = None) -> Any:
             call_id = self._next_id
@@ -182,17 +187,7 @@ def main() -> int:
 
         def read_head_check_runs(self, *, head_sha):
             result = self._call("read_head_check_runs", {"head_sha": head_sha})
-            observations = parse_head_check_runs(result, head_sha, HeadCheckRunObservation)
-            self.last_head_check_run_apps = tuple(
-                {
-                    "name": item["name"],
-                    "head_sha": item["head_sha"],
-                    "app_slug": item.get("app_slug"),
-                    "app_id": item.get("app_id"),
-                }
-                for item in result["check_runs"]
-            )
-            return observations
+            return parse_head_check_runs(result, head_sha, HeadCheckRunObservation)
 
         def read_reviews(self):
             result = self._call("read_reviews")

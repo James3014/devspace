@@ -107,40 +107,76 @@ export function isTransientRequiredChecksDecision(
 
 const CHECK_RUNS_PER_PAGE = 100;
 const CHECK_RUNS_MAX_PAGES = 50;
+/** GitHub Actions app id; only its check runs are bound to a workflow file. */
+const GITHUB_ACTIONS_APP_ID = 15368;
 
 export interface HeadCheckRunWire {
   name: string;
   status: string;
   conclusion: string | null;
   head_sha: string;
+  app_id: number;
   app_slug: string | null;
-  app_id: number | null;
+  /** Workflow file path for GitHub Actions runs; "" for any other app. */
+  workflow_path: string;
+}
+
+type PageView = { totalCount: number; items: unknown[] };
+
+/** Fetch every page; throws on any error, shifting total, or short pagination. */
+async function collectAllPages(
+  fetchPage: (page: number) => Promise<PageView>,
+  label: string,
+  onItem: (raw: unknown) => void,
+): Promise<void> {
+  let expectedTotal: number | undefined;
+  let seen = 0;
+  for (let page = 1; page <= CHECK_RUNS_MAX_PAGES; page += 1) {
+    const view = await fetchPage(page);
+    if (!Number.isInteger(view.totalCount) || view.totalCount < 0 || !Array.isArray(view.items)) {
+      throw new Error(`${label}_RESPONSE_INVALID`);
+    }
+    if (expectedTotal === undefined) expectedTotal = view.totalCount;
+    else if (view.totalCount !== expectedTotal) throw new Error(`${label}_TOTAL_CHANGED_DURING_PAGINATION`);
+    for (const raw of view.items) {
+      onItem(raw);
+      seen += 1;
+    }
+    if (seen >= expectedTotal) {
+      if (seen !== expectedTotal) throw new Error(`${label}_COUNT_MISMATCH`);
+      return;
+    }
+    if (view.items.length === 0) throw new Error(`${label}_PAGINATION_INCOMPLETE`);
+  }
+  throw new Error(`${label}_PAGINATION_LIMIT_EXCEEDED`);
 }
 
 /**
  * Read every latest check-run GitHub reports for exact `headSha`
- * (`filter=latest`, all pages). Fails closed: any API/shape/pagination/SHA
- * error throws; an empty array is returned only when GitHub itself reports
- * `total_count: 0`.
+ * (`filter=latest`, all pages) and bind each GitHub Actions run to its workflow
+ * file via `actions/runs?head_sha=` (check_suite_id -> path). Fails closed: any
+ * API/shape/pagination/SHA/workflow-resolution error throws; an empty array is
+ * returned only when GitHub itself reports `total_count: 0`.
  */
 export async function readHeadCheckRuns(
-  transport: Pick<GitHubCompletionTransport, "getCheckRunsPage">,
+  transport: Pick<GitHubCompletionTransport, "getCheckRunsPage" | "getWorkflowRunsPage">,
   repo: string,
   headSha: unknown,
 ): Promise<HeadCheckRunWire[]> {
   const sha = normalizeSha(headSha, "check_runs_head_sha");
-  const runs: HeadCheckRunWire[] = [];
-  let expectedTotal: number | undefined;
-  for (let page = 1; page <= CHECK_RUNS_MAX_PAGES; page += 1) {
-    const view = await transport.getCheckRunsPage(repo, sha, page, CHECK_RUNS_PER_PAGE);
-    if (!Number.isInteger(view.totalCount) || view.totalCount < 0 || !Array.isArray(view.checkRuns)) {
-      throw new Error("CHECK_RUNS_RESPONSE_INVALID");
-    }
-    if (expectedTotal === undefined) expectedTotal = view.totalCount;
-    else if (view.totalCount !== expectedTotal) throw new Error("CHECK_RUNS_TOTAL_CHANGED_DURING_PAGINATION");
-    for (const raw of view.checkRuns) {
+  const parsed: Array<Omit<HeadCheckRunWire, "workflow_path"> & { suiteId: number | null }> = [];
+  await collectAllPages(
+    async (page) => {
+      const v = await transport.getCheckRunsPage(repo, sha, page, CHECK_RUNS_PER_PAGE);
+      return { totalCount: v.totalCount, items: v.checkRuns };
+    },
+    "CHECK_RUNS",
+    (raw) => {
       if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("CHECK_RUN_INVALID");
-      const r = raw as { name?: unknown; status?: unknown; conclusion?: unknown; head_sha?: unknown; app?: unknown };
+      const r = raw as {
+        name?: unknown; status?: unknown; conclusion?: unknown; head_sha?: unknown;
+        app?: unknown; check_suite?: unknown;
+      };
       if (typeof r.name !== "string" || r.name === "") throw new Error("CHECK_RUN_NAME_INVALID");
       if (typeof r.status !== "string" || r.status === "") throw new Error("CHECK_RUN_STATUS_INVALID");
       if (r.conclusion !== null && r.conclusion !== undefined && typeof r.conclusion !== "string") {
@@ -149,22 +185,53 @@ export async function readHeadCheckRuns(
       if (typeof r.head_sha !== "string" || !FULL_SHA.test(r.head_sha)) throw new Error("CHECK_RUN_HEAD_SHA_INVALID");
       if (r.head_sha !== sha) throw new Error("CHECK_RUN_HEAD_SHA_MISMATCH");
       const app = r.app && typeof r.app === "object" ? (r.app as { id?: unknown; slug?: unknown }) : null;
-      runs.push({
+      if (!app || typeof app.id !== "number" || !Number.isInteger(app.id)) throw new Error("CHECK_RUN_APP_ID_INVALID");
+      const suite = r.check_suite && typeof r.check_suite === "object"
+        ? (r.check_suite as { id?: unknown })
+        : null;
+      const suiteId = suite && typeof suite.id === "number" && Number.isInteger(suite.id) ? suite.id : null;
+      if (app.id === GITHUB_ACTIONS_APP_ID && suiteId === null) throw new Error("CHECK_RUN_CHECK_SUITE_ID_INVALID");
+      parsed.push({
         name: r.name,
         status: r.status,
         conclusion: typeof r.conclusion === "string" ? r.conclusion : null,
         head_sha: r.head_sha,
-        app_slug: app && typeof app.slug === "string" ? app.slug : null,
-        app_id: app && typeof app.id === "number" ? app.id : null,
+        app_id: app.id,
+        app_slug: typeof app.slug === "string" ? app.slug : null,
+        suiteId,
       });
-    }
-    if (runs.length >= expectedTotal) {
-      if (runs.length !== expectedTotal) throw new Error("CHECK_RUNS_COUNT_MISMATCH");
-      return runs;
-    }
-    if (view.checkRuns.length === 0) throw new Error("CHECK_RUNS_PAGINATION_INCOMPLETE");
+    },
+  );
+
+  const pathBySuite = new Map<number, string>();
+  if (parsed.some((r) => r.app_id === GITHUB_ACTIONS_APP_ID)) {
+    await collectAllPages(
+      async (page) => {
+        const v = await transport.getWorkflowRunsPage(repo, sha, page, CHECK_RUNS_PER_PAGE);
+        return { totalCount: v.totalCount, items: v.workflowRuns };
+      },
+      "WORKFLOW_RUNS",
+      (raw) => {
+        if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("WORKFLOW_RUN_INVALID");
+        const w = raw as { check_suite_id?: unknown; path?: unknown; head_sha?: unknown };
+        if (w.head_sha !== sha) throw new Error("WORKFLOW_RUN_HEAD_SHA_MISMATCH");
+        if (typeof w.check_suite_id !== "number" || !Number.isInteger(w.check_suite_id)) {
+          throw new Error("WORKFLOW_RUN_CHECK_SUITE_ID_INVALID");
+        }
+        if (typeof w.path !== "string" || w.path === "") throw new Error("WORKFLOW_RUN_PATH_INVALID");
+        const existing = pathBySuite.get(w.check_suite_id);
+        if (existing !== undefined && existing !== w.path) throw new Error("WORKFLOW_PATH_CONFLICT");
+        pathBySuite.set(w.check_suite_id, w.path);
+      },
+    );
   }
-  throw new Error("CHECK_RUNS_PAGINATION_LIMIT_EXCEEDED");
+
+  return parsed.map(({ suiteId, ...run }) => {
+    if (run.app_id !== GITHUB_ACTIONS_APP_ID) return { ...run, workflow_path: "" };
+    const path = pathBySuite.get(suiteId as number);
+    if (path === undefined) throw new Error("CHECK_RUN_WORKFLOW_UNRESOLVED");
+    return { ...run, workflow_path: path };
+  });
 }
 
 export function parseGitHubCompletionToolInput(raw: Record<string, unknown>): GitHubCompletionToolInput {
@@ -223,6 +290,7 @@ function transportWithCompletion(
     "getPullRequestReviewState",
     "isPlatformApprovalRequired",
     "getCheckRunsPage",
+    "getWorkflowRunsPage",
   ] as const;
   for (const name of required) {
     if (typeof candidate[name] !== "function") {

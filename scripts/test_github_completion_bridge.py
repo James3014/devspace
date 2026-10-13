@@ -15,13 +15,15 @@ SHA = "a" * 40
 
 
 class Obs:
-    def __init__(self, *, name, status, conclusion, head_sha):
+    def __init__(self, *, name, status, conclusion, head_sha, app_id, workflow_path):
         self.name, self.status, self.conclusion, self.head_sha = name, status, conclusion, head_sha
+        self.app_id, self.workflow_path = app_id, workflow_path
 
 
 def run(**over):
     base = {"name": "Exact-base impact gate", "status": "completed", "conclusion": "success",
-            "head_sha": SHA, "app_slug": "github-actions", "app_id": 15368}
+            "head_sha": SHA, "app_slug": "github-actions", "app_id": 15368,
+            "workflow_path": ".github/workflows/pytest.yml"}
     base.update(over)
     return base
 
@@ -34,6 +36,17 @@ class ParseHeadCheckRuns(unittest.TestCase):
         out = self.parse({"check_runs": [run(), run(name="x", conclusion=None, status="queued")]})
         self.assertEqual([o.name for o in out], ["Exact-base impact gate", "x"])
         self.assertIsNone(out[1].conclusion)
+        self.assertEqual(out[0].app_id, 15368)
+        self.assertEqual(out[0].workflow_path, ".github/workflows/pytest.yml")
+
+    def test_non_actions_app_has_empty_workflow_path(self):
+        out = self.parse({"check_runs": [run(app_id=7, workflow_path="")]})
+        self.assertEqual((out[0].app_id, out[0].workflow_path), (7, ""))
+
+    def test_missing_or_bad_app_fields_fail_closed(self):
+        for bad in [{"app_id": None}, {"app_id": "1"}, {"app_id": True}, {"workflow_path": None}, {"workflow_path": 3}]:
+            with self.assertRaises(RuntimeError):
+                self.parse({"check_runs": [run(**bad)]})
 
     def test_empty_ok_when_host_says_empty(self):
         self.assertEqual(self.parse({"check_runs": []}), ())
