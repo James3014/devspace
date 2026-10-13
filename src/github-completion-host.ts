@@ -105,6 +105,68 @@ export function isTransientRequiredChecksDecision(
   );
 }
 
+const CHECK_RUNS_PER_PAGE = 100;
+const CHECK_RUNS_MAX_PAGES = 50;
+
+export interface HeadCheckRunWire {
+  name: string;
+  status: string;
+  conclusion: string | null;
+  head_sha: string;
+  app_slug: string | null;
+  app_id: number | null;
+}
+
+/**
+ * Read every latest check-run GitHub reports for exact `headSha`
+ * (`filter=latest`, all pages). Fails closed: any API/shape/pagination/SHA
+ * error throws; an empty array is returned only when GitHub itself reports
+ * `total_count: 0`.
+ */
+export async function readHeadCheckRuns(
+  transport: Pick<GitHubCompletionTransport, "getCheckRunsPage">,
+  repo: string,
+  headSha: unknown,
+): Promise<HeadCheckRunWire[]> {
+  const sha = normalizeSha(headSha, "check_runs_head_sha");
+  const runs: HeadCheckRunWire[] = [];
+  let expectedTotal: number | undefined;
+  for (let page = 1; page <= CHECK_RUNS_MAX_PAGES; page += 1) {
+    const view = await transport.getCheckRunsPage(repo, sha, page, CHECK_RUNS_PER_PAGE);
+    if (!Number.isInteger(view.totalCount) || view.totalCount < 0 || !Array.isArray(view.checkRuns)) {
+      throw new Error("CHECK_RUNS_RESPONSE_INVALID");
+    }
+    if (expectedTotal === undefined) expectedTotal = view.totalCount;
+    else if (view.totalCount !== expectedTotal) throw new Error("CHECK_RUNS_TOTAL_CHANGED_DURING_PAGINATION");
+    for (const raw of view.checkRuns) {
+      if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("CHECK_RUN_INVALID");
+      const r = raw as { name?: unknown; status?: unknown; conclusion?: unknown; head_sha?: unknown; app?: unknown };
+      if (typeof r.name !== "string" || r.name === "") throw new Error("CHECK_RUN_NAME_INVALID");
+      if (typeof r.status !== "string" || r.status === "") throw new Error("CHECK_RUN_STATUS_INVALID");
+      if (r.conclusion !== null && r.conclusion !== undefined && typeof r.conclusion !== "string") {
+        throw new Error("CHECK_RUN_CONCLUSION_INVALID");
+      }
+      if (typeof r.head_sha !== "string" || !FULL_SHA.test(r.head_sha)) throw new Error("CHECK_RUN_HEAD_SHA_INVALID");
+      if (r.head_sha !== sha) throw new Error("CHECK_RUN_HEAD_SHA_MISMATCH");
+      const app = r.app && typeof r.app === "object" ? (r.app as { id?: unknown; slug?: unknown }) : null;
+      runs.push({
+        name: r.name,
+        status: r.status,
+        conclusion: typeof r.conclusion === "string" ? r.conclusion : null,
+        head_sha: r.head_sha,
+        app_slug: app && typeof app.slug === "string" ? app.slug : null,
+        app_id: app && typeof app.id === "number" ? app.id : null,
+      });
+    }
+    if (runs.length >= expectedTotal) {
+      if (runs.length !== expectedTotal) throw new Error("CHECK_RUNS_COUNT_MISMATCH");
+      return runs;
+    }
+    if (view.checkRuns.length === 0) throw new Error("CHECK_RUNS_PAGINATION_INCOMPLETE");
+  }
+  throw new Error("CHECK_RUNS_PAGINATION_LIMIT_EXCEEDED");
+}
+
 export function parseGitHubCompletionToolInput(raw: Record<string, unknown>): GitHubCompletionToolInput {
   const initialEvidence = raw.initialEvidence;
   const standingGrantRequest = raw.standingGrantRequest;
@@ -160,6 +222,7 @@ function transportWithCompletion(
     "compareChangedFiles",
     "getPullRequestReviewState",
     "isPlatformApprovalRequired",
+    "getCheckRunsPage",
   ] as const;
   for (const name of required) {
     if (typeof candidate[name] !== "function") {
@@ -249,6 +312,8 @@ class CompletionHostPort {
         return await this.materialize(params);
       case "read_required_checks":
         return await this.readRequiredChecks(params);
+      case "read_head_check_runs":
+        return { check_runs: await readHeadCheckRuns(this.transport, REPOSITORY, params.head_sha) };
       case "read_reviews": {
         const state = await this.transport.getPullRequestReviewState(REPOSITORY, this.prNumber);
         const initialReviews = Array.isArray(this.input.initialEvidence.reviews)

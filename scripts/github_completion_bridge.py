@@ -24,6 +24,34 @@ def _recv() -> dict[str, Any]:
     return value
 
 
+def parse_head_check_runs(result: Any, head_sha: str, observation_cls: Any) -> tuple[Any, ...]:
+    """Validate the host's check-run payload; fail closed on any irregularity.
+
+    Each run must carry its own head_sha equal to the requested one.  App
+    identity (app_slug/app_id) is kept out of the frozen, extra="forbid"
+    observation model and is returned separately via ``HostPort.last_head_check_run_apps``.
+    """
+    if not isinstance(head_sha, str) or len(head_sha) != 40 or any(
+        c not in "0123456789abcdef" for c in head_sha
+    ):
+        raise RuntimeError("HEAD_CHECK_RUNS_HEAD_SHA_INVALID")
+    if not isinstance(result, dict) or not isinstance(result.get("check_runs"), list):
+        raise RuntimeError("HEAD_CHECK_RUNS_RESPONSE_INVALID")
+    observations = []
+    for item in result["check_runs"]:
+        if not isinstance(item, dict) or item.get("head_sha") != head_sha:
+            raise RuntimeError("HEAD_CHECK_RUNS_HEAD_SHA_MISMATCH")
+        observations.append(
+            observation_cls(
+                name=item.get("name"),
+                status=item.get("status"),
+                conclusion=item.get("conclusion"),
+                head_sha=item.get("head_sha"),
+            )
+        )
+    return tuple(observations)
+
+
 def main() -> int:
     start = _recv()
     if start.get("type") != "start":
@@ -44,6 +72,7 @@ def main() -> int:
         CasMergeResult,
         CasMergeStatus,
         DimensionRevalidationReceipt,
+        HeadCheckRunObservation,
         IntegrationMaterializationResult,
         PostMergeReconciliationResult,
         make_dimension_revalidation_receipt,
@@ -53,6 +82,8 @@ def main() -> int:
     class HostPort:
         def __init__(self) -> None:
             self._next_id = 1
+            # App identity per observed check-run (slug/id), for optional app pinning.
+            self.last_head_check_run_apps: tuple[dict[str, Any], ...] = ()
 
         def _call(self, method: str, params: dict[str, Any] | None = None) -> Any:
             call_id = self._next_id
@@ -148,6 +179,20 @@ def main() -> int:
                 },
             )
             return tuple(CheckResult.model_validate(item) for item in result["checks"])
+
+        def read_head_check_runs(self, *, head_sha):
+            result = self._call("read_head_check_runs", {"head_sha": head_sha})
+            observations = parse_head_check_runs(result, head_sha, HeadCheckRunObservation)
+            self.last_head_check_run_apps = tuple(
+                {
+                    "name": item["name"],
+                    "head_sha": item["head_sha"],
+                    "app_slug": item.get("app_slug"),
+                    "app_id": item.get("app_id"),
+                }
+                for item in result["check_runs"]
+            )
+            return observations
 
         def read_reviews(self):
             result = self._call("read_reviews")
