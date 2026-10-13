@@ -19,7 +19,7 @@ import {
   type MergeEffectGuard,
   type TrustedIntegrationTarget,
 } from "./git-pr-merge.js";
-import { runGitHubCompletionTool } from "./github-completion-host.js";
+import { MAX_COMPLETION_INTEGRATION_GENERATIONS, runGitHubCompletionTool } from "./github-completion-host.js";
 
 type JsonSchema = {
   type?: string | string[];
@@ -620,13 +620,13 @@ export async function createNexusGatewayProxyServer(
       name,
       {
         description:
-          "Run Nexus run_github_completion_loop() against the server-bound James3014/Nexus-new checkout. Ordinary main drift may create at most 3 non-force PR integration generations and wait at most 2700 seconds total. Affected semantic/authority/test/transport dimensions fail closed for fresh acceptance. Protected main integration delegates to the existing git_merge_pull_request merge core; this action does not implement a second merge authority.",
+          `Run Nexus run_github_completion_loop() against the server-bound James3014/Nexus-new checkout. Ordinary main drift may create at most ${MAX_COMPLETION_INTEGRATION_GENERATIONS} non-force PR integration generations and wait at most 2700 seconds total. Affected semantic/authority/test/transport dimensions fail closed for fresh acceptance. Protected main integration delegates to the existing git_merge_pull_request merge core; this action does not implement a second merge authority.`,
         inputSchema: {
           initialEvidence: z.record(z.string(), z.unknown()).describe("Exact accepted nexus.github_orchestration_evidence payload."),
           standingGrantRequest: z.record(z.string(), z.unknown()).describe("Exact nexus.standing_grant_request.v1 payload bound to the durable standing grant."),
           mergeMethod: z.enum(["merge", "squash", "rebase"]).default("merge"),
           ownerConfirmation: z.boolean().describe("Must be exactly true for the host protected merge authority."),
-          maxGenerations: z.number().int().min(1).max(3).optional(),
+          maxGenerations: z.number().int().min(1).max(MAX_COMPLETION_INTEGRATION_GENERATIONS).optional(),
           maxElapsedSeconds: z.number().int().min(1).max(2700).optional(),
         },
         annotations: {
