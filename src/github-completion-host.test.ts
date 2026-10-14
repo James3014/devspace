@@ -82,10 +82,11 @@ describe("completion integration generation cap (#1384)", () => {
     }
   });
 
-  it("port generation guard admits I4 and I5 and rejects I6", () => {
-    assert.equal(parseCompletionGeneration(4), 4);
-    assert.equal(parseCompletionGeneration(5), 5);
-    for (const value of [0, 6, null, "4"]) {
+  it("port generation guard accepts absolute I6 and later in a resumed five-generation run", () => {
+    for (const generation of [4, 5, 6, 7, 12, Number.MAX_SAFE_INTEGER]) {
+      assert.equal(parseCompletionGeneration(generation), generation);
+    }
+    for (const value of [0, -1, 1.5, null, "6", Number.MAX_SAFE_INTEGER + 1]) {
       assert.throws(() => parseCompletionGeneration(value), /generation_INVALID/);
     }
   });

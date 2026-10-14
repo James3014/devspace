@@ -83,7 +83,7 @@ function positiveInt(value: unknown, name: string, maximum: number): number {
 }
 
 export function parseCompletionGeneration(value: unknown): number {
-  return positiveInt(value, "generation", MAX_COMPLETION_INTEGRATION_GENERATIONS);
+  return positiveInt(value, "generation", Number.MAX_SAFE_INTEGER);
 }
 
 export function isTransientRequiredChecksDecision(
