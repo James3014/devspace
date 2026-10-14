@@ -134,7 +134,7 @@ Start at the boundary named by the problem and follow the data. Keep policy in D
 - This binding is Evidence Trust + Completion only. It does not select the execution lane, route, worker/model, Candidate acceptance, merge, release, deployment, or production authority.
 - DIRECT work remains transport-neutral. A Core mutation session is not required solely because repository files are being changed.
 
-New issues must be opened from the issue template so the Nexus Core evidence-universe marker is present (from the CLI: `gh issue create --template task.md`). After any change to `.nexus-core/config.toml`, regenerate the marker with `nexus-certify markers` and update the template. PRs bind to their issue with `<!-- NEXUS_CORE_ISSUE: N -->`.
+Issues no longer need a `NEXUS_CORE_EVIDENCE_UNIVERSE` marker: the Core gate runs with `evidence-universe: trusted-config` and derives it from the trusted base config. The issue template (`gh issue create --template task.md`) is still the preferred form. PRs bind to their issue with `<!-- NEXUS_CORE_ISSUE: N -->`.
 
 ## Handoff
 

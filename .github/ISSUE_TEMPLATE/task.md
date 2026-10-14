@@ -1,11 +1,10 @@
 ---
 name: Task
-about: Issue bound to the Nexus Core gate (marker pre-filled)
+about: Issue bound to the Nexus Core gate
 title: ""
 ---
-<!-- NEXUS_CORE_EVIDENCE_UNIVERSE: sha256:067385413f215bfa515e07d7e20b27b074040c19540e48aef9ae002cd314eec9 -->
-<!-- The line above binds this issue to the Nexus Core evidence universe. Keep it as the first line, unmodified.
-Regenerate it with `nexus-certify markers` (run in the repo on main) whenever `.nexus-core/config.toml` changes. -->
+<!-- No evidence-universe marker is needed: the Core gate derives it from the trusted base config
+(issue-gate evidence-universe: trusted-config). Bind the PR with a NEXUS_CORE_ISSUE marker in the PR body. -->
 
 ## Problem
 

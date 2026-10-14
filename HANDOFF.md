@@ -22,5 +22,5 @@
 
 ## 卡住 / 注意
 - #499（download_artifact 的 host 只做前綴比對）還沒有修正 PR。
-- 多個 PR 的 Nexus Core issue gate 紅燈；送出前要確認 issue 有 `NEXUS_CORE_EVIDENCE_UNIVERSE` marker，PR body 也帶 `NEXUS_CORE_ISSUE`。
+- Nexus Core issue gate 改用 `evidence-universe: trusted-config`：issue 不再需要 `NEXUS_CORE_EVIDENCE_UNIVERSE` marker；PR body 仍要帶 `NEXUS_CORE_ISSUE`。
 - 本 repo 是 fork；gate 已拿掉 `fork==false` 條件（#457），不要再加回去。
