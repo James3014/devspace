@@ -666,6 +666,73 @@ test("C4 direct cutover lost-ACK reconciles exact intent, never recreates absent
   }
 });
 
+test("C4 direct cutover reconcile rejects a generation started by a different attempt", async () => {
+  const f = await fixture();
+  const manager = new DurableOperationManager(f.config);
+  try {
+    const identities = {
+      currentIdentity: { serverInstanceId: "old-1", sourceCommit: "a".repeat(40), buildId: "old-build" },
+      expectedIdentity: { sourceCommit: "b".repeat(40), buildId: "new-build" },
+    };
+    const inputA = { attemptKey: "c4-attempt-a", ...identities };
+    const plannedA = planCutoverStart(f.config.stateDir, inputA);
+    const requestA = { ...plannedA.request, ownerDirect: true };
+    manager.store.createOrReplay({
+      operationId: plannedA.operationId,
+      attemptKey: inputA.attemptKey,
+      requestHash: hashJson(requestA),
+      kind: "cutover_start",
+      scopeRoot: plannedA.stateRoot,
+      request: requestA,
+    });
+    // Attempt B legitimately starts the generation (same identities and expiry).
+    const plannedB = planCutoverStart(f.config.stateDir, { attemptKey: "c4-attempt-b", ...identities });
+    assert.notEqual(plannedB.operationId, plannedA.operationId);
+    const requestB = { ...plannedB.request, ownerDirect: true };
+    assert.equal(requestB.expiresAt, requestA.expiresAt);
+    const generationB = new CutoverStateStore(f.config.stateDir).begin({
+      oldServerIdentity: identities.currentIdentity,
+      expectedNewIdentity: identities.expectedIdentity,
+      directOperation: { operationId: plannedB.operationId, requestHash: hashJson(requestB) },
+    });
+    assert.throws(
+      () => manager.reconcileDirectCutoverStart(plannedA.operationId),
+      (error: unknown) => error instanceof DurableOperationError && error.code === "RECONCILIATION_REQUIRED",
+    );
+    const after = manager.store.getByOperationId(plannedA.operationId);
+    assert.equal(after?.status, "started");
+    assert.notEqual(after?.receipt?.cutoverId, generationB.cutoverId);
+  } finally {
+    manager.close();
+    await f.cleanup();
+  }
+});
+
+test("C4 hasLegacyBoundOperations ignores owner-direct dependency_sync but counts unflagged unfinished ones", async () => {
+  const f = await fixture();
+  const manager = new DurableOperationManager(f.config);
+  try {
+    const create = (id: string, extra: Record<string, unknown>) => manager.store.createOrReplay({
+      operationId: id,
+      attemptKey: `attempt-${id}`,
+      requestHash: id.slice(3).padEnd(64, "e"),
+      kind: "dependency_sync",
+      scopeRoot: f.config.stateDir,
+      request: { version: "t", workspaceRoot: f.config.stateDir, ...extra },
+    });
+    const direct = create("op_aaaaaaaaaaaaaaaa", { ownerDirectExecution: true });
+    assert.equal(direct.record.status, "started");
+    assert.equal(manager.store.hasLegacyBoundOperations(), false, "ownerDirectExecution is not legacy");
+    create("op_bbbbbbbbbbbbbbbb", { ownerDirectIsolated: true });
+    assert.equal(manager.store.hasLegacyBoundOperations(), false, "ownerDirectIsolated is not legacy");
+    create("op_cccccccccccccccc", {});
+    assert.equal(manager.store.hasLegacyBoundOperations(), true, "unflagged started dependency_sync is legacy");
+  } finally {
+    manager.close();
+    await f.cleanup();
+  }
+});
+
 test("C4 startup Carrier compatibility inventory excludes direct records but detects bound history", async () => {
   const f = await fixture();
   const manager = new DurableOperationManager(f.config);
