@@ -2419,3 +2419,57 @@ test("revoked expired prepare-only cutover lease cleanup requires exact no-effec
     assert.deepEqual(replay.lease,result.lease);
   } finally {f.close();}
 });
+
+function idleCutoverScenario(f:ReturnType<typeof fixture>,key:string,opts:{revoke?:boolean;advanceMs?:number}={}) {
+  const context={clientId:"shared-oauth",sessionId:`idle-${key}`};
+  const pairing=f.store.requestPairing(context);
+  const cutover={
+    stateRoot:f.root,
+    attemptKey:key,
+    currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+    expectedIdentity:{sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+    expiresAt:new Date(f.clock()+30_000).toISOString(),
+    restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"prepare-only canary"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+    finish:{workspaceId:"ws_idle",agentId:"agt_idle"},
+  };
+  const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+60_000).toISOString()};
+  const approved=f.store.approveLocal(pairing.pendingId,contract);
+  f.store.redeem(context,pairing.credential);
+  const plan=planCutoverStart(f.root,cutover);
+  const lease=f.store.prepareEffect(context,plan.subject);
+  if(opts.revoke!==false) f.store.revokeLocal(approved.id,approved.version);
+  f.advance(opts.advanceMs ?? 120_000);
+  const input={leaseId:lease.leaseId,expectedLeaseVersion:lease.version,carrierId:approved.id,expectedCarrierVersion:opts.revoke===false?approved.version:2,expectedValidityVersion:1,expectedOperationId:plan.operationId,confirmLeaseId:lease.leaseId};
+  return {input,lease,plan,approved};
+}
+
+test("idle orphan lease cleanup fails closed for non-revoked carrier, live lease, pinned lease, durable evidence and wrong identity (#415)", () => {
+  const leaseRow=(f:ReturnType<typeof fixture>,id:string)=>f.db.sqlite.prepare("select terminal_state,version from control_plane_resource_leases where lease_id=?").get(id) as {terminal_state:string|null;version:number};
+  const expectDenied=(f:ReturnType<typeof fixture>,s:ReturnType<typeof idleCutoverScenario>,override:Partial<typeof s.input>,pattern:RegExp)=>{
+    const before=f.snapshot();
+    assert.throws(()=>f.store.releaseRevokedIdleCutoverLeaseLocal({...s.input,...override}),pattern);
+    assert.equal(f.snapshot(),before,"a denied cleanup must not mutate state");
+    assert.equal(leaseRow(f,s.lease.leaseId).terminal_state,null);
+  };
+  // Active (not revoked) root carrier.
+  { const f=fixture();try { const s=idleCutoverScenario(f,"active",{revoke:false}); expectDenied(f,s,{expectedCarrierVersion:2},/exact revoked root carrier/); } finally {f.close();} }
+  // Revoked carrier but not expired lease/validity.
+  { const f=fixture();try { const s=idleCutoverScenario(f,"live",{advanceMs:1_000}); expectDenied(f,s,{},/expired/); } finally {f.close();} }
+  // Wrong confirmation, carrier id, carrier version, lease id.
+  { const f=fixture();try { const s=idleCutoverScenario(f,"wrong");
+    expectDenied(f,s,{confirmLeaseId:"lease_other"},/confirmation must equal the exact lease id/);
+    expectDenied(f,s,{carrierId:"carrier_nope"},/exact revoked root carrier/);
+    expectDenied(f,s,{expectedCarrierVersion:s.input.expectedCarrierVersion+1},/exact revoked root carrier/);
+    expectDenied(f,s,{leaseId:"lease_nope",confirmLeaseId:"lease_nope"},/effect binding changed/);
+  } finally {f.close();} }
+  // Pinned lease (active operation handle) must go through reconciliation, never hygiene.
+  { const f=fixture();try { const s=idleCutoverScenario(f,"pinned");
+    f.db.sqlite.prepare("update control_plane_resource_leases set active_operation_handle='pinned-op', operation_state='active' where lease_id=?").run(s.lease.leaseId);
+    expectDenied(f,s,{},/exact expired unpinned prepare-only lease/);
+  } finally {f.close();} }
+  // Terminal witness present.
+  { const f=fixture();try { const s=idleCutoverScenario(f,"witness");
+    f.db.sqlite.prepare("insert into dependency_terminal_witnesses(operation_id,request_hash,lease_id,exit_code,frozen_inputs_unchanged) values(?,?,?,0,1)").run(s.plan.operationId,s.plan.requestHash,s.lease.leaseId);
+    expectDenied(f,s,{},/refuses any durable or terminal effect evidence/);
+  } finally {f.close();} }
+});

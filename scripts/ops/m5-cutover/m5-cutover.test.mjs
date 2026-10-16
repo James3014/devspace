@@ -54,6 +54,19 @@ test("no active generation or a closed one selects full", () => {
   assert.equal(select(record({ phase: "closed" }), false, true), "full");
 });
 
+test("closed file whose state-root lease is still held is refused with a release-terminal-lease hint (#516)", () => {
+  const closed = record({ phase: "closed", coordinationBinding: { leaseId: "lease_held" } });
+  const held = { leaseId: "lease_held", version: 3, terminalState: null };
+  const run = () => selectMode({ file: closed, contract, liveIsOld: false, liveIsTarget: true, closedLease: held });
+  assert.throws(run, (error) => error instanceof Refuse
+    && /cutover release-terminal-lease --cutover-id cut_1 --lease-id lease_held --lease-version 3 .* --confirm cut_1$/.test(error.recovery) && error.extra.cutoverId === "cut_1"
+    && error.extra.activePhase === "closed" && error.extra.leaseId === "lease_held");
+  // Liveness only: a terminal lease, an absent lease row, or no lease info keep the brand-new-attempt path.
+  for (const closedLease of [{ leaseId: "lease_held", version: 4, terminalState: "released" }, null, undefined]) {
+    assert.equal(selectMode({ file: closed, contract, liveIsOld: true, liveIsTarget: false, closedLease }), "full");
+  }
+});
+
 test("prepared without progress and old live resumes at drain", () => {
   assert.equal(select(record(), true, false), "resume_drain");
 });

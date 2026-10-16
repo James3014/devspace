@@ -98,7 +98,16 @@ try {
   const liveIsTarget = matchesTarget(before, target)
     && before.mcp.serverInstanceId !== contract.cutover.currentIdentity.serverInstanceId;
   if (file && file.phase !== "closed") cutoverId = file.cutoverId;
-  const mode = selectMode({ file, contract, liveIsOld, liveIsTarget }); // "full" | "resume_drain" | "resume_restart" | "resume_finish"
+  // Closed file but state-root lease not yet terminal (crash between file close and lease finalization): read-only probe.
+  let closedLease;
+  if (file?.phase === "closed" && file.coordinationBinding?.leaseId) {
+    const probeBindings = new CarrierBindingStore(config.stateDir);
+    try {
+      const row = probeBindings.ownership.get(file.coordinationBinding.leaseId);
+      if (row) closedLease = { leaseId: row.leaseId, version: row.version, terminalState: row.terminalState ?? null };
+    } finally { probeBindings.close(); }
+  }
+  const mode = selectMode({ file, contract, liveIsOld, liveIsTarget, closedLease }); // "full" | "resume_drain" | "resume_restart" | "resume_finish"
   log("phase_detected", { mode, activePhase: file?.phase ?? null, cutoverId: file?.cutoverId ?? null, liveIsOld, liveIsTarget });
 
   if (mode !== "resume_finish" && Date.parse(contract.cutover.expiresAt) <= Date.now()) {
