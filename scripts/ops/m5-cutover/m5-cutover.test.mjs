@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -25,10 +26,12 @@ function record(overrides = {}) {
 const select = (file, liveIsOld, liveIsTarget) => selectMode({ file, contract, liveIsOld, liveIsTarget });
 
 test("sidecar without env exits 1 with a usage error and no side effects", () => {
-  const env = { PATH: process.env.PATH };
+  // HOME is set explicitly: CI containers may run as a uid with no passwd entry, where os.homedir() throws.
+  const env = { PATH: process.env.PATH, HOME: tmpdir() };
   const result = spawnSync(process.execPath, [join(here, "m5-cutover-sidecar.mjs")], { env, encoding: "utf8" });
   assert.equal(result.status, 1);
-  const failure = JSON.parse(result.stderr);
+  let failure;
+  try { failure = JSON.parse(result.stderr); } catch { assert.fail(`sidecar stderr is not the JSON usage failure:\n${result.stderr}`); }
   assert.equal(failure.ok, false);
   assert.match(failure.error, /PENDING_ID, CONTRACT_PATH, RECEIPT_PATH and ACTIVE_RELEASE_ROOT are all required/);
 });

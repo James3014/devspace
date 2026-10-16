@@ -12,7 +12,6 @@ const pkg = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
 // Details: /home/claude/issues/devspace/DS-1-failures.md
 const EXCLUDED = new Map([
   ["src/cli.test.ts", "TODO(DS-1-F1): fails in npm test; see DS-1-failures.md"],
-  ["src/cutover-progression.test.ts", "TODO(DS-1-F2): fails in npm test; see DS-1-failures.md"],
   ["src/issue344-minimal-direct-coding.test.ts", "TODO(DS-1-F3): needs DEVSPACE_OAUTH_OWNER_TOKEN; see DS-1-failures.md"],
   ["src/local-agent-herdr.test.ts", "TODO(DS-1-F4): live canary with hard-coded /Users/james paths; see DS-1-failures.md"],
   ["src/local-agent-p2-telemetry.test.ts", "TODO(DS-1-F5): requires agy CLI; see DS-1-failures.md"],

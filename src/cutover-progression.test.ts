@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  CUTOVER_ACTIVATION_BINDING_SCHEMA,
   CutoverStateStore,
   type CutoverServerIdentity,
   type ExpectedCutoverIdentity,
@@ -74,6 +75,28 @@ function createMockActuator(fail = false): SelfRestartActuator & { scheduledCoun
   return actuator;
 }
 
+// Orchestrated restart is fenced on an exact activation binding (#377). The
+// fixture records one after the restart decision so the original gates under
+// test (build-ready, actuator) are reached instead of the earlier fence.
+const BOUND_RELEASE_SHA256 = "e".repeat(64);
+const boundReleasePath = (stateDir: string): string => join(stateDir, "releases", "release-target");
+
+function bindActivation(stateDir: string, controller: McpCutoverController): void {
+  const record = controller.record();
+  assert.ok(record);
+  const cutoverId = record.cutoverId;
+  new CutoverStateStore(stateDir).recordActivationBinding(cutoverId, {
+    schema: CUTOVER_ACTIVATION_BINDING_SCHEMA,
+    cutoverId,
+    sourceCommit: record.expectedNewIdentity.sourceCommit,
+    buildId: record.expectedNewIdentity.buildId,
+    releaseSha256: BOUND_RELEASE_SHA256,
+    releasePath: boundReleasePath(stateDir),
+    pointerPath: join(stateDir, "current-release.json"),
+    boundAt: new Date().toISOString(),
+  });
+}
+
 function createOrchestratorFixture(stateDir: string, options?: {
   actuatorFail?: boolean;
   probe?: (expected: ExpectedCutoverIdentity) => BuildReadyProbeResult;
@@ -101,6 +124,17 @@ function createOrchestratorFixture(stateDir: string, options?: {
     oldOrch: makeOrch(oldController),
     replacementOrch: makeOrch(replacementController),
     mismatchedOrch: makeOrch(mismatchedController),
+    // Successor that reports the activation it was started under (health
+    // build.activation_cutover_id), as the real replacement process does.
+    activatedReplacementFor: (cutoverId: string) => {
+      const controller = new McpCutoverController(store, {
+        ...replacementIdentity,
+        releaseSha256: BOUND_RELEASE_SHA256,
+        releasePath: boundReleasePath(stateDir),
+        activationCutoverId: cutoverId,
+      });
+      return { controller, orch: makeOrch(controller) };
+    },
   };
 }
 
@@ -155,6 +189,7 @@ test("devspace#263 G4: end-to-end self-cutover progression canary (advance-drive
       verifiedBy: "build-pipeline",
       verifiedAt: new Date().toISOString(),
     });
+    bindActivation(stateDir, f.oldController);
 
     // Step 6: cutover_advance marks restart and invokes actuator -> ADVANCED / AWAITING_RECONNECT
     const step6 = await f.oldOrch.advance();
@@ -170,17 +205,18 @@ test("devspace#263 G4: end-to-end self-cutover progression canary (advance-drive
     assert.equal(f.actuator.scheduledCount, 1, "must never schedule duplicate restart");
 
     // Step 8: Client reconnects to replacement instance (reconcile-only mode)
-    assert.equal(f.replacementController.mode(), "reconcile-only");
-    const step8 = await f.replacementOrch.advance({
+    const successor = f.activatedReplacementFor(started.cutoverId);
+    assert.equal(successor.controller.mode(), "reconcile-only");
+    const step8 = await successor.orch.advance({
       callerContinuity: { caller: "reconnected-agent" },
     });
     assert.equal(step8.status, "TERMINAL");
     assert.equal(step8.cutover_phase, "closed");
     assert.equal(step8.reconciliation_required, false);
-    assert.equal(f.replacementController.mode(), "normal");
+    assert.equal(successor.controller.mode(), "normal");
 
     // Step 9: Post-close advance returns TERMINAL
-    const final = await f.replacementOrch.advance();
+    const final = await successor.orch.advance();
     assert.equal(final.status, "TERMINAL");
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
@@ -278,6 +314,7 @@ test("devspace#263 G3: build-ready missing or probe failure blocks with BUILD_NO
       verifiedBy: "attester",
       verifiedAt: new Date().toISOString(),
     });
+    bindActivation(stateDir, f.oldController);
     const probeFailed = await f.oldOrch.advance();
     assert.equal(probeFailed.status, "BLOCKED");
     assert.equal(probeFailed.blocker, "BUILD_NOT_READY");
@@ -298,6 +335,7 @@ test("devspace#263 G3: replacement identity mismatch fails closed with RECONCILI
       verifiedBy: "attester",
       verifiedAt: new Date().toISOString(),
     });
+    bindActivation(stateDir, f.oldController);
     await f.oldOrch.advance();
 
     // Replacement boots with unexpected source/build
@@ -320,6 +358,7 @@ test("devspace#263 G3: actuator failure is durable and never retried blindly", a
       verifiedBy: "attester",
       verifiedAt: new Date().toISOString(),
     });
+    bindActivation(stateDir, f.oldController);
 
     const failed = await f.oldOrch.advance();
     assert.equal(failed.status, "BLOCKED");
