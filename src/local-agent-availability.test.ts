@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   checkLocalAgentProviderAvailability,
   formatLocalAgentProviderAvailabilitySummary,
@@ -62,6 +65,23 @@ assert.equal(
     AGY_COMMAND: process.execPath,
   });
   assert.equal(agyPath, process.execPath);
+}
+
+{
+  // The agy fallback is derived from the caller's HOME, not a fixed macOS user path.
+  const home = mkdtempSync(join(tmpdir(), "devspace-agy-home-"));
+  const emptyHome = mkdtempSync(join(tmpdir(), "devspace-agy-empty-home-"));
+  try {
+    const agyDir = join(home, ".local", "bin");
+    mkdirSync(agyDir, { recursive: true });
+    const agyPath = join(agyDir, "agy");
+    writeFileSync(agyPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    assert.equal(resolveAgyExecutable({ PATH: "", HOME: home }), agyPath);
+    assert.equal(resolveAgyExecutable({ PATH: "", HOME: emptyHome }), undefined);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(emptyHome, { recursive: true, force: true });
+  }
 }
 
 {

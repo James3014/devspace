@@ -552,9 +552,32 @@ test("C3 guarded finish closes exact generation, releases its pin and rejects ne
     assert.equal(result.phase,"closed");assert.equal(f.ownership.get(f.leaseId)?.operationHandle,undefined);
     assert.equal(f.manager.store.getByOperationId(start.operationId)?.receipt?.lifecycleTerminal,true);
     assert.deepEqual(await f.manager.finishCutover(id,replacement,pair,reconcile,f.context),result);assert.equal(calls,1);
-    const lease=f.ownership.get(f.leaseId)!;f.ownership.beginOperation(f.context,f.leaseId,lease.version,"new-operation");
-    await assert.rejects(f.manager.finishCutover(id,replacement,pair,reconcile,f.context),/pin/);
-    assert.equal(f.ownership.get(f.leaseId)?.operationHandle,"new-operation");
+    // #472: the finish releases the state-root lease atomically; replay is a no-op on the released lease.
+    const released=f.ownership.get(f.leaseId)!;
+    assert.equal(released.terminalState,"released");assert.equal(released.operationState,"finished");
+    assert.deepEqual(await f.manager.finishCutover(id,replacement,pair,reconcile,f.context),result);assert.equal(calls,1);
+    assert.deepEqual(f.ownership.get(f.leaseId),released);
+    assert.throws(()=>f.ownership.beginOperation(f.context,f.leaseId,released.version,"new-operation"),/pin/);
+  } finally {f.manager.close();}
+});
+
+test("#472 bound finish releases the state-root lease so a second cutover lease can be acquired",async()=>{
+  const f=cutoverFixture();
+  try {
+    const start=f.manager.startCutover(f.input,f.context);const id=start.receipt!.cutoverId as string;
+    f.options.approveCutoverLifecycle=(c,s)=>c===f.context&&s.operationId===start.operationId;
+    f.manager.drainCutover(id,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context);
+    const replacement={serverInstanceId:"replacement",...f.input.expectedIdentity};
+    const pair={workspaceId:"workspace",agentId:"agent"};
+    const reconcile=async()=>({workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:pair.workspaceId,witnessAgentId:pair.agentId});
+    const grant={repository:"owner/repo",goal:"cutover",coordinatorThread:"controller",evidenceHash:"fixture-grant"};
+    const second=()=>f.ownership.acquire(f.context,{repositoryKey:grant.repository,resourceKind:"filesystem",resourceId:f.config.stateDir,resource:f.config.stateDir,operation:"cutover_start",scope:[f.config.stateDir],baseRevision:f.input.currentIdentity.sourceCommit,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"cutover-second",grant});
+    assert.throws(second,/overlapping resource scope/);
+    await f.manager.finishCutover(id,replacement,pair,reconcile,f.context);
+    const lease=f.ownership.get(f.leaseId)!;
+    assert.equal(lease.terminalState,"released");
+    const next=second();
+    assert.notEqual(next.leaseId,f.leaseId);assert.equal(next.terminalState,undefined);
   } finally {f.manager.close();}
 });
 

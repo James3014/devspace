@@ -32,19 +32,19 @@ function resolvedPathInsideRoot(resolvedPath: string, resolvedRoot: string): boo
 export function isPathInsideRoot(path: string, root: string): boolean {
   const resolvedPath = resolve(expandHomePath(path));
   const resolvedRoot = resolve(expandHomePath(root));
-  if (resolvedPathInsideRoot(resolvedPath, resolvedRoot)) return true;
-
-  if (process.platform !== "darwin" && process.platform !== "win32") return false;
-
-  const foldedPath = resolvedPath.toLowerCase();
-  const foldedRoot = resolvedRoot.toLowerCase();
-  if (!resolvedPathInsideRoot(foldedPath, foldedRoot)) return false;
-
-  try {
-    return resolvedPathInsideRoot(canonicalizePath(resolvedPath), canonicalizePath(resolvedRoot));
-  } catch {
-    return false;
+  const lexicallyInside = resolvedPathInsideRoot(resolvedPath, resolvedRoot);
+  if (!lexicallyInside) {
+    if (process.platform !== "darwin" && process.platform !== "win32") return false;
+    const foldedPath = resolvedPath.toLowerCase();
+    const foldedRoot = resolvedRoot.toLowerCase();
+    if (!resolvedPathInsideRoot(foldedPath, foldedRoot)) return false;
   }
+
+  // Lexical containment is not enough: a symlink inside the root can point
+  // outside it. Require the real location (nearest existing ancestor resolved
+  // through symlinks) to be inside the real root on every platform. Unexpected
+  // filesystem errors (e.g. ELOOP) propagate, which also denies access.
+  return resolvedPathInsideRoot(canonicalizePath(resolvedPath), canonicalizePath(resolvedRoot));
 }
 
 export function assertAllowedPath(path: string, allowedRoots: string[]): string {
