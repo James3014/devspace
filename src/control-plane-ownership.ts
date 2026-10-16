@@ -324,7 +324,7 @@ export class ControlPlaneOwnershipStore {
           let unresolved = false;
           try { this.assertPhysicalBinding(other); }
           catch (error) { unresolved = error instanceof ControlPlaneOwnershipError && error.code === "INVALID_INPUT" && error.message === "resource identity cannot be resolved"; }
-          if (unresolved) throw new ControlPlaneOwnershipError("STALE_PHYSICAL_LEASE", `expired lease ${other.leaseId} has an unresolvable physical path and may overlap this scope; resolve it with the Owner-local hygiene command: devspace carrier ${other.leaseId} release-revoked-idle-cutover-lease (only for a revoked, expired, unpinned prepare-only lease with no durable effect)`);
+          if (unresolved) throw new ControlPlaneOwnershipError("STALE_PHYSICAL_LEASE", `expired lease ${other.leaseId} has an unresolvable path and may overlap this scope; Owner-local hygiene (revoked, expired, unpinned, no durable effect only): devspace carrier release-revoked-idle-cutover-lease ${other.leaseId} --lease-version <n> --carrier <id> --carrier-version <n> --validity-version <n> --operation-id <id> --confirm ${other.leaseId}`);
         }
         throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "overlapping resource scope is already leased");
       }
