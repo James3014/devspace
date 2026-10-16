@@ -16,6 +16,7 @@ import type {
   LocalAgentRuntime,
   LocalAgentRuntimeContext,
 } from "./local-agent-runtime.js";
+import { LocalAgentProviderError } from "./local-agent-runtime.js";
 import { LocalAgentRuntimePool } from "./local-agent-runtime-pool.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
@@ -64,6 +65,12 @@ class FakeRuntime implements LocalAgentRuntime {
     if (input.prompt.includes("log-secret")) {
       return Result.err(providerFailure("provider failed token=synthetic-secret-value-9f3a"));
     }
+    if (input.prompt.includes("verdict-fail")) {
+      return Result.err(providerFailure("provider exited nonzero after verdict", new LocalAgentProviderError(
+        "provider exited nonzero",
+        { providerSessionId: "thread_verdict", finalResponse: "VERDICT: ACCEPT\nfull terminal analysis body" },
+      )));
+    }
     if (input.prompt.includes("defect")) throw new TypeError("internal defect");
     if (input.prompt.includes("fail")) return Result.err(providerFailure("provider failed"));
     if (input.prompt.includes("hold")) {
@@ -109,8 +116,9 @@ const driver: LocalAgentDriver = {
   },
 };
 
-function providerFailure(message: string): AgentProviderExecutionError {
+function providerFailure(message: string, cause?: unknown): AgentProviderExecutionError {
   return new AgentProviderExecutionError({
+    cause,
     code: "PROVIDER_EXECUTION_ERROR",
     provider: "codex",
     operation: "run",
@@ -303,6 +311,19 @@ assert.equal(getRecord(failed.id).errorRetryable, false);
 const recovered = unwrap(await manager.continue(failed.id, "recovered", {}, scope));
 assert.equal(recovered.status, "running", "provider Err releases active-turn ownership");
 await waitFor(() => getRecord(failed.id).status === "idle");
+
+// Issue #381: a provider failure that still carried a terminal response must
+// keep that response durably (never lost to the error projection).
+const verdictFailed = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "verdict-fail",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => getRecord(verdictFailed.id).status === "error");
+assert.equal(getRecord(verdictFailed.id).latestResponse, "VERDICT: ACCEPT\nfull terminal analysis body");
+assert.equal(getRecord(verdictFailed.id).providerSessionId, "thread_verdict");
+assert.equal(getRecord(verdictFailed.id).errorCode, "PROVIDER_EXECUTION_ERROR");
 
 const earlyFailure = unwrap(await manager.start({
   target: "reviewer",
