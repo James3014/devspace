@@ -3300,7 +3300,7 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
     },
   });
   assert.equal(sync.isError, true);
-  assert.match(JSON.stringify(sync), /authenticated MCP client context/);
+  assert.match(JSON.stringify(sync), /dependency_sync requires a DevSpace-managed isolated worktree/);
   assert.equal(await readFile(join(destination, "package.json"), "utf8"), manifestBefore);
   assert.equal(await readFile(join(destination, "package-lock.json"), "utf8"), lockBefore);
 

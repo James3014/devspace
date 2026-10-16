@@ -3995,7 +3995,7 @@ export function createMcpServer(
         if (!ownerDirectIsolated && !ownerDirectExecution) {
           throw new ControlPlaneOwnershipError(
             "AUTHORITY_REQUIRED",
-            "An authenticated MCP client context is required for single-conversation checkout dependency sync; use an isolated managed worktree otherwise.",
+            `dependency_sync requires a DevSpace-managed isolated worktree or a single-conversation checkout; this workspace is ${workspace.mode}/${safety.state}.`,
           );
         }
         try {
