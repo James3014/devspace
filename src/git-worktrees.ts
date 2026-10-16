@@ -45,11 +45,14 @@ export class GitWorktreeError extends Error {
   }
 }
 
-export interface ManagedWorktree {
+export interface ManagedWorktreeIdentity {
   sourceRoot: string;
-  path: string;
   baseRef: string;
   baseSha: string;
+}
+
+export interface ManagedWorktree extends ManagedWorktreeIdentity {
+  path: string;
   dirtySource: boolean;
   detached: boolean;
   managed: boolean;
@@ -80,11 +83,11 @@ export function repoWorktreeLockCount(): number {
   return repoWorktreeLocks.size;
 }
 
-export async function createManagedWorktree(input: {
+export async function resolveManagedWorktreeIdentity(input: {
   sourcePath: string;
   baseRef?: string;
   config: ServerConfig;
-}): Promise<ManagedWorktree> {
+}): Promise<ManagedWorktreeIdentity> {
   const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
 
   try {
@@ -106,6 +109,15 @@ export async function createManagedWorktree(input: {
   const sourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
   const baseRef = input.baseRef ?? "HEAD";
   const baseSha = await resolveBaseCommit(sourceRoot, baseRef);
+  return { sourceRoot, baseRef, baseSha };
+}
+
+export async function createManagedWorktree(input: {
+  sourcePath: string;
+  baseRef?: string;
+  config: ServerConfig;
+}): Promise<ManagedWorktree> {
+  const { sourceRoot, baseRef, baseSha } = await resolveManagedWorktreeIdentity(input);
   const dirtySource = (await git(["status", "--porcelain=v1"], sourceRoot)).trim().length > 0;
   const worktreePath = managedWorktreePath({
     worktreeRoot: input.config.worktreeRoot,

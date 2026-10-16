@@ -18,6 +18,7 @@ const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const DEFAULT_MCP_SESSION_MAX_SESSIONS = 256;
+const DEFAULT_MCP_SESSION_LRU_MIN_IDLE_MS = 60_000;
 const DEFAULT_CHAT_SWARM_MAX_WORKERS = 16;
 const DEFAULT_CHAT_SWARM_QUEUE_LIMIT = 1000;
 const DEFAULT_CHAT_SWARM_RESULT_MAX_CHARS = 256 * 1024;
@@ -52,6 +53,7 @@ export interface ServerConfig {
   codexBin?: string;
   mcpSessionIdleTimeoutMs: number;
   mcpSessionMaxSessions: number;
+  mcpSessionLruMinIdleMs: number;
   chatSwarmEnabled: boolean;
   chatSwarmMaxWorkers: number;
   chatSwarmQueueLimit: number;
@@ -75,6 +77,8 @@ export interface ServerConfig {
   hostOperationMaxWallMs?: number;
   hostOperationMaxIdleMs?: number;
   hostOperationAllowLongLived?: boolean;
+  nexusAgyOperationRoot?: string;
+  nexusAgyLeasesDir?: string;
   coreMutationRecoveryOwnerClientId?: string;
   /**
    * Explicit Core CLI executable path for candidate acquisition.
@@ -385,6 +389,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     new URL(publicBaseUrl).hostname,
     ...(files.config.allowedHosts ?? []),
   ];
+  const mcpSessionIdleTimeoutMs = parsePositiveInteger(
+    env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS ?? numberConfigValue(files.config.mcpSessionIdleTimeoutMs),
+    DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
+    "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS",
+  );
+  // The default is clamped so a short idle timeout never makes the default invalid;
+  // an explicit value above the idle timeout is rejected.
+  const mcpSessionLruMinIdleMs = parsePositiveInteger(
+    env.DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS ?? numberConfigValue(files.config.mcpSessionLruMinIdleMs),
+    Math.min(DEFAULT_MCP_SESSION_LRU_MIN_IDLE_MS, mcpSessionIdleTimeoutMs),
+    "DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS",
+    mcpSessionIdleTimeoutMs,
+  );
 
   return {
     host,
@@ -428,11 +445,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     agentExecutionBackend: parseAgentExecutionBackend(env.DEVSPACE_AGENT_EXECUTION_BACKEND),
     codexGoalsEnabled: parseBoolean(env.DEVSPACE_CODEX_GOALS),
     codexBin: env.DEVSPACE_CODEX_BIN?.trim() || undefined,
-    mcpSessionIdleTimeoutMs: parsePositiveInteger(
-      env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS ?? numberConfigValue(files.config.mcpSessionIdleTimeoutMs),
-      DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
-      "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS",
-    ),
+    mcpSessionIdleTimeoutMs,
+    mcpSessionLruMinIdleMs,
     mcpSessionMaxSessions: parsePositiveInteger(
       env.DEVSPACE_MCP_SESSION_MAX_SESSIONS ?? numberConfigValue(files.config.mcpSessionMaxSessions),
       DEFAULT_MCP_SESSION_MAX_SESSIONS,
@@ -497,6 +511,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     hostOperationMaxWallMs: env.DEVSPACE_HOST_OPERATION_MAX_WALL_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_WALL_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_WALL_MS", 120_000) : undefined,
     hostOperationMaxIdleMs: env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_IDLE_MS", 120_000) : undefined,
     hostOperationAllowLongLived: parseBoolean(env.DEVSPACE_HOST_OPERATION_ALLOW_LONG_LIVED),
+    nexusAgyOperationRoot: env.NEXUS_AGY_OPERATION_ROOT?.trim() || env.DEVSPACE_NEXUS_AGY_OPERATION_ROOT?.trim() || undefined,
+    nexusAgyLeasesDir: env.NEXUS_AGY_LEASES_DIR?.trim() || env.DEVSPACE_NEXUS_AGY_LEASES_DIR?.trim() || undefined,
     coreMutationRecoveryOwnerClientId: env.DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID?.trim() || undefined,
     coreAcquisitionExecutable: env.DEVSPACE_CORE_ACQUISITION_EXECUTABLE?.trim() || undefined,
     coreAcquisitionExpectedSourceRevision: parseCoreAcquisitionRevision(env.DEVSPACE_CORE_ACQUISITION_EXPECTED_SOURCE_REVISION),

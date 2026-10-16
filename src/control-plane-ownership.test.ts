@@ -448,3 +448,38 @@ test("persisted alias and raw Windows scope cannot bypass physical fencing", () 
     }
   } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
 });
+
+
+test("expired missing physical lease does not poison disjoint acquisition while unresolved pin stays fenced", () => {
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"devspace-expired-missing-"))).replaceAll("\\","/");
+  const a=join(root,"a"),b=join(root,"b");mkdirSync(a);mkdirSync(b);
+  const sqlite=db();let now=Date.now();
+  const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:options.verifyGrantEvidence,now:()=>now});
+  const request=(path:string,key:string,expiresAt:string)=>({...input([path]),resourceKind:"filesystem",resourceId:path,resource:path,idempotencyKey:key,expiresAt});
+  try {
+    const first=store.acquire(context("one"),request(a,"first",new Date(now+1_000).toISOString()));
+    const pinned=store.beginOperation(context("one"),first.leaseId,first.version,"historical-effect");
+    now+=2_000;
+    rmSync(a,{recursive:true});
+    const second=store.acquire(context("two"),request(b,"second",new Date(now+60_000).toISOString()));
+    assert.equal(second.resource,realpathSync.native(b).replaceAll("\\","/"));
+    assert.equal(store.get(pinned.leaseId)?.operationHandle,"historical-effect");
+    assert.throws(()=>store.assertHeld(context("one"),pinned.leaseId,pinned.version,pinned.operation,pinned.baseRevision),/resource identity cannot be resolved/);
+    mkdirSync(a);
+    assert.throws(()=>store.acquire(context("three"),request(a,"overlap",new Date(now+60_000).toISOString())),(error:unknown)=>error instanceof ControlPlaneOwnershipError&&error.code==="OWNERSHIP_CONFLICT");
+    assert.equal(store.get(pinned.leaseId)?.operationHandle,"historical-effect");
+  } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test("non-expired missing physical lease still fails closed for unrelated acquisition", () => {
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"devspace-current-missing-"))).replaceAll("\\","/");
+  const a=join(root,"a"),b=join(root,"b");mkdirSync(a);mkdirSync(b);
+  const sqlite=db();const now=Date.now();
+  const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:options.verifyGrantEvidence,now:()=>now});
+  const request=(path:string,key:string)=>({...input([path]),resourceKind:"filesystem",resourceId:path,resource:path,idempotencyKey:key,expiresAt:new Date(now+60_000).toISOString()});
+  try {
+    store.acquire(context("one"),request(a,"first"));
+    rmSync(a,{recursive:true});
+    assert.throws(()=>store.acquire(context("two"),request(b,"second")),(error:unknown)=>error instanceof ControlPlaneOwnershipError&&error.code==="INVALID_INPUT"&&/resource identity cannot be resolved/.test(error.message));
+  } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
+});

@@ -87,9 +87,7 @@ function makePromotionFixture(name: string, files: Record<string, string> = { "a
 const LOADED_MANIFEST: CapabilityManifest = {
   schema: "devspace.capability_manifest.v1",
   capabilities: [
-    "agent_start.executionContract.authorityMode",
     "agent_start.executionContract.idleTimeoutMs",
-    "agent_start.executionContract.nexusGrant",
     "agent_start.executionContract.authorizedToolCeiling",
     "agent_start.executionContract.toolProjectionManifest",
     "agent_start.tool",

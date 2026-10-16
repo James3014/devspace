@@ -263,6 +263,43 @@ assert.throws(
 assert.equal(loadConfig(baseEnv).mcpSessionIdleTimeoutMs, 30 * 60 * 1000);
 assert.equal(loadConfig(baseEnv).mcpSessionMaxSessions, 256);
 assert.equal(loadConfig(baseEnv).mcpCutoverBuildReadyRoot, undefined);
+assert.equal(loadConfig(baseEnv).mcpSessionLruMinIdleMs, 60_000);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS: "120000" }).mcpSessionLruMinIdleMs,
+  120_000,
+);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "60000",
+    DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS: "60000",
+  }).mcpSessionLruMinIdleMs,
+  60_000,
+);
+// A short idle timeout clamps the default instead of making it invalid.
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "30000" }).mcpSessionLruMinIdleMs,
+  30_000,
+);
+for (const bad of ["0", "-5", "1.5", "abc"]) {
+  assert.throws(
+    () => loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS: bad }),
+    new RegExp(`Invalid DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS: ${bad}`),
+  );
+}
+assert.throws(
+  () =>
+    loadConfig({
+      ...baseEnv,
+      DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "30000",
+      DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS: "30001",
+    }),
+  /Invalid DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS: 30001/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS: "1800001" }),
+  /Invalid DEVSPACE_MCP_SESSION_LRU_MIN_IDLE_MS: 1800001/,
+);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "30000" }).mcpSessionIdleTimeoutMs,
   30000,

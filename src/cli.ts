@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { existsSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
+import { hashReleaseTree } from "./cutover-activation.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
@@ -84,7 +85,7 @@ import {
   probeTargetPackage,
 } from "./cutover-build-ready.js";
 import type { ExpectedCutoverIdentity } from "./cutover-state.js";
-import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
+import { performLocalBoundCutoverFinish, performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "cutover" | "carrier" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -441,6 +442,7 @@ function printHelp(): void {
       "  devspace carrier reauthorize <carrier-id> --validity-version <version> --until <ISO expiry>",
       "  devspace carrier approve <pending-id> --contract <file> --confirm <pending-id>",
       "  devspace carrier revoke <carrier-id> --version <version>",
+      "  devspace carrier release-revoked-idle-cutover-lease <lease-id> --lease-version <n> --carrier <id> --carrier-version <n> --validity-version <n> --operation-id <id> --confirm <lease-id>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
@@ -858,12 +860,20 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     await runCutoverCapabilityMismatchRecovery(args.slice(1));
     return;
   }
+  if (subcommand === "recover-failed-activation") {
+    await runCutoverFailedActivationRecovery(args.slice(1));
+    return;
+  }
   if (subcommand === "recover-unexpected-replacement") {
     await runCutoverUnexpectedReplacementRecovery(args.slice(1));
     return;
   }
   if (subcommand === "restart-bound") {
     await runCutoverRestartBound(args.slice(1));
+    return;
+  }
+  if (subcommand === "finish-bound") {
+    await runCutoverFinishBound(args.slice(1));
     return;
   }
   if (subcommand === "release-terminal-lease") {
@@ -874,7 +884,7 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-expired-drained|recover-capability-mismatch|recover-unexpected-replacement|restart-bound|release-terminal-lease>");
+  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-expired-drained|recover-capability-mismatch|recover-failed-activation|recover-unexpected-replacement|restart-bound|finish-bound|release-terminal-lease>");
 }
 
 function printCutoverHelp(): void {
@@ -890,8 +900,10 @@ function printCutoverHelp(): void {
       "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover recover-expired-drained --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
+      "  devspace cutover recover-failed-activation --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover recover-unexpected-replacement --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --package-root <path> --confirm <id> [--json]",
+      "  devspace cutover finish-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --workspace-id <id> --agent-id <id> --confirm <id> [--json]",
       "  devspace cutover release-terminal-lease --cutover-id <id> --lease-id <id> --lease-version <n> --carrier <id> --carrier-version <n> --terminal-record-hash <sha256> --confirm <id> [--json]",
       "",
       "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
@@ -901,6 +913,39 @@ function printCutoverHelp(): void {
       "the cutover without replaying the restart.",
     ].join("\n"),
   );
+}
+
+function readCarrierCredentialIntent(
+  credentialFile: string,
+  carrierId: string,
+  version: number,
+  validityVersion: number,
+  purpose = "restart",
+): { credential: string } {
+  const stats = lstatSync(credentialFile);
+  if (!stats.isFile() || stats.isSymbolicLink() ||
+      (process.platform !== "win32" && ((stats.mode & 0o077) !== 0 ||
+        (typeof process.getuid === "function" && stats.uid !== process.getuid())))) {
+    throw new Error("Carrier credential intent file must be an owner-private regular file");
+  }
+  const intent = JSON.parse(readFileSync(credentialFile, "utf8")) as {
+    schema?: unknown;
+    carrierId?: unknown;
+    expectedVersion?: unknown;
+    expectedValidityVersion?: unknown;
+    expectedCredentialHash?: unknown;
+    credential?: unknown;
+  };
+  if (intent.schema !== "devspace.carrier_credential_rotation.v1" ||
+      intent.carrierId !== carrierId ||
+      intent.expectedVersion !== version ||
+      intent.expectedValidityVersion !== validityVersion ||
+      typeof intent.expectedCredentialHash !== "string" || !/^[a-f0-9]{64}$/.test(intent.expectedCredentialHash) ||
+      typeof intent.credential !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(intent.credential) ||
+      Object.keys(intent).sort().join(",") !== "carrierId,credential,expectedCredentialHash,expectedValidityVersion,expectedVersion,schema") {
+    throw new Error(`Carrier credential intent file does not match the requested bound ${purpose}`);
+  }
+  return { credential: intent.credential };
 }
 
 async function runCutoverRestartBound(args: string[]): Promise<void> {
@@ -936,29 +981,7 @@ async function runCutoverRestartBound(args: string[]): Promise<void> {
     throw new Error(usage);
   }
 
-  const stats = lstatSync(credentialFile);
-  if (!stats.isFile() || stats.isSymbolicLink() ||
-      (process.platform !== "win32" && ((stats.mode & 0o077) !== 0 ||
-        (typeof process.getuid === "function" && stats.uid !== process.getuid())))) {
-    throw new Error("Carrier credential intent file must be an owner-private regular file");
-  }
-  const intent = JSON.parse(readFileSync(credentialFile, "utf8")) as {
-    schema?: unknown;
-    carrierId?: unknown;
-    expectedVersion?: unknown;
-    expectedValidityVersion?: unknown;
-    expectedCredentialHash?: unknown;
-    credential?: unknown;
-  };
-  if (intent.schema !== "devspace.carrier_credential_rotation.v1" ||
-      intent.carrierId !== carrierId ||
-      intent.expectedVersion !== version ||
-      intent.expectedValidityVersion !== validityVersion ||
-      typeof intent.expectedCredentialHash !== "string" || !/^[a-f0-9]{64}$/.test(intent.expectedCredentialHash) ||
-      typeof intent.credential !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(intent.credential) ||
-      Object.keys(intent).sort().join(",") !== "carrierId,credential,expectedCredentialHash,expectedValidityVersion,expectedVersion,schema") {
-    throw new Error("Carrier credential intent file does not match the requested bound restart");
-  }
+  const intent = readCarrierCredentialIntent(credentialFile, carrierId, version!, validityVersion!);
 
   try {
     const result = await performLocalBoundCutoverRestart({
@@ -989,6 +1012,72 @@ async function runCutoverRestartBound(args: string[]): Promise<void> {
   }
 }
 
+
+async function runCutoverFinishBound(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let carrierId: string | undefined;
+  let version: number | undefined;
+  let validityVersion: number | undefined;
+  let credentialFile: string | undefined;
+  let workspaceId: string | undefined;
+  let agentId: string | undefined;
+  let confirmCutoverId: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--carrier") carrierId = value();
+    else if (argument === "--version") version = Number(value());
+    else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--credential-file") credentialFile = resolve(value());
+    else if (argument === "--workspace-id") workspaceId = value();
+    else if (argument === "--agent-id") agentId = value();
+    else if (argument === "--confirm") confirmCutoverId = value();
+    else throw new Error(`Unknown cutover finish-bound flag: ${argument}`);
+  }
+  const usage = "Usage: devspace cutover finish-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --workspace-id <id> --agent-id <id> --confirm <id> [--json]";
+  if (!cutoverId || !carrierId || !credentialFile || !workspaceId || !agentId || confirmCutoverId !== cutoverId ||
+      !Number.isSafeInteger(version) || (version ?? 0) < 1 ||
+      !Number.isSafeInteger(validityVersion) || (validityVersion ?? 0) < 1) {
+    throw new Error(usage);
+  }
+  const intent = readCarrierCredentialIntent(credentialFile, carrierId, version!, validityVersion!, "finish");
+  try {
+    const result = await performLocalBoundCutoverFinish({
+      config: loadConfig(),
+      cutoverId,
+      carrierId,
+      expectedCarrierVersion: version!,
+      expectedValidityVersion: validityVersion!,
+      carrierCredential: intent.credential,
+      confirmCutoverId,
+      workspaceId,
+      agentId,
+    });
+    const payload = {
+      cutoverId: result.record.cutoverId,
+      phase: result.record.phase,
+      liveIdentity: result.liveIdentity,
+      witnessWorkspaceId: workspaceId,
+      witnessAgentId: agentId,
+      leaseId: result.leaseId,
+      leaseTerminalState: result.leaseTerminalState ?? null,
+    };
+    if (json) {
+      printJson(payload);
+      return;
+    }
+    console.log(`Bound cutover finish ${payload.cutoverId}: phase=${payload.phase}; server=${result.liveIdentity.serverInstanceId}; lease=${payload.leaseId ?? "none"}; leaseTerminal=${payload.leaseTerminalState ?? "none"}.`);
+  } finally {
+    try { unlinkSync(credentialFile); } catch {}
+  }
+}
 
 function runCutoverReleaseTerminalLease(args: string[]): void {
   let cutoverId: string | undefined;
@@ -1411,6 +1500,137 @@ async function runCutoverCapabilityMismatchRecovery(args: string[]): Promise<voi
   }
 }
 
+async function runCutoverFailedActivationRecovery(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let carrierId: string | undefined;
+  let version: number | undefined;
+  let validityVersion: number | undefined;
+  let confirmCutoverId: string | undefined;
+  let packageRoot: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--carrier") carrierId = value();
+    else if (argument === "--version") version = Number(value());
+    else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--confirm") confirmCutoverId = value();
+    else if (argument === "--package-root") packageRoot = resolve(value());
+    else throw new Error(`Unknown cutover recover-failed-activation flag: ${argument}`);
+  }
+  if (!cutoverId || !carrierId || !Number.isSafeInteger(version) || !Number.isSafeInteger(validityVersion) ||
+      (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || confirmCutoverId !== cutoverId || !packageRoot) {
+    throw new Error("Usage: devspace cutover recover-failed-activation --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]");
+  }
+
+  const config = loadConfig();
+  if (!["127.0.0.1", "localhost", "::1"].includes(config.host)) {
+    throw new Error("Failed activation recovery requires a loopback DevSpace host.");
+  }
+  const response = await fetch(new URL("/healthz", `http://${config.host}:${config.port}`), { redirect: "error" });
+  if (!response.ok) throw new Error(`DevSpace /healthz failed with HTTP ${response.status}.`);
+  const health = await response.json() as {
+    ok?: unknown;
+    build?: {
+      source_commit?: unknown;
+      build_id?: unknown;
+      release_sha256?: unknown;
+      release_path?: unknown;
+      activation_cutover_id?: unknown;
+    };
+    capabilityManifest?: { manifestSha256?: unknown; missing?: unknown };
+    mcp?: { serverInstanceId?: unknown; cutoverMode?: unknown; reconciliationRequired?: unknown };
+  };
+  const sourceCommit = health.build?.source_commit;
+  const buildId = health.build?.build_id;
+  const releaseSha256 = health.build?.release_sha256;
+  const releasePath = health.build?.release_path;
+  const activationCutoverId = health.build?.activation_cutover_id;
+  const capabilityManifestSha256 = health.capabilityManifest?.manifestSha256;
+  const serverInstanceId = health.mcp?.serverInstanceId;
+  if (
+    health.ok !== true ||
+    typeof sourceCommit !== "string" || !/^[0-9a-f]{40}$/.test(sourceCommit) ||
+    typeof buildId !== "string" || !buildId ||
+    typeof capabilityManifestSha256 !== "string" || !/^[0-9a-f]{64}$/.test(capabilityManifestSha256) ||
+    typeof serverInstanceId !== "string" || !serverInstanceId ||
+    (releaseSha256 !== undefined && (typeof releaseSha256 !== "string" || !/^[0-9a-f]{64}$/.test(releaseSha256))) ||
+    (releasePath !== undefined && (typeof releasePath !== "string" || !releasePath.startsWith("/"))) ||
+    (activationCutoverId !== undefined && (typeof activationCutoverId !== "string" || !activationCutoverId)) ||
+    !Array.isArray(health.capabilityManifest?.missing) || health.capabilityManifest.missing.length !== 0 ||
+    health.mcp?.cutoverMode !== "reconcile-only" || health.mcp?.reconciliationRequired !== true
+  ) {
+    throw new Error("Live /healthz is not an exact reconciliation-required replacement runtime; refusing failed activation recovery.");
+  }
+
+  const activeCutover = new CutoverStateStore(config.stateDir).get();
+  if (!activeCutover || activeCutover.cutoverId !== cutoverId || activeCutover.phase !== "drained" ||
+      !activeCutover.restartRequest?.restartScheduledAt) {
+    throw new Error("Failed activation recovery requires the exact drained cutover with a consumed restart marker.");
+  }
+  const observedIdentity = {
+    serverInstanceId,
+    sourceCommit,
+    buildId,
+    capabilityManifestSha256,
+    ...(typeof releaseSha256 === "string" ? { releaseSha256 } : {}),
+    ...(typeof releasePath === "string" ? { releasePath } : {}),
+    ...(typeof activationCutoverId === "string" ? { activationCutoverId } : {}),
+  };
+  const sourceBuildCapabilityMatches =
+    sourceCommit === activeCutover.expectedNewIdentity.sourceCommit &&
+    buildId === activeCutover.expectedNewIdentity.buildId &&
+    (activeCutover.expectedNewIdentity.capabilityManifestSha256 === undefined ||
+      capabilityManifestSha256 === activeCutover.expectedNewIdentity.capabilityManifestSha256);
+  const releaseMatches = activeCutover.activationBinding === undefined || (
+    releaseSha256 === activeCutover.activationBinding.releaseSha256 &&
+    releasePath === activeCutover.activationBinding.releasePath &&
+    activationCutoverId === activeCutover.cutoverId
+  );
+  if (sourceBuildCapabilityMatches && releaseMatches) {
+    throw new Error("Live replacement matches the approved deployment target; use normal cutover completion.");
+  }
+
+  const canonicalPackageRoot = realpathSync.native(packageRoot);
+  const targetPackage = probeTargetPackage(canonicalPackageRoot);
+  if (targetPackage.sourceCommit !== sourceCommit || targetPackage.buildId !== buildId) {
+    throw new Error("Running package identity does not match the live observed replacement source/build; refusing failed activation recovery.");
+  }
+  if (typeof releasePath === "string" && realpathSync.native(releasePath) !== canonicalPackageRoot) {
+    throw new Error("Live release path does not match --package-root; refusing failed activation recovery.");
+  }
+  if (typeof releaseSha256 === "string" && hashReleaseTree(canonicalPackageRoot) !== releaseSha256) {
+    throw new Error("Live release digest does not match --package-root; refusing failed activation recovery.");
+  }
+
+  const bindings = new CarrierBindingStore(config.stateDir);
+  try {
+    const result = bindings.recoverFailedActivationLocal({
+      cutoverId,
+      carrierId,
+      expectedVersion: version as number,
+      expectedValidityVersion: validityVersion as number,
+      confirmCutoverId,
+      observedIdentity,
+    });
+    if (json) {
+      printJson(result);
+      return;
+    }
+    console.log(
+      `Recovered failed activation ${result.cutover.cutoverId}: phase=${result.cutover.phase}; lease=${result.lease.terminalState}; retryAllowed=${String(result.cutover.failedActivation?.retryAllowed)}; successorRequired=${String(result.cutover.failedActivation?.successorRequired)}; replayed=${String(result.replayed)}`,
+    );
+  } finally {
+    bindings.close();
+  }
+}
+
 async function runCutoverUnexpectedReplacementRecovery(args: string[]): Promise<void> {
   let cutoverId: string | undefined;
   let carrierId: string | undefined;
@@ -1815,6 +2035,19 @@ function runCarrierCommand(args: string[]): void {
       bindings.validateLocalScope(contract,[...config.allowedRoots,config.worktreeRoot]);
       result=bindings.approveLocal(id,contract);
     } else if(action==="revoke" && flags.length===2 && flags[0]==="--version") result=bindings.revokeLocal(id,Number(flags[1]));
+    else if(action==="release-revoked-idle-cutover-lease" && flags.length===12 &&
+      flags[0]==="--lease-version" && flags[2]==="--carrier" && flags[4]==="--carrier-version" &&
+      flags[6]==="--validity-version" && flags[8]==="--operation-id" && flags[10]==="--confirm") {
+      result=bindings.releaseRevokedIdleCutoverLeaseLocal({
+        leaseId:id,
+        expectedLeaseVersion:Number(flags[1]),
+        carrierId:flags[3]!,
+        expectedCarrierVersion:Number(flags[5]),
+        expectedValidityVersion:Number(flags[7]),
+        expectedOperationId:flags[9]!,
+        confirmLeaseId:flags[11]!,
+      });
+    }
     else throw new Error("Invalid carrier arguments. Inspect the exact pending pairing before approving its bounded contract.");
     console.log(JSON.stringify(result,null,2));
   } finally { bindings.close(); }

@@ -120,3 +120,17 @@ test("v22 repairs a database that already recorded the legacy v21 migration", ()
     sqlite.close();
   }
 });
+
+
+test("v26 recreates carrier idle lease cleanup receipts idempotently", () => {
+  const sqlite=new Database(":memory:");
+  try {
+    migrateDatabase(sqlite);
+    assert.equal((sqlite.prepare("select name from sqlite_master where type='table' and name='carrier_idle_lease_cleanup_receipts'").get() as {name?:string}|undefined)?.name,"carrier_idle_lease_cleanup_receipts");
+    sqlite.exec("drop table carrier_idle_lease_cleanup_receipts; delete from devspace_schema_migrations where version=26;");
+    migrateDatabase(sqlite);
+    assert.equal((sqlite.prepare("select name from devspace_schema_migrations where version=26").get() as {name:string}).name,"carrier-idle-lease-cleanup-receipts");
+    migrateDatabase(sqlite);
+    assert.equal((sqlite.prepare("select count(*) count from devspace_schema_migrations where version=26").get() as {count:number}).count,1);
+  } finally {sqlite.close();}
+});

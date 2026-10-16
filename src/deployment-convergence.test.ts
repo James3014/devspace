@@ -14,9 +14,7 @@ import { mcpToolCatalogGeneration } from "./capability-manifest.js";
 
 const REQUIRED_AGENT_START_CAPABILITIES = [
   "agent_start.tool",
-  "agent_start.executionContract.authorityMode",
   "agent_start.executionContract.idleTimeoutMs",
-  "agent_start.executionContract.nexusGrant",
   "agent_start.executionContract.authorizedToolCeiling",
   "agent_start.executionContract.toolProjectionManifest",
 ] as const;
@@ -134,7 +132,7 @@ test("Negative test: assertDeploymentCandidateValid rejects diverged/stale candi
     capabilities: [...REQUIRED_AGENT_START_CAPABILITIES],
   };
 
-  // Regression candidate 1f626813: not a descendant of main and dropped authorityMode/nexusGrant
+  // Regression candidate 1f626813: not a descendant of main and dropped required execution capabilities.
   const staleCandidate = {
     commit: "1f626813",
     isDescendantOfCanonicalMain: false,

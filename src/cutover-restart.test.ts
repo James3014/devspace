@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { createBoundLaunchdRestartActuator, createLaunchdSelfRestartActuator } from "./cutover-restart.js";
+import {
+  createBoundLaunchdRestartActuator,
+  createLaunchdSelfRestartActuator,
+  inspectBoundStableLaunchdService,
+} from "./cutover-restart.js";
 
 test("self restart actuator is unavailable outside macOS launchd", () => {
   assert.equal(
@@ -194,5 +201,93 @@ test("bound restart actuator records an asynchronous PID-race error and does not
   callback?.();
   assert.equal(launches, 0);
   assert.equal(errors.length, 1);
-  assert.match(errors[0]!.message, /PID changed/i);
+  assert.match(errors[0]!.message, /PID or stable launch binding changed/i);
+});
+
+
+test("stable launchd binding rejects legacy cli entrypoint and fences deferred drift", () => {
+  const serviceRoot = mkdtempSync(join(tmpdir(), "devspace-stable-launchd-"));
+  try {
+    mkdirSync(join(serviceRoot, "dist"), { recursive: true });
+    writeFileSync(join(serviceRoot, "dist", "service-launcher.js"), "export {};\n");
+    const stableOutput = [
+      "program = " + process.execPath,
+      "arguments = {",
+      "  " + process.execPath,
+      "  dist/service-launcher.js",
+      "  serve",
+      "}",
+      "working directory = " + serviceRoot,
+      "pid = 4321",
+      "",
+    ].join("\n");
+    const legacyOutput = stableOutput.replace(
+      "dist/service-launcher.js",
+      "dist/cli.js",
+    );
+
+    const inspected = inspectBoundStableLaunchdService({
+      platform: "darwin",
+      uid: 501,
+      livePid: 4321,
+      serviceLabel: "com.example.devspace",
+      launchdTarget: "gui/501/com.example.devspace",
+      inspectLaunchdTarget: () => ({ status: 0, stdout: stableOutput }),
+    });
+    assert.ok(inspected);
+    assert.equal(inspected.serviceRoot, realpathSync.native(serviceRoot));
+
+    assert.equal(
+      inspectBoundStableLaunchdService({
+        platform: "darwin",
+        uid: 501,
+        livePid: 4321,
+        serviceLabel: "com.example.devspace",
+        launchdTarget: "gui/501/com.example.devspace",
+        inspectLaunchdTarget: () => ({ status: 0, stdout: legacyOutput }),
+      }),
+      undefined,
+    );
+
+    let inspections = 0;
+    let callback: (() => void) | undefined;
+    let launches = 0;
+    let verifications = 0;
+    const errors: Error[] = [];
+    const actuator = createBoundLaunchdRestartActuator({
+      platform: "darwin",
+      uid: 501,
+      livePid: 4321,
+      serviceLabel: "com.example.devspace",
+      launchdTarget: "gui/501/com.example.devspace",
+      expectedStableServiceRoot: serviceRoot,
+      inspectLaunchdTarget: () => {
+        inspections += 1;
+        return {
+          status: 0,
+          stdout: inspections === 1 ? stableOutput : legacyOutput,
+        };
+      },
+      schedule: (scheduled) => {
+        callback = scheduled;
+        return {};
+      },
+      verifyActivation: () => {
+        verifications += 1;
+      },
+      spawnDetached: () => {
+        launches += 1;
+      },
+      onError: (error) => errors.push(error),
+    });
+    assert.ok(actuator);
+    actuator.schedule();
+    callback?.();
+    assert.equal(launches, 0);
+    assert.equal(verifications, 0);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0]!.message, /stable launch binding changed/i);
+  } finally {
+    rmSync(serviceRoot, { recursive: true, force: true });
+  }
 });

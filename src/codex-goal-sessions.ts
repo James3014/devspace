@@ -5,7 +5,6 @@ import { homedir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import {
   HeadTailBuffer,
-  type CoreMutationProcessBinding,
   type ProcessSnapshot,
   type StartCommandInput,
   type WriteStdinInput,
@@ -49,7 +48,6 @@ export interface CodexGoalStartInput {
   model?: string;
   reasoningEffort?: string;
   expectedHead?: string;
-  coreMutation?: CoreMutationProcessBinding;
 }
 
 export interface CodexGoalState {
@@ -69,7 +67,6 @@ export interface CodexGoalState {
   terminalReason?: string;
   error?: string;
   processTreeState?: ProcessSnapshot["processTreeState"];
-  coreMutation?: CoreMutationProcessBinding;
 }
 
 interface GoalSession {
@@ -80,7 +77,6 @@ interface GoalSession {
   model?: string;
   reasoningEffort?: string;
   baseHead?: string;
-  coreMutation?: CoreMutationProcessBinding;
   startedAt: number;
   goalActiveObserved: boolean;
   trustDialogObserved: boolean;
@@ -888,11 +884,6 @@ export class CodexGoalSessionManager {
       .map((session) => session.goalId);
   }
 
-  getCoreMutationBinding(workspaceId: string, goalId: string): CoreMutationProcessBinding | undefined {
-    const binding = this.getOwnedSession(workspaceId, goalId).coreMutation;
-    return binding ? { ...binding } : undefined;
-  }
-
   async start(input: CodexGoalStartInput): Promise<CodexGoalState> {
     const { session, goal } = await this.createSession(input);
     session.activationPending = true;
@@ -998,7 +989,6 @@ export class CodexGoalSessionManager {
       args,
       environmentPolicy: "sanitized",
       yieldTimeMs: this.activationPollMs,
-      ...(input.coreMutation ? { coreMutation: { ...input.coreMutation } } : {}),
     });
 
     if (this.closed || generation !== this.lifecycleGeneration) {
@@ -1024,7 +1014,6 @@ export class CodexGoalSessionManager {
       model: input.model,
       reasoningEffort: input.reasoningEffort,
       baseHead,
-      coreMutation: input.coreMutation ? { ...input.coreMutation } : undefined,
       startedAt: Date.now(),
       goalActiveObserved: false,
       trustDialogObserved: false,
@@ -1453,7 +1442,6 @@ export class CodexGoalSessionManager {
       ...(session.model ? { model: session.model } : {}),
       ...(session.reasoningEffort ? { reasoningEffort: session.reasoningEffort } : {}),
       ...(session.baseHead ? { baseHead: session.baseHead } : {}),
-      ...(session.coreMutation ? { coreMutation: { ...session.coreMutation } } : {}),
       ...(session.terminalReason ? { terminalReason: session.terminalReason } : {}),
       ...(session.error ? { error: session.error } : {}),
       ...(session.processTreeState ? { processTreeState: session.processTreeState } : {}),

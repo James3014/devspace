@@ -24,24 +24,9 @@ type ToolInputSchemas = Record<string, Record<string, SchemaLike>>;
 const REQUIRED_CAPABILITIES = [
   { id: "agent_start.tool", tool: "agent_start" },
   {
-    id: "agent_start.executionContract.authorityMode",
-    tool: "agent_start",
-    fieldPath: "executionContract.authorityMode",
-  },
-  {
     id: "agent_start.executionContract.idleTimeoutMs",
     tool: "agent_start",
     fieldPath: "executionContract.idleTimeoutMs",
-  },
-  {
-    id: "agent_start.executionContract.nexusGrant",
-    tool: "agent_start",
-    fieldPath: "executionContract.nexusGrant",
-  },
-  {
-    id: "agent_start.executionContract.capabilityDiscovery",
-    tool: "agent_start",
-    fieldPath: "executionContract.capabilityDiscovery",
   },
   {
     id: "agent_start.executionContract.authorizedToolCeiling",

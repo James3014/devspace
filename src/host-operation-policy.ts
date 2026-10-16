@@ -388,23 +388,113 @@ function shellProfilePath(path: string): string {
   return path.replaceAll("\\", "\\\\").replaceAll('"', '\\"');
 }
 
+function parseMachORpaths(binaryPath: string): string[] {
+  const output = spawnSync("/usr/bin/otool", ["-l", binaryPath], {
+    encoding: "utf8",
+    timeout: 1_000,
+    maxBuffer: 4 * 1024 * 1024,
+  });
+  if (output.status !== 0 || typeof output.stdout !== "string") return [];
+  const lines = output.stdout.split("\n");
+  const rpaths: string[] = [];
+  const seen = new Set<string>();
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]?.trim() === "cmd LC_RPATH") {
+      for (let j = i + 1; j < Math.min(i + 6, lines.length); j++) {
+        const match = lines[j]?.match(/^\s*path\s+(.*?)\s+\(offset\s+\d+\)$/);
+        if (match && match[1]) {
+          const raw = match[1].trim();
+          if (!seen.has(raw)) {
+            seen.add(raw);
+            rpaths.push(raw);
+          }
+          break;
+        }
+      }
+    }
+  }
+  return rpaths;
+}
+
+function expandRpath(entry: string, binaryDir: string, executableDir: string): { normalized: string; rawPath: string } | undefined {
+  if (entry === "@loader_path" || entry.startsWith("@loader_path/")) {
+    const sub = entry.slice("@loader_path".length).replace(/^[\/\\]/, "");
+    return { normalized: resolve(binaryDir, sub), rawPath: join(binaryDir, sub) };
+  }
+  if (entry === "@executable_path" || entry.startsWith("@executable_path/")) {
+    const sub = entry.slice("@executable_path".length).replace(/^[\/\\]/, "");
+    return { normalized: resolve(executableDir, sub), rawPath: join(executableDir, sub) };
+  }
+  if (entry.startsWith("/")) {
+    return { normalized: resolve(entry), rawPath: entry };
+  }
+  return undefined;
+}
+
 function linkedLibraryPaths(executablePath: string): string[] {
   if (process.platform !== "darwin") return [];
   const seen = new Set<string>();
   const result: string[] = [];
   const startedAt = Date.now();
-  const visit = (path: string, depth: number): void => {
+  const executableDir = dirname(executablePath);
+
+  const getRpathsFor = (binaryPath: string): Array<{ normalized: string; rawPath: string }> => {
+    const binaryDir = dirname(binaryPath);
+    const rpaths: Array<{ normalized: string; rawPath: string }> = [];
+    for (const raw of parseMachORpaths(binaryPath)) {
+      const expanded = expandRpath(raw, binaryDir, executableDir);
+      if (!expanded || expanded.normalized === "/" || expanded.normalized === resolve(homedir())) continue;
+      if (!rpaths.some((item) => item.normalized === expanded.normalized && item.rawPath === expanded.rawPath)) {
+        rpaths.push(expanded);
+      }
+    }
+    return rpaths;
+  };
+
+  const visit = (path: string, depth: number, inheritedRpaths: readonly { normalized: string; rawPath: string }[]): void => {
     if (depth > 4 || seen.has(path)) return;
     if (seen.size >= 128 || Date.now() - startedAt > 5_000) deny("HOST_OPERATION_SANDBOX_UNAVAILABLE", "Executable dependency scan exceeded its bounded limit.");
     seen.add(path);
+    const activeRpaths: Array<{ normalized: string; rawPath: string }> = [];
+    for (const item of [...getRpathsFor(path), ...inheritedRpaths]) {
+      if (!activeRpaths.some((existing) => existing.normalized === item.normalized && existing.rawPath === item.rawPath)) {
+        activeRpaths.push(item);
+      }
+    }
     const output = spawnSync("/usr/bin/otool", ["-L", path], { encoding: "utf8", timeout: 1_000, maxBuffer: 1_024 * 1_024 });
     if (output.status !== 0 || typeof output.stdout !== "string") return;
-    for (const dependency of output.stdout.split("\n").slice(1).map((line) => line.trim().split(" ", 1)[0] ?? "").map((value) => value.startsWith("@loader_path/") ? join(dirname(path), value.slice("@loader_path/".length)) : value.startsWith("@rpath/") ? resolve(dirname(path), value.slice("@rpath/".length)) : value).filter((value) => value.startsWith("/"))) {
-      if (!seen.has(dependency)) result.push(dependency);
-      if (existsSync(dependency)) visit(dependency, depth + 1);
+    for (const line of output.stdout.split("\n").slice(1)) {
+      const dep = line.trim().split(" ", 1)[0] ?? "";
+      if (!dep || dep === path) continue;
+      let resolvedCandidates: string[] = [];
+      if (dep.startsWith("@loader_path/")) {
+        const sub = dep.slice("@loader_path/".length);
+        const resolved = resolve(dirname(path), sub);
+        resolvedCandidates = [resolved, join(dirname(path), sub)];
+      } else if (dep.startsWith("@executable_path/")) {
+        const sub = dep.slice("@executable_path/".length);
+        const resolved = resolve(executableDir, sub);
+        resolvedCandidates = [resolved, join(executableDir, sub)];
+      } else if (dep.startsWith("@rpath/")) {
+        const rel = dep.slice("@rpath/".length);
+        for (const rpath of activeRpaths) {
+          const candidate = resolve(rpath.normalized, rel);
+          if (!isWithin(candidate, rpath.normalized)) continue;
+          if (existsSync(candidate)) {
+            resolvedCandidates = [candidate, join(rpath.rawPath, rel)];
+            break;
+          }
+        }
+      } else if (dep.startsWith("/")) {
+        resolvedCandidates = [resolve(dep), dep];
+      }
+      for (const candidate of [...new Set(resolvedCandidates)]) {
+        if (!seen.has(candidate)) result.push(candidate);
+        if (existsSync(candidate) && !seen.has(candidate)) visit(candidate, depth + 1, activeRpaths);
+      }
     }
   };
-  visit(executablePath, 0);
+  visit(executablePath, 0, []);
   return result;
 }
 

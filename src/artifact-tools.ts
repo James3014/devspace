@@ -21,9 +21,8 @@ import {
   IncomingArtifactAdapterRegistry,
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
-import { logEvent } from "./logger.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
-import type { CoreMutationGuard } from "./core-mutation-tools.js";
+import { logEvent } from "./logger.js";
 
 const ARTIFACT_WRITE_ANNOTATIONS = {
   readOnlyHint: false,
@@ -53,7 +52,6 @@ export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
-  coreMutation?: CoreMutationGuard;
 }
 
 export interface DownloadIncomingArtifactInput {
@@ -123,7 +121,6 @@ export function registerArtifactTools(
     config,
     workspaces,
     incomingArtifactAdapters = [],
-    coreMutation,
   }: ArtifactToolRegistrationOptions,
 ): void {
   const incomingRegistry = new IncomingArtifactAdapterRegistry(incomingArtifactAdapters);
@@ -148,7 +145,6 @@ export function registerArtifactTools(
       },
       outputSchema: {
         path: z.string(),
-        coreMutation: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: { "openai/fileParams": ["file"] },
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
@@ -156,14 +152,6 @@ export function registerArtifactTools(
     async (input, extra) => executeArtifactTool(config, input, async () => {
       const destination = normalizeArtifactDestination(input.path);
       const workspace = workspaces.getWorkspace(input.workspaceId);
-      const admission = coreMutation
-        ? await coreMutation.admit({
-            workspaceId: input.workspaceId,
-            extra,
-            paths: [destination.path],
-            pathContainment: "STRUCTURED_SINK_ENFORCED",
-          })
-        : undefined;
       const downloaded = await downloadIncomingArtifact({
         registry: incomingRegistry,
         workspaceId: workspace.id,
@@ -176,7 +164,6 @@ export function registerArtifactTools(
       return {
         publicResult: {
           path: downloaded.path,
-          ...(admission?.bound ? { coreMutation: { bound: true, claim: admission.claim, pathContainment: admission.pathContainment, sessionId: admission.sessionId, bindingHash: admission.bindingHash, acceptanceContractHash: admission.acceptanceContractHash } } : {}),
         },
         logResult: downloaded,
       };

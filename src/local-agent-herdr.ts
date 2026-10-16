@@ -1,7 +1,8 @@
 import { createConnection, type Socket } from "node:net";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { resolve, normalize } from "node:path";
+import { resolve, normalize, join } from "node:path";
+import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import type { LocalAgentStore, ExternalRuntimeLaunchFence, LocalAgentRecord } from "./local-agent-store.js";
@@ -14,7 +15,11 @@ import {
 import { AgentProviderFailureError } from "./local-agent-errors.js";
 import { canonicalizePath, isSameWorktreePath } from "./roots.js";
 
-export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
+export function resolveHerdrDefaultSocketPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.HERDR_SOCKET_PATH || join(env.HOME ?? homedir(), ".config", "herdr", "herdr.sock");
+}
+
+export const HERDR_DEFAULT_SOCKET_PATH = resolveHerdrDefaultSocketPath();
 export const HERDR_RUNTIME_KIND = "HERDR" as const;
 export const HERDR_ROOT_PANE_READY_TIMEOUT_MS = 5_000;
 export const HERDR_ROOT_PANE_READY_POLL_INTERVAL_MS = 100;

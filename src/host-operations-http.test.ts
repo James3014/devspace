@@ -172,7 +172,6 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
     ...requestFor(root, executable, fixtureArgv, [effectsRoot], workspaceRoot),
     workspaceId,
     clientId: foreign.clientId,
-    authorityMode: "NEXUS_GOVERNED",
   } as any;
   let operationId: string | undefined;
   try {
@@ -185,7 +184,7 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
     assert.equal(preflight.status, "ready");
     const started = structured(await ownerClient.callTool({ name: "host_operation_start", arguments: request }));
     assert.equal(started.status, "started", JSON.stringify(started));
-    assert.equal(started.authorityMode, "OWNER_DIRECT");
+    assert.equal(started.authorityMode, undefined);
     assert.equal(started.workspaceId, workspaceId);
     assert.equal(started.request.clientId, owner.clientId);
     assert.equal(started.request.workspaceId, workspaceId);
@@ -371,7 +370,9 @@ test("HTTP server omits host operation tools when startup capability is disabled
   const client = await connect(new URL(`http://127.0.0.1:${(listener.address() as { port: number }).port}/mcp`), owner.accessToken, "host-disabled-http");
   try {
     const names = (await client.listTools()).tools.map((tool) => tool.name);
-    assert.equal(names.some((name) => name.startsWith("host_operation_")), false);
+    const actuatorNames = ["host_operation_preflight", "host_operation_start", "host_operation_status", "host_operation_reconcile", "host_operation_cancel"];
+    assert.equal(names.some((name) => actuatorNames.includes(name)), false);
+    assert.equal(names.includes("host_operation_external_status"), true);
   } finally {
     await client.close().catch(() => {});
     await running.close();

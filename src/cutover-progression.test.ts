@@ -11,7 +11,7 @@ import {
 import {
   McpCutoverController,
   type DurableReconciliationWitness,
-  CUTOVER_SAFE_TOOLS,
+  classifyCutoverEffect,
 } from "./mcp-cutover.js";
 import {
   CutoverOrchestrator,
@@ -108,10 +108,11 @@ function createOrchestratorFixture(stateDir: string, options?: {
 // G0 & G2: Surface and Inventory Verification
 // ---------------------------------------------------------------------------
 
-test("devspace#263 G0/G2: cutover_advance is registered in CUTOVER_SAFE_TOOLS allowlist", () => {
-  assert.equal(CUTOVER_SAFE_TOOLS.has("cutover_advance"), true);
-  assert.equal(CUTOVER_SAFE_TOOLS.has("cutover_status"), true);
-  assert.equal(CUTOVER_SAFE_TOOLS.has("capability_convergence_status"), true);
+test("devspace#263 G0/G2: lifecycle tools remain coordinated without global admission allowlist", () => {
+  assert.equal(classifyCutoverEffect("cutover_advance"), "CUTOVER_CONTROL_OR_OBSERVATION");
+  assert.equal(classifyCutoverEffect("cutover_status"), "CUTOVER_CONTROL_OR_OBSERVATION");
+  assert.equal(classifyCutoverEffect("capability_convergence_status"), "INDEPENDENT");
+  assert.equal(classifyCutoverEffect("cutover_unknown_future_mutation"), "DEPLOYMENT_CONFLICT");
 });
 
 // ---------------------------------------------------------------------------

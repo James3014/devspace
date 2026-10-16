@@ -13,7 +13,6 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { createMcpServer } from "./server.js";
-import { CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
 import { createManagedWorktree, GitWorktreeError } from "./git-worktrees.js";
 
 interface TestWorkspaceEnvironment {
@@ -86,20 +85,6 @@ async function setupMinimalEnvironment(t: TestContext): Promise<TestWorkspaceEnv
     new ProcessSessionManager(),
     () => [],
     [],
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
   );
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -700,6 +685,7 @@ test("Issue #344 - Criteria 6: end-to-end dogfood flow (open/sync -> inspect -> 
     name: "git_push",
     arguments: {
       workspaceId: wsId,
+      attemptKey: "issue344-dogfood-push",
       expectedHead: candidateHead,
       remote: "origin",
       branch: "feat/dogfood-pr",

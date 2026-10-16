@@ -3,7 +3,7 @@ import type { SelfRestartActuator } from "./cutover-restart.js";
 import type { CompletionSelection } from "./current-completion-matrix.js";
 import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
-import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
+import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding, type CutoverActivationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput, type TakeoverInput, type ReconciliationReceipt } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
@@ -16,21 +16,19 @@ import { join, resolve } from "node:path";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
-import { EXECUTION_PROTOCOL_VERSION, type ExecutionAuthorityMode } from "./execution-protocol.js";
+import { EXECUTION_PROTOCOL_VERSION } from "./execution-protocol.js";
+import { GitCandidateError, pushCandidate, type GitCandidateCommandRunner } from "./git-candidate.js";
 
 const spawn = nativeSpawn;
 const crossSpawn = createRequire(import.meta.url)("cross-spawn") as typeof import("node:child_process").spawn;
 
 export type DurableOperationKind =
   | "workspace_clone"
+  | "git_push"
   | "dependency_sync"
-  | "nexus_gateway_recover"
-  | "nexus_gateway_recovery_preflight"
-  | "nexus_gateway_recovery_materialize"
   | "cutover_start"
   | "host_operation"
-  | "chat_swarm_reconciliation"
-  | "core_candidate_acquisition";
+  | "chat_swarm_reconciliation";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
 export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 
@@ -57,48 +55,11 @@ export function cutoverTerminalRecordHash(record: NonNullable<ReturnType<Cutover
   return hashJson(durable);
 }
 
-import {
-  NexusRecoveryAdapter,
-  NEXUS_GATEWAY_RECOVERY_SCHEMA,
-  NEXUS_GATEWAY_INTERPRETER,
-  NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
-  NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
-  NEXUS_GATEWAY_STATE_ROOT,
-  type NexusGatewayRecoveryRequest,
-  type NexusGatewayRecoveryInput,
-  type NexusGatewayRecoveryBridgeResult,
-  type NexusGatewayRecoveryReceipt,
-  type NexusGatewayRecoveryMaterializationReceipt,
-  type NexusGatewayRecoveryMaterializationRequest,
-  type NexusGatewayRecoveryMaterializationInput,
-  type NexusGatewayPreflightResult,
-  type NexusGatewayRecoveryPreflightResult,
-  type NexusGatewayRecoveryRunner,
-  type NexusGatewayRecoveryMaterializationRunner,
-  assertNexusGatewayRecoveryRequest,
-  assertNexusGatewayRecoveryMaterializationRequest,
-  validateNexusGatewayPreflightReceipt,
-  validateNexusGatewayRecoveryReceipt,
-  validateNexusGatewayMaterializationReceipt,
-  buildNexusGatewayRecoveryBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
-  spawnNexusGatewayRecovery,
-  buildNexusGatewayRecoveryPreflightBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
-  spawnNexusGatewayRecoveryPreflight,
-  buildNexusGatewayRecoveryMaterializationBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
-  spawnNexusGatewayRecoveryMaterialize,
-} from "./nexus-recovery-adapter.js";
-
 export interface DurableOperationRecord {
   operationId: string;
   attemptKey: string;
   requestHash: string;
   kind: DurableOperationKind;
-  authorityMode: ExecutionAuthorityMode;
   scopeRoot: string;
   workspaceId?: string;
   status: DurableOperationStatus;
@@ -143,12 +104,6 @@ export class DurableOperationError extends Error {
       | "DEPENDENCY_RECIPE_UNSUPPORTED"
       | "DEPENDENCY_SYNC_FAILED"
       | "FROZEN_INPUT_CHANGED"
-      | "NEXUS_GATEWAY_REQUEST_INVALID"
-      | "NEXUS_GATEWAY_PREFLIGHT_FAILED"
-      | "NEXUS_GATEWAY_RECOVERY_FAILED"
-      | "NEXUS_GATEWAY_RECOVERY_UNCERTAIN"
-      | "NEXUS_GATEWAY_MATERIALIZATION_FAILED"
-      | "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN"
       | "RECONCILIATION_REQUIRED",
     message: string,
     readonly operation?: DurableOperationRecord,
@@ -215,14 +170,6 @@ export class DurableOperationStore {
 
   markInterruptedUnknown(): number {
     const now = new Date().toISOString();
-    const preflight = this.database.sqlite.prepare(`
-      update durable_operations
-      set status = 'outcome_unknown', retry_safe = 'false',
-          error_code = 'RECONCILIATION_REQUIRED',
-          error_message = 'DevSpace restarted while the read-only Gateway preflight was nonterminal; reconcile the same stored request.',
-          updated_at = ?
-      where status = 'started' and kind = 'nexus_gateway_recovery_preflight'
-    `).run(now);
     const result = this.database.sqlite.prepare(`
       update durable_operations
       set status = 'outcome_unknown', retry_safe = 'false',
@@ -230,9 +177,9 @@ export class DurableOperationStore {
           error_message = 'DevSpace restarted while the mutating operation was nonterminal; reconcile physical state before any replay.',
           updated_at = ?
       where status = 'started'
-        and kind not in ('dependency_sync', 'cutover_start', 'nexus_gateway_recovery_preflight')
+        and kind not in ('dependency_sync', 'cutover_start')
     `).run(now);
-    return result.changes + preflight.changes;
+    return result.changes;
   }
 
   getByOperationId(operationId: string): DurableOperationRecord | undefined {
@@ -288,7 +235,7 @@ export class DurableOperationStore {
         input.attemptKey,
         input.requestHash,
         input.kind,
-        input.authorityMode,
+        "OWNER_DIRECT",
         canonicalizePath(input.scopeRoot),
         input.workspaceId ?? null,
         JSON.stringify(input.request),
@@ -361,7 +308,17 @@ export interface WorkspaceCloneInput {
   remote: string;
   destination: string;
   ref?: string;
-  authorityMode?: ExecutionAuthorityMode;
+}
+
+export interface GitPushInput {
+  attemptKey: string;
+  workspaceId: string;
+  workspaceRoot: string;
+  expectedHead: string;
+  remote: string;
+  branch: string;
+  /** Test-only command injection; MCP callers cannot supply this. */
+  gitRunner?: GitCandidateCommandRunner;
 }
 
 export interface DependencySyncInput {
@@ -369,7 +326,6 @@ export interface DependencySyncInput {
   workspaceId: string;
   workspaceRoot: string;
   recipe: DependencySyncRecipe;
-  authorityMode?: ExecutionAuthorityMode;
   /**
    * Trusted server-side admission only. Callers cannot set this through MCP.
    * Allows OWNER_DIRECT frozen dependency sync without a carrier only for a
@@ -388,23 +344,13 @@ export class DurableOperationManager {
   readonly store: DurableOperationStore;
   private readonly consumer?: ControlPlaneConsumer;
 
-  readonly recoveryAdapter: NexusRecoveryAdapter;
-
   constructor(
     private readonly config: ServerConfig,
     private readonly runCommand: CommandRunner = spawnCommand,
-    runNexusGatewayRecovery?: NexusGatewayRecoveryRunner,
-    runNexusGatewayRecoveryPreflight?: NexusGatewayRecoveryRunner,
     coordination?: ControlPlaneConsumerOptions,
-    runNexusGatewayRecoveryMaterialize?: NexusGatewayRecoveryMaterializationRunner,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
-    this.recoveryAdapter = new NexusRecoveryAdapter(this.store, {
-      runRecovery: runNexusGatewayRecovery,
-      runPreflight: runNexusGatewayRecoveryPreflight,
-      runMaterialize: runNexusGatewayRecoveryMaterialize,
-    });
     if (coordination) this.consumer = new ControlPlaneConsumer(this.store.createOwnershipStore(coordination), coordination);
   }
 
@@ -414,13 +360,6 @@ export class DurableOperationManager {
 
   async workspaceClone(input: WorkspaceCloneInput): Promise<DurableOperationRecord> {
     assertAttemptKey(input.attemptKey);
-    const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
-    if (authorityMode !== "OWNER_DIRECT") {
-      throw new DurableOperationError(
-        "RECONCILIATION_REQUIRED",
-        "NEXUS_GOVERNED workspace bootstrap is not self-authorizing; G9 must provide validated Nexus authority evidence.",
-      );
-    }
     assertCredentialFreeRemote(input.remote);
     const destination = canonicalizePath(
       assertAllowedDestination(input.destination, this.config.allowedRoots),
@@ -453,7 +392,6 @@ export class DurableOperationManager {
       attemptKey: input.attemptKey,
       requestHash,
       kind: "workspace_clone",
-      authorityMode,
       scopeRoot,
       request,
     });
@@ -486,6 +424,173 @@ export class DurableOperationManager {
     });
   }
 
+  async gitPush(input: GitPushInput): Promise<DurableOperationRecord> {
+    assertAttemptKey(input.attemptKey);
+    const workspaceRoot = canonicalizePath(input.workspaceRoot);
+    const allowed =
+      this.config.allowedRoots.some((root) => isPathInsideRoot(workspaceRoot, canonicalizePath(root))) ||
+      isPathInsideRoot(workspaceRoot, canonicalizePath(this.config.worktreeRoot));
+    if (!allowed) {
+      throw new DurableOperationError(
+        "DESTINATION_OUTSIDE_ALLOWED_ROOT",
+        `Workspace is outside configured roots: ${workspaceRoot}`,
+      );
+    }
+    const request = {
+      version: EXECUTION_PROTOCOL_VERSION,
+      workspaceId: input.workspaceId,
+      workspaceRoot,
+      expectedHead: input.expectedHead.toLowerCase(),
+      remote: input.remote,
+      branch: input.branch,
+    };
+    const requestHash = hashJson(request);
+    const operationId = stableOperationId("git_push", workspaceRoot, input.attemptKey);
+    const existing = this.store.getByAttempt(workspaceRoot, input.attemptKey);
+    if (existing) {
+      if (existing.requestHash !== requestHash || existing.kind !== "git_push") {
+        throw new DurableOperationError(
+          "OPERATION_REPLAY_CONFLICT",
+          `attemptKey '${input.attemptKey}' is already bound to a materially different ${existing.kind} request.`,
+          existing,
+        );
+      }
+      return replayResult(existing);
+    }
+    const { record, created } = this.store.createOrReplay({
+      operationId,
+      attemptKey: input.attemptKey,
+      requestHash,
+      kind: "git_push",
+      scopeRoot: workspaceRoot,
+      workspaceId: input.workspaceId,
+      request,
+    });
+    if (!created) return replayResult(record);
+
+    try {
+      const pushed = await pushCandidate({
+        workspaceRoot,
+        expectedHead: request.expectedHead,
+        remote: input.remote,
+        branch: input.branch,
+        ...(input.gitRunner ? { gitRunner: input.gitRunner } : {}),
+      });
+      return this.store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt: {
+          remote: pushed.remote,
+          branch: pushed.branch,
+          pushedSha: pushed.pushedSha,
+          effectState: "CONFIRMED_REMOTE_PUSH",
+        },
+      });
+    } catch (error) {
+      if (error instanceof GitCandidateError) {
+        const effect = error.effect;
+        if (effect?.state === "CONFIRMED_REMOTE_PUSH") {
+          return this.store.finish(operationId, {
+            status: "succeeded",
+            retrySafe: false,
+            receipt: {
+              remote: effect.remote,
+              branch: effect.branch,
+              pushedSha: effect.expectedPushedSha,
+              effectState: effect.state,
+              reconciledFromError: true,
+            },
+          });
+        }
+        if (!effect) {
+          return this.store.finish(operationId, {
+            status: "failed",
+            retrySafe: true,
+            errorCode: error.code,
+            errorMessage: redactSecrets(error.message),
+            receipt: {
+              remote: input.remote,
+              branch: input.branch,
+              expectedPushedSha: request.expectedHead,
+              effectState: "CONFIRMED_NO_EFFECT",
+            },
+          });
+        }
+        return this.store.finish(operationId, {
+          status: "outcome_unknown",
+          retrySafe: false,
+          errorCode: "RECONCILIATION_REQUIRED",
+          errorMessage: redactSecrets(error.message),
+          receipt: {
+            remote: effect.remote ?? input.remote,
+            branch: effect.branch ?? input.branch,
+            expectedPushedSha: effect.expectedPushedSha ?? request.expectedHead,
+            effectState: effect.state,
+          },
+        });
+      }
+      return this.store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "RECONCILIATION_REQUIRED",
+        errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
+        receipt: {
+          remote: input.remote,
+          branch: input.branch,
+          expectedPushedSha: request.expectedHead,
+          effectState: "EFFECT_UNKNOWN",
+        },
+      });
+    }
+  }
+
+  async reconcileGitPush(operationId: string): Promise<DurableOperationRecord> {
+    const record = this.store.getByOperationId(operationId);
+    if (!record || record.kind !== "git_push") {
+      throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown Git push operation: ${operationId}`, record);
+    }
+    if (record.status === "succeeded" || record.status === "failed") return record;
+    const expectedHead = String(record.request.expectedHead ?? "");
+    const remote = String(record.request.remote ?? "");
+    const branch = String(record.request.branch ?? "");
+    if (!/^[0-9a-f]{40}$/.test(expectedHead) || !remote || !branch) {
+      throw new DurableOperationError("RECONCILIATION_REQUIRED", "Git push durable request is malformed.", record);
+    }
+    const observed = await readGitRemoteRef(record.scopeRoot, remote, branch);
+    if (observed.available && observed.sha === expectedHead) {
+      return this.store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt: {
+          ...(record.receipt ?? {}),
+          remote,
+          branch,
+          pushedSha: expectedHead,
+          observedSha: observed.sha,
+          effectState: "CONFIRMED_REMOTE_PUSH",
+          reconciled: true,
+        },
+      });
+    }
+    return this.store.finish(operationId, {
+      status: "outcome_unknown",
+      retrySafe: false,
+      errorCode: "RECONCILIATION_REQUIRED",
+      errorMessage: observed.available
+        ? `Remote ref ${remote}/${branch} is currently ${observed.sha || "absent"}; delayed settlement remains possible.`
+        : `Remote ref reconciliation failed: ${redactSecrets(observed.errorMessage)}`,
+      receipt: {
+        ...(record.receipt ?? {}),
+        remote,
+        branch,
+        expectedPushedSha: expectedHead,
+        observedSha: observed.available ? observed.sha : undefined,
+        effectState: "EFFECT_UNKNOWN",
+        reconciled: true,
+      },
+    });
+  }
+
   startCutover(input: CutoverStartInput, context?: unknown): DurableOperationRecord {
     if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host authority");
     const {snapshot,stateRoot,request,requestHash,operationId,subject} = planCutoverStart(this.config.stateDir,input);
@@ -499,7 +604,7 @@ export class DurableOperationManager {
         return {record:existing,created:false};
       }
       const coordinationBinding = consumer.pinCutover(context,subject,binding);
-      return this.store.createOrReplay({operationId,attemptKey:snapshot.attemptKey,requestHash,kind:"cutover_start",authorityMode:"OWNER_DIRECT",scopeRoot:stateRoot,request:{...request,coordinationBinding}});
+      return this.store.createOrReplay({operationId,attemptKey:snapshot.attemptKey,requestHash,kind:"cutover_start",scopeRoot:stateRoot,request:{...request,coordinationBinding}});
     });
     if (!intent.created) return this.reconcileCutoverStart(operationId,context);
     try {
@@ -568,7 +673,7 @@ export class DurableOperationManager {
     });
   }
 
-  async restartCutover(cutoverId:string, currentIdentity:CutoverServerIdentity, buildReady:BuildReadyReceipt, probe:(expected:ExpectedCutoverIdentity)=>{buildReady:boolean;detail:string}|Promise<{buildReady:boolean;detail:string}>, actuator:SelfRestartActuator, context?:unknown) {
+  async restartCutover(cutoverId:string, currentIdentity:CutoverServerIdentity, buildReady:BuildReadyReceipt, probe:(expected:ExpectedCutoverIdentity)=>{buildReady:boolean;detail:string}|Promise<{buildReady:boolean;detail:string}>, actuator:SelfRestartActuator, context?:unknown, activationBinding?:CutoverActivationBinding) {
     if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted host authority");
     const consumer=this.consumer,identity=Object.freeze({...currentIdentity});
     const target=Object.freeze({actuator:actuator.actuator,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget});
@@ -578,6 +683,7 @@ export class DurableOperationManager {
     const readBound=()=>{
       const file=cutoverStore.get();
       if(!file?.coordinationBinding||file.cutoverId!==cutoverId||file.phase!=="drained"||!isDeepStrictEqual(file.oldServerIdentity,identity)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart requires exact drained original runtime binding");
+      if(activationBinding!==undefined && !isDeepStrictEqual(file.activationBinding,activationBinding)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart activation binding changed or is missing");
       const intent=this.reconcileCutoverStart(file.coordinationBinding.operationHandle,context);
       const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision as string,operation:"cutover_start" as const};
       const binding=consumer.authorizeCutoverLifecycle(context,subject,action);
@@ -593,6 +699,7 @@ export class DurableOperationManager {
         if(!current.intent.receipt?.restartAction) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart marker lacks bound action; reconciliation required");
         return {...current,replay:true};
       }
+      if(!current.file.activationBinding) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart requires an exact durable activation binding before any restart effect");
       this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,restartAction:action,restartState:"requested"}});
       new McpCutoverController(cutoverStore,identity).requestRestart(cutoverId,ready);
       return {...readBound(),replay:false};
@@ -656,7 +763,10 @@ export class DurableOperationManager {
       if(!closed||closed.phase!=="closed"||closed.cutoverId!==cutoverId||!isDeepStrictEqual(closed.coordinationBinding,current.file.coordinationBinding)||!validWitness(receipt)||receipt?.closedByServerInstanceId!==identity.serverInstanceId||!Number.isFinite(Date.parse(receipt.reconciledAt))||Date.parse(receipt.reconciledAt)>Date.now()) throw new ControlPlaneOwnershipError("CAS_CONFLICT","closed file lacks exact terminal witness");
       if(current.replay) return closed;
       const expiredLeaseRecovery=current.recovery ? consumer.reconcileCutoverFinish(context,current.subject,action,current.binding,JSON.stringify({kind:"cutover_terminal",cutoverId,requestHash:current.subject.requestHash,terminalRecordHash:digest(closed)})) : undefined;
-      if(!current.recovery) consumer.finish(context,current.subject,current.binding,current.binding.leaseVersion);
+      if(!current.recovery) {
+        const released=consumer.finishAndRelease(context,current.subject,current.binding,current.binding.leaseVersion);
+        if(released.terminalState!=="released"||released.operationHandle!==undefined) throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish did not release the state-root lease");
+      }
       if(!isDeepStrictEqual(cutoverStore.get(),closed)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal file changed during final authority check");
       if(!isDeepStrictEqual(this.store.getByOperationId(current.intent.operationId),current.intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal intent changed during final authority check");
       this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,lifecycleTerminal:true,terminalRecordHash:digest(closed),lifecycleAction:action,...(expiredLeaseRecovery?{expiredLeaseRecovery}:{})}});
@@ -696,13 +806,6 @@ export class DurableOperationManager {
 
   async planDependencySync(input: DependencySyncInput) {
     assertAttemptKey(input.attemptKey);
-    const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
-    if (authorityMode !== "OWNER_DIRECT") {
-      throw new DurableOperationError(
-        "RECONCILIATION_REQUIRED",
-        "NEXUS_GOVERNED dependency sync is not self-authorizing; G9 must provide validated Nexus authority evidence.",
-      );
-    }
     const workspaceRoot = canonicalizePath(input.workspaceRoot);
     if (!this.config.allowedRoots.some((root) => isPathInsideRoot(workspaceRoot, canonicalizePath(root))) &&
         !isPathInsideRoot(workspaceRoot, canonicalizePath(this.config.worktreeRoot))) {
@@ -725,7 +828,7 @@ export class DurableOperationManager {
     const requestHash = hashJson(request);
     const operationId = stableOperationId("dependency_sync", workspaceRoot, input.attemptKey);
     const subject = {operationId, requestHash, workspaceRoot, baseRevision, operation: "dependency_sync" as const};
-    return {subject, request, workspaceRoot, authorityMode, frozenInputs, before, baseRevision, requestHash, operationId};
+    return {subject, request, workspaceRoot, frozenInputs, before, baseRevision, requestHash, operationId};
   }
 
   async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
@@ -734,7 +837,7 @@ export class DurableOperationManager {
       throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
     }
     const consumer = this.consumer;
-    const {subject, request, workspaceRoot, authorityMode, frozenInputs, before, baseRevision, requestHash, operationId} = await this.planDependencySync(input);
+    const {subject, request, workspaceRoot, frozenInputs, before, baseRevision, requestHash, operationId} = await this.planDependencySync(input);
     const directWitnessId = "OWNER_DIRECT_ISOLATED";
     const prepared = this.store.atomic(() => {
       if (ownerDirectIsolated) {
@@ -743,7 +846,6 @@ export class DurableOperationManager {
           attemptKey: input.attemptKey,
           requestHash,
           kind: "dependency_sync",
-          authorityMode,
           scopeRoot: workspaceRoot,
           workspaceId: input.workspaceId,
           request,
@@ -756,7 +858,6 @@ export class DurableOperationManager {
         attemptKey: input.attemptKey,
         requestHash,
         kind: "dependency_sync",
-        authorityMode,
         scopeRoot: workspaceRoot,
         workspaceId: input.workspaceId,
         request,
@@ -831,7 +932,6 @@ export class DurableOperationManager {
       if (
         !record ||
         record.kind !== "dependency_sync" ||
-        record.authorityMode !== "OWNER_DIRECT" ||
         record.request.ownerDirectIsolated !== true
       ) {
         throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "owner-direct isolated reconciliation is not authorized for this operation");
@@ -885,40 +985,18 @@ export class DurableOperationManager {
     });
   }
 
-  async nexusGatewayRecover(input: NexusGatewayRecoveryInput): Promise<DurableOperationRecord> {
-    return await this.recoveryAdapter.recover(input);
-  }
-
-  async nexusGatewayRecoveryPreflight(input: NexusGatewayRecoveryInput): Promise<NexusGatewayPreflightResult> {
-    return await this.recoveryAdapter.preflight(input);
-  }
-
-  async nexusGatewayRecoveryPreflightStart(input: NexusGatewayRecoveryInput): Promise<DurableOperationRecord> {
-    return await this.recoveryAdapter.preflightStart(input);
-  }
-
-  async nexusGatewayRecoveryMaterialize(input: NexusGatewayRecoveryMaterializationInput): Promise<DurableOperationRecord> {
-    return await this.recoveryAdapter.materialize(input);
-  }
-
   async reconcile(operationId: string, consumerContext?: unknown): Promise<DurableOperationRecord> {
     const record = this.store.getByOperationId(operationId);
     if (!record) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
     if (record.kind === "cutover_start") return this.reconcileCutoverStart(operationId,consumerContext);
+    if (record.kind === "git_push") return await this.reconcileGitPush(operationId);
     if (record.kind === "dependency_sync") {
-      if (record.authorityMode === "OWNER_DIRECT" && record.request.ownerDirectIsolated === true) {
+      if (record.request.ownerDirectIsolated === true) {
         return this.reconcileOwnerDirectDependencySync(operationId);
       }
       if (!this.consumer || typeof record.request.baseRevision !== "string") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires revision-bound host authority");
       const subject = {operationId, requestHash:record.requestHash, workspaceRoot:record.scopeRoot, baseRevision:record.request.baseRevision, operation:"dependency_sync" as const};
       return this.reconcileDependencySync(operationId, this.consumer.readReconciliation(consumerContext, subject), consumerContext);
-    }
-    if (
-      record.kind === "nexus_gateway_recovery_preflight"
-      || record.kind === "nexus_gateway_recover"
-      || record.kind === "nexus_gateway_recovery_materialize"
-    ) {
-      return await this.recoveryAdapter.reconcile(record);
     }
 
     if (record.kind === "workspace_clone") {
@@ -966,7 +1044,6 @@ function rowToRecord(row: DurableOperationRow): DurableOperationRecord {
     attemptKey: row.attempt_key,
     requestHash: row.request_hash,
     kind: row.kind as DurableOperationKind,
-    authorityMode: row.authority_mode as ExecutionAuthorityMode,
     scopeRoot: row.scope_root,
     workspaceId: row.workspace_id ?? undefined,
     status: row.status as DurableOperationStatus,
@@ -1137,6 +1214,35 @@ async function readGitRemote(root: string): Promise<string | undefined> {
   }
 }
 
+async function readGitRemoteRef(
+  root: string,
+  remote: string,
+  branch: string,
+): Promise<{ available: true; sha: string } | { available: false; errorMessage: string }> {
+  try {
+    const result = await spawnCommand(
+      "git",
+      ["ls-remote", "--heads", remote, `refs/heads/${branch}`],
+      root,
+    );
+    if (result.exitCode !== 0) {
+      return {
+        available: false,
+        errorMessage: result.stderr || `git ls-remote exited ${result.exitCode}`,
+      };
+    }
+    return {
+      available: true,
+      sha: result.stdout.trim().split(/\s+/)[0] ?? "",
+    };
+  } catch (error) {
+    return {
+      available: false,
+      errorMessage: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 
 async function spawnCommand(
   command: string,
@@ -1163,39 +1269,3 @@ async function spawnCommand(
     child.on("close", (exitCode) => resolvePromise({ exitCode, stdout, stderr }));
   });
 }
-
-export {
-  NEXUS_GATEWAY_RECOVERY_SCHEMA,
-  NEXUS_GATEWAY_INTERPRETER,
-  NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
-  NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
-  NEXUS_GATEWAY_STATE_ROOT,
-  type NexusGatewayRecoveryRequest,
-  type NexusGatewayRecoveryInput,
-  type NexusGatewayRecoveryBridgeResult,
-  type NexusGatewayRecoveryReceipt,
-  type NexusGatewayRecoveryMaterializationReceipt,
-  type NexusGatewayRecoveryMaterializationRequest,
-  type NexusGatewayRecoveryMaterializationInput,
-  type NexusGatewayPreflightResult,
-  type NexusGatewayRecoveryPreflightResult,
-  type NexusGatewayRecoveryRunner,
-  type NexusGatewayRecoveryMaterializationRunner,
-  assertNexusGatewayRecoveryRequest,
-  assertNexusGatewayRecoveryMaterializationRequest,
-  validateNexusGatewayPreflightReceipt,
-  validateNexusGatewayRecoveryReceipt,
-  validateNexusGatewayMaterializationReceipt,
-  buildNexusGatewayRecoveryBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
-  spawnNexusGatewayRecovery,
-  buildNexusGatewayRecoveryPreflightBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
-  spawnNexusGatewayRecoveryPreflight,
-  buildNexusGatewayRecoveryMaterializationBridgeCode,
-  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
-  spawnNexusGatewayRecoveryMaterialize,
-  NexusRecoveryAdapter,
-} from "./nexus-recovery-adapter.js";

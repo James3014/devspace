@@ -93,6 +93,7 @@ export interface AgentProviderFailureDetails {
   code: string;
   errorClass: string;
   retryable: boolean;
+  rawProviderCode?: string;
   model?: string;
   variant?: string;
   providerSessionId?: string;
@@ -114,6 +115,7 @@ export class AgentProviderFailureError extends TaggedError(
   errorClass: AgentProviderFailureClass;
   model?: string;
   variant?: string;
+  rawProviderCode?: string;
   providerSessionId?: string;
   providerMessage?: string;
 }>() {}
@@ -226,6 +228,7 @@ export function describeAgentProviderError(error: AgentProviderError): AgentProv
       code: error.code,
       errorClass: error.errorClass,
       retryable: error.retryable,
+      ...(error.rawProviderCode ? { rawProviderCode: redactSensitiveText(error.rawProviderCode) } : {}),
       ...(error.model ? { model: error.model } : {}),
       ...(error.variant ? { variant: error.variant } : {}),
       ...(error.providerSessionId ? { providerSessionId: error.providerSessionId } : {}),

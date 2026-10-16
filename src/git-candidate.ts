@@ -145,15 +145,15 @@ function pushFailureWithEvidence(input: {
     "GIT_EXECUTION_ERROR",
     `${base} Remote reconciliation observed ${input.remote}/${input.branch} at ${input.observation.sha || "absent"}.`,
     {
-      state: confirmed ? "CONFIRMED_REMOTE_PUSH" : "CONFIRMED_NO_EFFECT",
+      state: confirmed ? "CONFIRMED_REMOTE_PUSH" : "EFFECT_UNKNOWN",
       retryAllowed: false,
-      reconciliationRequired: confirmed,
+      reconciliationRequired: true,
       expectedPushedSha: input.expectedHead,
       remote: input.remote,
       branch: input.branch,
       guidance: confirmed
         ? "The expected remote push is confirmed. Reconcile the exact attempt; do not retry."
-        : "The expected SHA is not present at the remote ref. Reconcile before any retry.",
+        : "The expected SHA is not currently visible at the remote ref. Delayed settlement remains possible; reconcile the exact attempt and do not retry.",
     },
   );
 }
@@ -636,6 +636,41 @@ export async function pushCandidate(options: {
     throw new GitCandidateError(
       "GIT_PROTECTED_BRANCH",
       `Pushing to discovered remote default branch '${branch}' is denied.`,
+    );
+  }
+
+  // The local refs/remotes/<remote>/HEAD symref may be absent or stale, so ask
+  // the remote authoritatively. Fail closed when the default is undeterminable.
+  let authoritativeDefault: string | undefined;
+  try {
+    const { stdout } = await runGit(["ls-remote", "--symref", remote, "HEAD"], resolvedWorkspaceRoot, 15000);
+    const match = /^ref:\s+refs\/heads\/(\S+)\s+HEAD\s*$/m.exec(stdout);
+    authoritativeDefault = match?.[1];
+  } catch {
+    authoritativeDefault = undefined;
+  }
+  if (!authoritativeDefault) {
+    // A verified-empty remote has no born default branch yet, so no existing
+    // default can be overwritten; any other undeterminable state fails closed.
+    let remoteIsEmpty = false;
+    try {
+      const { stdout } = await runGit(["ls-remote", remote], resolvedWorkspaceRoot, 15000);
+      remoteIsEmpty = stdout.trim() === "";
+    } catch {
+      remoteIsEmpty = false;
+    }
+    if (remoteIsEmpty) authoritativeDefault = "";
+  }
+  if (authoritativeDefault === undefined) {
+    throw new GitCandidateError(
+      "GIT_EXECUTION_ERROR",
+      `Could not determine the default branch of remote '${remote}'; push denied because the default branch cannot be excluded.`,
+    );
+  }
+  if (authoritativeDefault && branch === authoritativeDefault) {
+    throw new GitCandidateError(
+      "GIT_PROTECTED_BRANCH",
+      `Pushing to remote default branch '${branch}' is denied.`,
     );
   }
 

@@ -9,9 +9,11 @@ export const REPOSITORY_INTELLIGENCE_TOOL_NAMES = [
   "repository_intelligence_impact",
   "repository_intelligence_cfi",
   "repository_intelligence_eia",
+  "repository_intelligence_knowledge",
+  "repository_intelligence_guard_delta",
 ] as const;
 
-export type RepositoryIntelligenceOperation = "revision" | "readiness" | "overlap" | "ci" | "impact" | "cfi" | "eia";
+export type RepositoryIntelligenceOperation = "revision" | "readiness" | "overlap" | "ci" | "impact" | "cfi" | "eia" | "knowledge" | "guard-delta";
 
 export interface RepositoryIntelligenceEngineIdentity {
   head: string;
@@ -29,7 +31,12 @@ export interface RepositoryIntelligenceRunnerConfig {
 
 export interface RepositoryIntelligenceResult {
   operation: RepositoryIntelligenceOperation;
-  claim_ceiling: "PR_INTELLIGENCE_ONLY" | "CI_EVIDENCE_ONLY" | "AUTOMATION_ADVISORY_ONLY";
+  claim_ceiling:
+    | "PR_INTELLIGENCE_ONLY"
+    | "CI_EVIDENCE_ONLY"
+    | "AUTOMATION_ADVISORY_ONLY"
+    | "REPOSITORY_KNOWLEDGE_APPLICABILITY_EVIDENCE_ONLY"
+    | "GUARD_SEMANTIC_DELTA_ADVISORY_EVIDENCE_ONLY";
   result: Record<string, unknown>;
   engine: RepositoryIntelligenceEngineIdentity;
 }
@@ -45,6 +52,8 @@ export function expectedRepositoryIntelligenceClaimCeiling(
 ): RepositoryIntelligenceResult["claim_ceiling"] {
   if (operation === "ci" || operation === "cfi") return "CI_EVIDENCE_ONLY";
   if (operation === "eia") return "AUTOMATION_ADVISORY_ONLY";
+  if (operation === "knowledge") return "REPOSITORY_KNOWLEDGE_APPLICABILITY_EVIDENCE_ONLY";
+  if (operation === "guard-delta") return "GUARD_SEMANTIC_DELTA_ADVISORY_EVIDENCE_ONLY";
   return "PR_INTELLIGENCE_ONLY";
 }
 
@@ -68,7 +77,11 @@ function validateCanonicalPayload(
     throw new Error("Repository Intelligence result is missing or invalid");
   }
   const result = payload.result as Record<string, unknown>;
-  if (result.claim_ceiling !== undefined && result.claim_ceiling !== expected) {
+  const requiresNestedClaimCeiling = operation === "knowledge" || operation === "guard-delta";
+  if (
+    (requiresNestedClaimCeiling && result.claim_ceiling !== expected) ||
+    (!requiresNestedClaimCeiling && result.claim_ceiling !== undefined && result.claim_ceiling !== expected)
+  ) {
     throw new Error(`Repository Intelligence nested claim ceiling mismatch: expected ${expected}`);
   }
   return { operation, claim_ceiling: expected, result, engine };

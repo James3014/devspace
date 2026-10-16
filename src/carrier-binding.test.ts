@@ -9,9 +9,9 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBinding } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
-import { CutoverStateStore } from "./cutover-state.js";
+import { CUTOVER_ACTIVATION_BINDING_SCHEMA, CutoverStateStore, type CutoverActivationBinding } from "./cutover-state.js";
 import { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
-import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
+import { performLocalBoundCutoverFinish, performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
 function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   const root=realpathSync.native(mkdtempSync(join(tmpdir(),"carrier-test-"))).replaceAll("\\","/");
@@ -29,6 +29,38 @@ function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   return {root,workspace,store,db,controller,worker,contract,request,approved,snapshot,advance:(ms=120000)=>{now+=ms;},clock:()=>now,close:()=>{db.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 
+function bindFixtureActivation(
+  stateDir:string,
+  cutoverId:string,
+  expectedIdentity:{sourceCommit:string;buildId:string},
+):CutoverActivationBinding {
+  const binding:CutoverActivationBinding={
+    schema:CUTOVER_ACTIVATION_BINDING_SCHEMA,
+    cutoverId,
+    sourceCommit:expectedIdentity.sourceCommit,
+    buildId:expectedIdentity.buildId,
+    releaseSha256:"e".repeat(64),
+    releasePath:join(stateDir,"releases",`release-${expectedIdentity.sourceCommit}`),
+    pointerPath:join(stateDir,"current-release.json"),
+    boundAt:"2026-10-06T00:00:00.000Z",
+  };
+  return new CutoverStateStore(stateDir).recordActivationBinding(cutoverId,binding).record.activationBinding!;
+}
+
+function withFixtureRelease<T extends {
+  serverInstanceId:string;
+  sourceCommit:string;
+  buildId:string;
+  capabilityManifestSha256?:string;
+}>(identity:T,binding:CutoverActivationBinding) {
+  return {
+    ...identity,
+    releaseSha256:binding.releaseSha256,
+    releasePath:binding.releasePath,
+    activationCutoverId:binding.cutoverId,
+  };
+}
+
 async function prepareCapabilityMismatch(f: ReturnType<typeof fixture>, sessionId: string, expectedCapability: string, observedCapability: string) {
   const context={clientId:"shared-oauth",sessionId};
   const pairing=f.store.requestPairing(context);
@@ -44,15 +76,16 @@ async function prepareCapabilityMismatch(f: ReturnType<typeof fixture>, sessionI
   const plan=planCutoverStart(f.root,cutover);
   const preparedLease=f.store.prepareEffect(context,plan.subject);
   const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,`${sessionId}-config`),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,`${sessionId}-worktrees`),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-  const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+  const manager=new DurableOperationManager(config,undefined,f.store.readers);
   const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
   manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+  const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
   let scheduled=0;
   await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"exact target build"}),{
     actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",
     schedule:()=>{scheduled+=1;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"};},
   },context);
-  return {context,cutover,approved,preparedLease,manager,start,id,scheduled:()=>scheduled,observed:{serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:observedCapability}};
+  return {context,cutover,approved,preparedLease,manager,start,id,activation,scheduled:()=>scheduled,observed:withFixtureRelease({serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:observedCapability},activation)};
 }
 
 async function prepareUnexpectedReplacement(f: ReturnType<typeof fixture>, sessionId: string) {
@@ -70,11 +103,12 @@ async function prepareUnexpectedReplacement(f: ReturnType<typeof fixture>, sessi
   const plan=planCutoverStart(f.root,cutover);
   const preparedLease=f.store.prepareEffect(context,plan.subject);
   const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,`${sessionId}-config`),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,`${sessionId}-worktrees`),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-  const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+  const manager=new DurableOperationManager(config,undefined,f.store.readers);
   const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
   manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+  const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
   const observed={serverInstanceId:"replacement",sourceCommit:"f".repeat(40),buildId:"replacement-build",capabilityManifestSha256:"e".repeat(64)};
-  return {context,pairing,cutover,approved,preparedLease,manager,start,id,observed};
+  return {context,pairing,cutover,approved,preparedLease,manager,start,id,activation,observed};
 }
 
 for(const scenario of ["current","expired","close-response","terminal-write","revoke-witness","renew-witness","stale-replay"]) test(`local cutover approval binds execution and recovery (${scenario})`,async()=>{
@@ -84,7 +118,15 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
     const context={clientId:"shared-oauth",sessionId:"cutover-controller"};
     const pairing=f.store.requestPairing(context);
     const cutover={stateRoot:f.root,attemptKey:"approved-cutover",
-      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      currentIdentity:{
+        serverInstanceId:"original",
+        sourceCommit:f.contract.baseRevision,
+        buildId:"old",
+        capabilityManifestSha256:"c".repeat(64),
+        releaseSha256:"e".repeat(64),
+        releasePath:join(f.root,"releases","release-old"),
+        activationCutoverId:"bootstrap-old",
+      },
       expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
       expiresAt:new Date(Date.parse(f.contract.expiresAt)-30000).toISOString(),
       restart:{buildReady:{verifiedBy:"independent",verifiedAt:new Date(Date.parse(f.contract.expiresAt)-60000).toISOString(),evidence:"exact package digest"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
@@ -112,16 +154,25 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
     assert.equal(lease.operation,"cutover_start");
     assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,attemptKey:"other"}).subject));
     assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,expectedIdentity:{...cutover.expectedIdentity,buildId:"wrong"}}).subject));
+    assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,currentIdentity:{...cutover.currentIdentity,releaseSha256:"f".repeat(64)}}).subject));
+    assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,currentIdentity:{...cutover.currentIdentity,releasePath:join(f.root,"releases","release-other")}}).subject));
+    assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,currentIdentity:{...cutover.currentIdentity,activationCutoverId:"bootstrap-other"}}).subject));
     const child=f.store.requestPairing(f.worker);
     assert.throws(()=>f.store.delegate(context,child.pendingId,{...contract,role:"worker"}));
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const manager=new DurableOperationManager(config,undefined,f.store.readers);
     let scheduled=0;
     const actuator={actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget,schedule:()=>{scheduled++;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget};}};
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    let activation:CutoverActivationBinding|undefined;
     try {
       assert.throws(()=>manager.drainCutover(id,{...cutover.currentIdentity,serverInstanceId:"other"},()=>({activeSessions:0,oldestAgeMs:0}),context));
       assert.equal(manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context).phase,"drained");
+      await assert.rejects(
+        manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"test"}),actuator,context),
+        /activation binding/i,
+      );
+      activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
       await assert.rejects(manager.restartCutover(id,cutover.currentIdentity,{...cutover.restart.buildReady,evidence:"wrong"},async()=>({buildReady:true,detail:"test"}),actuator,context));
       await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"test"}),actuator,context);
       await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>{throw new Error("replay must not probe");},actuator,context);
@@ -131,7 +182,7 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
       await assert.rejects(manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"test"}),actuator,context));
     } finally {manager.close();}
     const resumedStore=new CarrierBindingStore(f.root,f.clock);
-    const resumedManager=new DurableOperationManager(config,undefined,undefined,undefined,resumedStore.readers);
+    const resumedManager=new DurableOperationManager(config,undefined,resumedStore.readers);
     const successor={clientId:context.clientId,sessionId:"replacement-session"};
     try {
       if(expireLease) {
@@ -141,7 +192,7 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
       }
       assert.throws(()=>resumedStore.status(successor));
       resumedStore.redeem(successor,pairing.credential);
-      const replacement={serverInstanceId:"replacement",...cutover.expectedIdentity};
+      const replacement=withFixtureRelease({serverInstanceId:"replacement",...cutover.expectedIdentity},activation!);
       const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
       await assert.rejects(resumedManager.finishCutover(id,cutover.currentIdentity,cutover.finish,async()=>witness,successor));
       await assert.rejects(resumedManager.finishCutover(id,replacement,{...cutover.finish,agentId:"wrong"},async()=>witness,successor));
@@ -198,7 +249,7 @@ test("active coordination-bound prepared cutover can terminally reconcile an exa
     f.store.approveLocal(pairing.pendingId,{...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover});
     f.store.redeem(context,pairing.credential);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const manager=new DurableOperationManager(config,undefined,f.store.readers);
     try {
       f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
       const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
@@ -235,7 +286,7 @@ test("terminal hygiene releases the exact active prepared-replacement cutover le
     const plan=planCutoverStart(f.root,cutover);
     const acquired=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context);
     const cutoverId=start.receipt!.cutoverId as string;
     const replacement={serverInstanceId:"replacement",...cutover.expectedIdentity};
@@ -250,7 +301,7 @@ test("terminal hygiene releases the exact active prepared-replacement cutover le
     const terminalLease=f.store.ownership.get(acquired.leaseId)!;
     assert.equal(terminalLease.operationState,"finished");
     assert.equal(terminalLease.operationHandle,undefined);
-    assert.equal(terminalLease.terminalState,undefined);
+    assert.equal(terminalLease.terminalState,"released");
     assert.equal(manager.store.getByOperationId(start.operationId)?.receipt?.terminalRecordHash,terminalHash);
 
     const revoked=f.store.revokeLocal(approved.id,1);
@@ -260,15 +311,15 @@ test("terminal hygiene releases the exact active prepared-replacement cutover le
     const released=f.store.releaseClosedCutoverLeaseLocal({
       cutoverId,
       leaseId:acquired.leaseId,
-      expectedLeaseVersion:terminalLease.version,
+      expectedLeaseVersion:terminalLease.version-1,
       carrierId:approved.id,
       expectedCarrierVersion:2,
       expectedTerminalRecordHash:terminalHash,
       confirmCutoverId:cutoverId,
     });
-    assert.equal(released.replayed,false);
+    assert.equal(released.replayed,true);
     assert.equal(released.lease.terminalState,"released");
-    assert.equal(released.lease.version,terminalLease.version+1);
+    assert.equal(released.lease.version,terminalLease.version);
     assert.equal(released.lease.operationState,"finished");
     assert.equal(released.lease.operationHandle,undefined);
   } finally {
@@ -292,7 +343,7 @@ test("expired coordination-bound prepared cutover can terminally reconcile an ex
     const approved=f.store.approveLocal(pairing.pendingId,contract);
     f.store.redeem(context,pairing.credential);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const manager=new DurableOperationManager(config,undefined,f.store.readers);
     try {
       f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
       const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
@@ -337,7 +388,7 @@ test("host-local recovery terminally closes only an expired prepared cutover wit
     const plan=planCutoverStart(f.root,cutover);
     const lease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config2"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees2"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     const validityBefore=f.store.inspectLocal(approved.id).validity;
     f.advance(120000);
@@ -383,7 +434,7 @@ test("host-local expired prepared recovery rejects any prior drain effect",()=>{
     f.store.redeem(context,pairing.credential);
     const plan=planCutoverStart(f.root,cutover);f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config3"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees3"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     f.store.readers.approveCutoverLifecycle=()=>true;
     manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
@@ -412,7 +463,7 @@ test("expired prepared recovery crash before cutover close keeps the global fenc
     const approved=f.store.approveLocal(pairing.pendingId,contract);f.store.redeem(context,pairing.credential);
     const plan=planCutoverStart(f.root,cutover);const lease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config4"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees4"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     f.advance(120000);
     CutoverStateStore.prototype.recoverExpiredPreparedNoEffect=function(){throw new Error("injected-before-cutover-close");};
@@ -448,7 +499,7 @@ test("expired prepared recovery crash after cutover close replays only operation
     const approved=f.store.approveLocal(pairing.pendingId,contract);f.store.redeem(context,pairing.credential);
     const plan=planCutoverStart(f.root,cutover);const lease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config5"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees5"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     f.advance(120000);
     let injected=false;
@@ -748,9 +799,10 @@ test("host-local capability expectation mismatch recovery closes the failed cuto
     const plan=planCutoverStart(f.root,cutover);
     const preparedLease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-cap-mismatch"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-cap-mismatch"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
     const actuator={actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",schedule:()=>({scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"})};
     await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"exact target build"}),actuator,context);
     const before=new CutoverStateStore(f.root).get()!;
@@ -758,7 +810,7 @@ test("host-local capability expectation mismatch recovery closes the failed cuto
     assert.ok(before.restartRequest?.restartScheduledAt);
     assert.equal(f.store.ownership.get(preparedLease.leaseId)?.operationHandle,start.operationId);
 
-    const observed={serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:observedCapability};
+    const observed=withFixtureRelease({serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:observedCapability},activation);
     for (const wrongIdentity of [
       {...observed,sourceCommit:"f".repeat(40)},
       {...observed,buildId:"wrong-build"},
@@ -826,12 +878,13 @@ test("host-local capability expectation mismatch recovery accepts an arbitrary s
     const plan=planCutoverStart(f.root,cutover);
     const lease=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-cap-mismatch-negative"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-cap-mismatch-negative"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
     manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
     const actuator={actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",schedule:()=>({scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"})};
     await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"different expected capability"}),actuator,context);
-    const observed={serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:"e".repeat(64)};
+    const observed=withFixtureRelease({serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:"e".repeat(64)},activation);
     const recovered=f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
     assert.equal(recovered.replayed,false);
     assert.equal(recovered.cutover.phase,"closed");
@@ -841,6 +894,61 @@ test("host-local capability expectation mismatch recovery accepts an arbitrary s
     assert.equal(recovered.cutover.capabilityExpectationMismatch?.observedIdentity.capabilityManifestSha256,"e".repeat(64));
     assert.equal(recovered.operation.errorMessage,"Replacement source/build matched, but the observed capability manifest differed from the approved expected capability.");
     assert.equal(recovered.lease.terminalState,"released");
+  } finally {manager?.close();f.close();}
+});
+
+test("host-local failed activation recovery closes a consumed wrong-generation restart without replay",async()=>{
+  const f=fixture();
+  const context={clientId:"shared-oauth",sessionId:"failed-activation-controller"};
+  let manager:DurableOperationManager|undefined;
+  try {
+    const pairing=f.store.requestPairing(context);
+    const cutover={stateRoot:f.root,attemptKey:"failed-activation",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+120000).toISOString(),
+      restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact target build"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+180000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const preparedLease=f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-failed-activation"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-failed-activation"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
+    const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    const activation=bindFixtureActivation(f.root,id,cutover.expectedIdentity);
+    let scheduled=0;
+    const actuator={actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",schedule:()=>{scheduled+=1;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"};}};
+    await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"exact target build"}),actuator,context);
+    assert.equal(scheduled,1);
+    assert.equal(f.store.ownership.get(preparedLease.leaseId)?.operationHandle,start.operationId);
+
+    const observed=withFixtureRelease({serverInstanceId:"replacement",sourceCommit:"f".repeat(40),buildId:"wrong-build",capabilityManifestSha256:"e".repeat(64)},activation);
+    const recovered=f.store.recoverFailedActivationLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
+    assert.equal(recovered.replayed,false);
+    assert.equal(recovered.cutover.phase,"closed");
+    assert.equal(recovered.cutover.reconciliationReceipt?.terminalReason,"FAILED_ACTIVATION");
+    assert.equal(recovered.cutover.failedActivation?.restartConsumed,true);
+    assert.equal(recovered.cutover.failedActivation?.retryAllowed,false);
+    assert.equal(recovered.cutover.failedActivation?.successorRequired,true);
+    assert.deepEqual(recovered.cutover.failedActivation?.approvedTarget,cutover.expectedIdentity);
+    assert.deepEqual(recovered.cutover.failedActivation?.observedIdentity,observed);
+    assert.equal(recovered.lease.terminalState,"released");
+    assert.equal(recovered.lease.operationState,"finished");
+    assert.equal(recovered.lease.operationHandle,undefined);
+    assert.equal(recovered.operation.status,"failed");
+    assert.equal(recovered.operation.errorCode,"FAILED_ACTIVATION");
+    assert.equal(recovered.operation.retrySafe,false);
+    assert.equal(recovered.operation.receipt?.lifecycleTerminal,true);
+    assert.equal(recovered.operation.receipt?.recoveryKind,"failed_activation");
+
+    const replay=f.store.recoverFailedActivationLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
+    assert.equal(replay.replayed,true);
+    assert.equal(scheduled,1);
+    assert.deepEqual(replay.cutover,recovered.cutover);
+    assert.deepEqual(replay.reconciliation,recovered.reconciliation);
   } finally {manager?.close();f.close();}
 });
 
@@ -1083,7 +1191,7 @@ test("handoff denies a pinned operation and permits terminal replay after predec
     const started=new Promise<void>(resolve=>{launched=resolve;});
     const terminal=new Promise<void>(resolve=>{finish=resolve;});
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_ALLOWED_ROOTS:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},f.store.readers);
     const input={workspaceId:"fixture-workspace",workspaceRoot:f.workspace,attemptKey:"handoff-terminal",recipe:"npm_ci" as const};
     const plan=await manager.planDependencySync(input);
     const lease=f.store.prepareEffect(sender,plan.subject);
@@ -1352,7 +1460,7 @@ for(const expire of [true,false]) test(`validity drift fences completion and ori
     const started=new Promise<void>(resolve=>{launched=resolve;});
     const terminal=new Promise<void>(resolve=>{finish=resolve;});
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_ALLOWED_ROOTS:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
-    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},f.store.readers);
     const input={workspaceId:"fixture-workspace",workspaceRoot:f.workspace,attemptKey:"handoff-terminal",recipe:"npm_ci" as const};
     const plan=await manager.planDependencySync(input);
     const lease=f.store.prepareEffect(sender,plan.subject);
@@ -1486,7 +1594,7 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
       HOST:"127.0.0.1",
       PORT:"7677",
     });
-    const setup=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const setup=new DurableOperationManager(config,undefined,f.store.readers);
     const start=setup.startCutover(cutover,context);
     const cutoverId=start.receipt!.cutoverId as string;
     setup.drainCutover(cutoverId,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
@@ -1503,11 +1611,46 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
     });
     const actuatorCalls: Array<{livePid:number;serviceLabel:string;launchdTarget:string}>=[];
     let scheduled=0;
+    let activationVerifications=0;
+    const activationBinding={
+      schema:CUTOVER_ACTIVATION_BINDING_SCHEMA,
+      cutoverId,
+      sourceCommit:cutover.expectedIdentity.sourceCommit,
+      buildId:cutover.expectedIdentity.buildId,
+      releaseSha256:"e".repeat(64),
+      releasePath:join(f.root,"release-target"),
+      pointerPath:join(f.root,"current-release.json"),
+      boundAt:new Date(f.clock()).toISOString(),
+    };
     const dependencies={
       readHealth:async()=>health(),
       probeTarget:async()=>({buildReady:true,detail:"exact package"}),
-      createActuator:(options:{livePid:number;serviceLabel:string;launchdTarget:string})=>{
-        actuatorCalls.push(options);
+      inspectStableService:()=>({
+        serviceRoot:f.root,
+        program:process.execPath,
+        arguments:[process.execPath,"dist/service-launcher.js","serve"],
+        pid:4321,
+      }),
+      bindActivation:()=>activationBinding,
+      verifyActivation:(binding:typeof activationBinding,serviceRoot:string)=>{
+        assert.deepEqual(binding,activationBinding);
+        assert.equal(serviceRoot,f.root);
+        activationVerifications+=1;
+      },
+      createActuator:(options:{
+        livePid:number;
+        serviceLabel:string;
+        launchdTarget:string;
+        expectedStableServiceRoot?:string;
+        verifyActivation?:()=>void;
+      })=>{
+        actuatorCalls.push({
+          livePid:options.livePid,
+          serviceLabel:options.serviceLabel,
+          launchdTarget:options.launchdTarget,
+        });
+        assert.equal(options.expectedStableServiceRoot,f.root);
+        options.verifyActivation?.();
         return {
           actuator:"launchd-self" as const,
           serviceLabel:options.serviceLabel,
@@ -1565,7 +1708,10 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
       serviceLabel:"test.service",
       launchdTarget:"gui/501/test.service",
     });
-    assert.ok(new CutoverStateStore(f.root).get()?.restartRequest?.restartScheduledAt);
+    const storedCutover=new CutoverStateStore(f.root).get();
+    assert.ok(storedCutover?.restartRequest?.restartScheduledAt);
+    assert.deepEqual(storedCutover?.activationBinding,activationBinding);
+    assert.ok(activationVerifications>=2);
 
     const replay=await performLocalBoundCutoverRestart({
       config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,carrierCredential:pairing.credential,
@@ -1573,6 +1719,112 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
     },dependencies);
     assert.equal(replay.scheduled,false);
     assert.equal(scheduled,1);
+  } finally {
+    f.close();
+  }
+});
+
+
+test("owner-local finish-bound closes a drained activated generation only for the exact live replacement", async () => {
+  const f=fixture();
+  try {
+    const context={clientId:"shared-oauth",sessionId:"cutover-finish-controller"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={
+      stateRoot:f.root,
+      attemptKey:"bound-local-finish",
+      currentIdentity:{serverInstanceId:"live-old",sourceCommit:f.contract.baseRevision,buildId:"old-build",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new-build",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+30000).toISOString(),
+      restart:{
+        buildReady:{verifiedBy:"independent",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact target package"},
+        actuator:"launchd-self" as const,
+        serviceLabel:"test.service",
+        launchdTarget:"gui/501/test.service",
+      },
+      finish:{workspaceId:"ws_test",agentId:"agt_test"},
+    };
+    const contract:CarrierContract={...f.contract,scope:[f.root],operations:["cutover_start"],expiresAt:new Date(f.clock()+60000).toISOString(),cutover};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
+    const config=loadConfig({
+      DEVSPACE_CONFIG_DIR:join(f.root,"config"),
+      DEVSPACE_ALLOWED_ROOTS:f.workspace,
+      DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),
+      DEVSPACE_STATE_DIR:f.root,
+      DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",
+      HOST:"127.0.0.1",
+      PORT:"7677",
+    });
+    const setup=new DurableOperationManager(config,undefined,f.store.readers);
+    const start=setup.startCutover(cutover,context);
+    const cutoverId=start.receipt!.cutoverId as string;
+    setup.drainCutover(cutoverId,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    setup.close();
+    f.store.forgetSession(context.sessionId);
+
+    const activationBinding={
+      schema:CUTOVER_ACTIVATION_BINDING_SCHEMA,
+      cutoverId,
+      sourceCommit:cutover.expectedIdentity.sourceCommit,
+      buildId:cutover.expectedIdentity.buildId,
+      releaseSha256:"e".repeat(64),
+      releasePath:join(f.root,"release-target"),
+      pointerPath:join(f.root,"current-release.json"),
+      boundAt:new Date(f.clock()).toISOString(),
+    };
+    new CutoverStateStore(f.root).recordActivationBinding(cutoverId,activationBinding);
+    const health=(over:{serverInstanceId?:string;buildId?:string}={})=>({
+      build:{
+        source_commit:cutover.expectedIdentity.sourceCommit,
+        build_id:over.buildId??cutover.expectedIdentity.buildId,
+        pid:4322,
+        release_sha256:activationBinding.releaseSha256,
+        release_path:activationBinding.releasePath,
+        activation_cutover_id:cutoverId,
+      },
+      capabilityManifest:{manifestSha256:cutover.expectedIdentity.capabilityManifestSha256},
+      mcp:{serverInstanceId:over.serverInstanceId??"live-new",cutoverMode:"normal",reconciliationRequired:false},
+    });
+    const pair={workspaceId:"ws_test",agentId:"agt_test"};
+    const witness=(p:{workspaceId:string;agentId:string})=>Promise.resolve({
+      workspaceQueryable:true,agentQueryable:true,agentReconciled:true,
+      witnessWorkspaceId:p.workspaceId,witnessAgentId:p.agentId,
+      workspaceSessions:1,agentSessions:1,witnessWorkspaceSessions:1,witnessAgentSessions:1,
+      witnessKind:"exact-pair",
+    });
+    const base={
+      config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,
+      carrierCredential:pairing.credential,confirmCutoverId:cutoverId,...pair,
+    };
+
+    // Negative: the old instance, or a wrong build, is never accepted as the replacement.
+    const drainedSnapshot=f.snapshot();
+    await assert.rejects(
+      performLocalBoundCutoverFinish(base,{readHealth:async()=>health({serverInstanceId:"live-old"}),reconcile:witness}),
+      /not the exact expected replacement/i,
+    );
+    await assert.rejects(
+      performLocalBoundCutoverFinish(base,{readHealth:async()=>health({buildId:"wrong-build"}),reconcile:witness}),
+      /not the exact expected replacement/i,
+    );
+    assert.equal(f.snapshot(),drainedSnapshot);
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+
+    // Negative: a wrong credential is refused before any state change.
+    await assert.rejects(
+      performLocalBoundCutoverFinish({...base,carrierCredential:"x".repeat(43)},{readHealth:async()=>health(),reconcile:witness}),
+      /credential/i,
+    );
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+
+    const closed=await performLocalBoundCutoverFinish(base,{readHealth:async()=>health(),reconcile:witness});
+    assert.equal(closed.record.phase,"closed");
+    assert.equal(closed.liveIdentity.serverInstanceId,"live-new");
+    const stored=new CutoverStateStore(f.root).get();
+    assert.equal(stored?.phase,"closed");
+    assert.equal(stored?.reconciliationReceipt?.witnessKind,"exact-pair");
   } finally {
     f.close();
   }
@@ -1600,10 +1852,11 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     const plan=planCutoverStart(f.root,cutover);
     const acquired=f.store.prepareEffect(context,plan.subject);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",HOST:"127.0.0.1",PORT:"7677"});
-    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    manager=new DurableOperationManager(config,undefined,f.store.readers);
     const start=manager.startCutover(cutover,context);
     const cutoverId=start.receipt!.cutoverId as string;
     manager.drainCutover(cutoverId,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    const activation=bindFixtureActivation(f.root,cutoverId,cutover.expectedIdentity);
     let scheduled=0;
     await manager.restartCutover(cutoverId,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"exact package"}),{
       actuator:"launchd-self" as const,
@@ -1612,7 +1865,7 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
       schedule:()=>{scheduled+=1;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget};},
     },context);
     assert.equal(scheduled,1);
-    const replacement={serverInstanceId:"replacement-instance",...cutover.expectedIdentity};
+    const replacement=withFixtureRelease({serverInstanceId:"replacement-instance",...cutover.expectedIdentity},activation);
     const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
     await manager.finishCutover(cutoverId,replacement,cutover.finish,async()=>witness,context);
 
@@ -1628,10 +1881,12 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     const terminalLease=f.store.ownership.get(acquired.leaseId)!;
     assert.equal(terminalLease.operationState,"finished");
     assert.equal(terminalLease.operationHandle,undefined);
-    assert.equal(terminalLease.terminalState,undefined);
+    // #472: finishCutover itself releases the lease; release-terminal-lease is then an exact replay.
+    assert.equal(terminalLease.terminalState,"released");
+    const preReleaseVersion=terminalLease.version-1;
 
     assert.throws(()=>f.store.releaseClosedCutoverLeaseLocal({
-      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,
       carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
     }),/revoked/i);
 
@@ -1643,24 +1898,24 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     const beforeCutover=JSON.stringify(new CutoverStateStore(f.root).get());
     const beforeOperation=JSON.stringify(terminalOperation);
     for(const invalid of [
-      {leaseId:"lease_wrong",expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
-      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version+1,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
-      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:3,expectedTerminalRecordHash:terminalHash},
-      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:2,expectedTerminalRecordHash:"0".repeat(64)},
+      {leaseId:"lease_wrong",expectedLeaseVersion:preReleaseVersion,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,expectedCarrierVersion:3,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,expectedCarrierVersion:2,expectedTerminalRecordHash:"0".repeat(64)},
     ]) {
       assert.throws(()=>f.store.releaseClosedCutoverLeaseLocal({
         cutoverId,carrierId:approved.id,confirmCutoverId:cutoverId,...invalid,
       }));
-      assert.equal(f.store.ownership.get(acquired.leaseId)?.terminalState,undefined);
+      assert.equal(f.store.ownership.get(acquired.leaseId)?.terminalState,"released");
     }
 
     const released=f.store.releaseClosedCutoverLeaseLocal({
-      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,
       carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
     });
-    assert.equal(released.replayed,false);
+    assert.equal(released.replayed,true);
     assert.equal(released.lease.terminalState,"released");
-    assert.equal(released.lease.version,terminalLease.version+1);
+    assert.equal(released.lease.version,terminalLease.version);
     assert.equal(released.lease.operationState,"finished");
     assert.equal(released.lease.operationHandle,undefined);
     assert.equal(JSON.stringify(new CutoverStateStore(f.root).get()),beforeCutover);
@@ -1669,7 +1924,7 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     finalOperations.close();
 
     const replay=f.store.releaseClosedCutoverLeaseLocal({
-      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:preReleaseVersion,
       carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
     });
     assert.equal(replay.replayed,true);
@@ -2120,4 +2375,47 @@ test("NAB-E2 Issue #287: 12 Mandatory Hostile Controls for recursive multi-hop d
   } finally {
     f.close();
   }
+});
+
+
+test("revoked expired prepare-only cutover lease cleanup requires exact no-effect evidence and is idempotent", () => {
+  const f=fixture();
+  try {
+    const context={clientId:"shared-oauth",sessionId:"idle-cleanup"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={
+      stateRoot:f.root,
+      attemptKey:"idle-cutover-canary",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expiresAt:new Date(f.clock()+30_000).toISOString(),
+      restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"prepare-only canary"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_idle",agentId:"agt_idle"},
+    };
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+60_000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const lease=f.store.prepareEffect(context,plan.subject);
+    assert.equal(f.db.sqlite.prepare("select operation_id from durable_operations where operation_id=?").get(plan.operationId),undefined);
+    assert.equal(new CutoverStateStore(f.root).get(),undefined);
+    assert.deepEqual(f.store.revokeLocal(approved.id,approved.version),{id:approved.id,version:2,revoked:true});
+    f.advance(120_000);
+    const input={leaseId:lease.leaseId,expectedLeaseVersion:lease.version,carrierId:approved.id,expectedCarrierVersion:2,expectedValidityVersion:1,expectedOperationId:plan.operationId,confirmLeaseId:lease.leaseId};
+    assert.throws(()=>f.store.releaseRevokedIdleCutoverLeaseLocal({...input,expectedOperationId:"op_0000000000000000"}),/operation identity changed/);
+    assert.throws(()=>f.store.releaseRevokedIdleCutoverLeaseLocal({...input,expectedLeaseVersion:lease.version+1}),/exact expired unpinned prepare-only lease/);
+    const result=f.store.releaseRevokedIdleCutoverLeaseLocal(input);
+    assert.equal(result.replayed,false);
+    assert.equal(result.lease.terminalState,"released");
+    assert.equal(result.lease.version,lease.version+1);
+    assert.equal(result.receipt.schema,"devspace.carrier_idle_lease_cleanup.v1");
+    assert.equal(result.receipt.operationId,plan.operationId);
+    assert.deepEqual(result.receipt.evidence,{carrierRevoked:true,carrierExpired:true,leaseExpired:true,operationHandleAbsent:true,durableOperationAbsent:true,terminalWitnessAbsent:true});
+    assert.equal((f.db.sqlite.prepare("select count(*) count from carrier_idle_lease_cleanup_receipts where lease_id=?").get(lease.leaseId) as {count:number}).count,1);
+    assert.equal(new CutoverStateStore(f.root).get(),undefined);
+    const replay=f.store.releaseRevokedIdleCutoverLeaseLocal(input);
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.receipt,result.receipt);
+    assert.deepEqual(replay.lease,result.lease);
+  } finally {f.close();}
 });

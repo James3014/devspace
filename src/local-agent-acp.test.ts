@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
+import test from "node:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -9,10 +10,29 @@ import {
   AcpRuntime,
   appendAcpQueueValue,
   acpCommandArgs,
+  classifyAcpError,
   resolveAcpCommand,
   selectAcpPermissionOption,
 } from "./local-agent-acp.js";
 import { GrokPromptCompletionRegistry } from "./local-agent-grok.js";
+import { AgentProviderFailureError } from "./local-agent-errors.js";
+
+test("ACP unsupported model HTTP 401 is classified as model unavailable with raw provider evidence", () => {
+  const providerMessage = 'HTTP 401 {"type":"error","error":{"type":"ModelError","message":"Model deepseek-v4-flash-free is not supported"}}';
+  const classified = classifyAcpError(
+    new Error(providerMessage),
+    "cline",
+    "sess-model-rejected",
+    { model: "deepseek-v4-flash-free" },
+  );
+
+  assert.ok(AgentProviderFailureError.is(classified));
+  assert.equal(classified.code, "PROVIDER_MODEL_UNAVAILABLE");
+  assert.equal(classified.errorClass, "MODEL_UNAVAILABLE");
+  assert.equal(classified.retryable, false);
+  assert.equal(classified.rawProviderCode, "ModelError");
+  assert.equal(classified.providerMessage, providerMessage);
+});
 
 const requests: Array<{ method: string; params?: unknown }> = [];
 const queues = new Map<string, { values: unknown[] }>();

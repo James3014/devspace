@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
@@ -93,4 +93,38 @@ try {
   }
 } finally {
   rmSync(tempDir, { recursive: true, force: true });
+}
+
+// Symlink containment: a link inside an allowed root must not reach outside it.
+if (process.platform !== "win32") {
+  const base = mkdtempSync(join(tmpdir(), "devspace-roots-symlink-"));
+  try {
+    const root = join(base, "allowed-root");
+    const outside = join(base, "outside");
+    mkdirSync(join(root, "sub"), { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(join(outside, "secret.txt"), "secret");
+    writeFileSync(join(root, "sub", "ok.txt"), "ok");
+    symlinkSync(outside, join(root, "escape-link"), "dir");
+    symlinkSync(join(outside, "secret.txt"), join(root, "file-link"));
+    symlinkSync(join(root, "sub"), join(root, "inner-link"), "dir");
+    const rootLink = join(base, "root-link");
+    symlinkSync(root, rootLink, "dir");
+
+    // Rejected: existing and not-yet-existing targets through an escaping link.
+    for (const escaped of ["escape-link/secret.txt", "escape-link/new-file.txt", "escape-link/a/b/c.txt", "file-link", "escape-link"]) {
+      assert.equal(isPathInsideRoot(join(root, escaped), root), false, escaped);
+      assert.throws(() => assertAllowedPath(join(root, escaped), [root]), /Path is outside allowed roots/, escaped);
+      assert.throws(() => resolveAllowedPath(escaped, root, [root]), /Path is outside allowed roots/, escaped);
+    }
+
+    // Honest positive paths still pass: plain files, new files, internal links, symlinked root.
+    assert.equal(assertAllowedPath(join(root, "sub", "ok.txt"), [root]), join(root, "sub", "ok.txt"));
+    assert.equal(isPathInsideRoot(join(root, "sub", "new.txt"), root), true);
+    assert.equal(isPathInsideRoot(join(root, "inner-link", "ok.txt"), root), true);
+    assert.equal(isPathInsideRoot(join(rootLink, "sub", "ok.txt"), rootLink), true);
+    assert.equal(isPathInsideRoot(join(rootLink, "escape-link", "secret.txt"), rootLink), false);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 }

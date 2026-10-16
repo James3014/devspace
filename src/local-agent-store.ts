@@ -3053,6 +3053,7 @@ function readErrorDetails(value: string | null): AgentProviderFailureDetails | u
         code: parsed.code,
         errorClass: parsed.errorClass,
         retryable: parsed.retryable === true,
+        ...(parsed.rawProviderCode ? { rawProviderCode: parsed.rawProviderCode } : {}),
         model: parsed.model,
         variant: parsed.variant,
         providerSessionId: parsed.providerSessionId,

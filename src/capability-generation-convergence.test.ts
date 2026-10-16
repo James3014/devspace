@@ -10,11 +10,11 @@ import {
   type SessionGenerationSnapshot,
   type ServiceRoleDeploymentIdentity,
 } from "./deployment-convergence.js";
-import { CUTOVER_SAFE_TOOLS } from "./mcp-cutover.js";
+import { classifyCutoverEffect } from "./mcp-cutover.js";
 import { McpSessionRegistry } from "./mcp-sessions.js";
 
-test("Issue #133: CUTOVER_SAFE_TOOLS includes capability_convergence_status", () => {
-  assert.equal(CUTOVER_SAFE_TOOLS.has("capability_convergence_status"), true);
+test("Issue #133: capability convergence observation remains independent of deployment conflicts", () => {
+  assert.equal(classifyCutoverEffect("capability_convergence_status"), "INDEPENDENT");
 });
 
 test("Issue #133: SessionConvergence detects stale server across restart", () => {
@@ -147,9 +147,7 @@ test("Issue #133: MultiRoleConvergence evaluates 7677 (dev2) and 7678 (dev-c) di
         manifestSha256: "manifest-latest",
         capabilities: [
           "agent_start.tool",
-          "agent_start.executionContract.authorityMode",
           "agent_start.executionContract.idleTimeoutMs",
-          "agent_start.executionContract.nexusGrant",
           "agent_start.executionContract.authorizedToolCeiling",
           "agent_start.executionContract.toolProjectionManifest",
         ],
@@ -174,9 +172,7 @@ test("Issue #133: MultiRoleConvergence evaluates 7677 (dev2) and 7678 (dev-c) di
         manifestSha256: "manifest-older",
         capabilities: [
           "agent_start.tool",
-          "agent_start.executionContract.authorityMode",
           "agent_start.executionContract.idleTimeoutMs",
-          "agent_start.executionContract.nexusGrant",
           "agent_start.executionContract.authorizedToolCeiling",
           "agent_start.executionContract.toolProjectionManifest",
         ],

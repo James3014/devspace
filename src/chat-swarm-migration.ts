@@ -60,7 +60,6 @@ export class ChatSwarmMigrationCoordinator {
       attemptKey: input.attemptKey,
       requestHash,
       kind: "chat_swarm_reconciliation",
-      authorityMode: "OWNER_DIRECT",
       scopeRoot: this.destinationStateDirectory,
       request,
     });

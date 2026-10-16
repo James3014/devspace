@@ -671,21 +671,17 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       stderr: stderrCapture.metadata(),
     } : undefined;
 
-    const observedModel = typeof parsed.model === "string"
-      ? parsed.model
-      : typeof parsed.observed_model === "string"
-        ? parsed.observed_model
-        : typeof parsed.resolved_model === "string"
-          ? parsed.resolved_model
-          : undefined;
-
+    // Agy's verified JSON contract does not provide a provider-side model
+    // identity readback. The known stream-json `init.model` is launch metadata,
+    // and response keys named `model`, `observed_model`, or `resolved_model`
+    // have no established provenance here. Preserve the response as output,
+    // but leave physical model attestation unavailable until Agy exposes a
+    // documented provider-side identity source.
     return {
       provider: this.provider,
       providerSessionId: conversation_id,
       finalResponse: response.trim(),
       items: outputMetadata ? [parsed, outputMetadata] : [parsed],
-      observedModel,
-      attestationSource: observedModel ? "agy_json_output" : undefined,
     };
   }
 }

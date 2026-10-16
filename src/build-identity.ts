@@ -38,6 +38,9 @@ export interface RuntimeBuildIdentity {
   configRoot: string;
   stateRoot: string;
   profileCatalogGeneration: string;
+  activeReleasePath?: string;
+  activeReleaseSha256?: string;
+  activationCutoverId?: string;
 }
 
 function packageRoot(): string {
@@ -125,5 +128,15 @@ export function describeRuntimeBuildIdentity(input: {
     configRoot: input.configRoot,
     stateRoot: input.stateRoot,
     profileCatalogGeneration: input.profileCatalogGeneration,
+    ...(input.env?.DEVSPACE_ACTIVE_RELEASE_PATH
+      ? { activeReleasePath: input.env.DEVSPACE_ACTIVE_RELEASE_PATH }
+      : {}),
+    ...(input.env?.DEVSPACE_ACTIVE_RELEASE_SHA256 &&
+      /^[0-9a-f]{64}$/.test(input.env.DEVSPACE_ACTIVE_RELEASE_SHA256)
+      ? { activeReleaseSha256: input.env.DEVSPACE_ACTIVE_RELEASE_SHA256 }
+      : {}),
+    ...(input.env?.DEVSPACE_ACTIVATION_CUTOVER_ID
+      ? { activationCutoverId: input.env.DEVSPACE_ACTIVATION_CUTOVER_ID }
+      : {}),
   };
 }

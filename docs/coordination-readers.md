@@ -167,3 +167,27 @@ replay must match both the saved terminal action/receipt and the current resulti
 lease version and state. An expired or revoked carrier, wrong witness, changed
 owner/grant/pin, or unresolved effect remains denied. Recovery never reacquires a
 resource or treats timeout as evidence that an effect finished.
+
+### Closing a bound generation after restart (`finish-bound`)
+
+Use `devspace cutover finish-bound` when `cutover restart-bound` (or the owner
+sidecar) already scheduled the restart and the replacement runtime is live, but
+the sidecar died before `cutover_finish`, leaving the generation `drained`.
+`cutover observe` is refused for coordination-bound generations, so this is the
+supported CLI closure path.
+
+```sh
+devspace cutover finish-bound --cutover-id <id> --carrier <id> --version <n> \
+  --validity-version <n> --credential-file <owner-private-intent.json> \
+  --workspace-id <id> --agent-id <id> --confirm <id> [--json]
+```
+
+It uses the same authority as `restart-bound`: the rotated credential intent file
+(owner-private, consumed on exit), the exact root controller carrier, and the
+`cutover_start` lease pinned to the drained generation. Live loopback `/healthz`
+must show the generation's `expectedNewIdentity` with a `serverInstanceId`
+different from the old instance. The command then runs the exact-pair witness
+(durable workspace session, agent bound to that workspace, status and reconcile)
+and calls the same `finishCutover` path as MCP finish. It never restarts a
+service, and any authority, identity or witness mismatch is refused without
+changing state.

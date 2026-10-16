@@ -16,6 +16,7 @@ import { join } from "node:path";
 export const CUTOVER_STATE_SCHEMA = "devspace.cutover.v1" as const;
 const CUTOVER_RESTART_SCHEMA = "devspace.cutover_restart.v1" as const;
 const CUTOVER_RESTART_SCHEDULED_SCHEMA = "devspace.cutover_restart_scheduled.v1" as const;
+export const CUTOVER_ACTIVATION_BINDING_SCHEMA = "devspace.cutover_activation_binding.v1" as const;
 export const CUTOVER_RECOVERY_INTENT_SCHEMA = "devspace.cutover_recovery_intent.v1" as const;
 export const CUTOVER_SUPERSEDED_SCHEMA = "devspace.cutover_superseded.v1" as const;
 export const CUTOVER_OBSERVED_REPLACEMENT_SCHEMA = "devspace.cutover_observed_replacement.v1" as const;
@@ -23,6 +24,7 @@ export const CUTOVER_EXPIRED_PREPARED_NO_EFFECT_SCHEMA = "devspace.cutover_expir
 export const CUTOVER_EXPIRED_DRAINED_NO_RESTART_SCHEMA = "devspace.cutover_expired_drained_no_restart.v1" as const;
 export const CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_SCHEMA = "devspace.cutover_capability_expectation_mismatch.v1" as const;
 export const CUTOVER_UNEXPECTED_REPLACEMENT_SCHEMA = "devspace.cutover_unexpected_replacement.v1" as const;
+export const CUTOVER_FAILED_ACTIVATION_SCHEMA = "devspace.cutover_failed_activation.v1" as const;
 
 export const CUTOVER_SUPERSEDED_REASON = "STALE_TARGET_SUPERSEDED" as const;
 export const CUTOVER_OBSERVED_REPLACEMENT_REASON = "OBSERVED_REPLACEMENT_WITHOUT_DRAIN" as const;
@@ -30,6 +32,7 @@ export const CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON = "EXPIRED_PREPARED_NO_EF
 export const CUTOVER_EXPIRED_DRAINED_NO_RESTART_REASON = "EXPIRED_DRAINED_NO_RESTART" as const;
 export const CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON = "CAPABILITY_EXPECTATION_MISMATCH" as const;
 export const CUTOVER_UNEXPECTED_REPLACEMENT_REASON = "UNEXPECTED_REPLACEMENT_IDENTITY" as const;
+export const CUTOVER_FAILED_ACTIVATION_REASON = "FAILED_ACTIVATION" as const;
 export const CUTOVER_BINDING_REPAIR_SCHEMA = "devspace.cutover_binding_repair.v1" as const;
 export const CUTOVER_BINDING_REPAIR_REASON = "CROSS_DOMAIN_DIGEST_MISBINDING" as const;
 
@@ -74,12 +77,27 @@ export interface CutoverServerIdentity {
   sourceCommit: string;
   buildId: string;
   capabilityManifestSha256?: string;
+  releaseSha256?: string;
+  releasePath?: string;
+  activationCutoverId?: string;
 }
 
 export interface ExpectedCutoverIdentity {
   sourceCommit: string;
   buildId: string;
   capabilityManifestSha256?: string;
+}
+
+export interface CutoverActivationBinding {
+  schema: typeof CUTOVER_ACTIVATION_BINDING_SCHEMA;
+  cutoverId: string;
+  sourceCommit: string;
+  buildId: string;
+  releaseSha256: string;
+  releasePath: string;
+  pointerPath: string;
+  previousReleasePath?: string;
+  boundAt: string;
 }
 
 /**
@@ -128,7 +146,7 @@ export interface CutoverReconciliationReceipt {
   agentQueryable: boolean;
   agentReconciled: boolean;
   reconciledAt: string;
-  terminalReason?: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON | typeof CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON | typeof CUTOVER_EXPIRED_DRAINED_NO_RESTART_REASON | typeof CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON | typeof CUTOVER_UNEXPECTED_REPLACEMENT_REASON;
+  terminalReason?: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON | typeof CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON | typeof CUTOVER_EXPIRED_DRAINED_NO_RESTART_REASON | typeof CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON | typeof CUTOVER_UNEXPECTED_REPLACEMENT_REASON | typeof CUTOVER_FAILED_ACTIVATION_REASON;
   preRestartDrainObserved?: boolean;
   witnessWorkspaceId?: string;
   witnessAgentId?: string;
@@ -211,6 +229,31 @@ export interface CutoverUnexpectedReplacementReceipt {
   restartScheduled: false;
   oldServerIdentity: CutoverServerIdentity;
   expectedIdentity: ExpectedCutoverIdentity;
+  observedIdentity: CutoverServerIdentity;
+  coordinationBinding: Readonly<CutoverCoordinationBinding>;
+  recoveredBy: string;
+  recoveredAt: string;
+  reconciliationReceipt: CutoverReconciliationReceipt;
+}
+
+/**
+ * Terminal evidence for one consumed restart whose replacement runtime did not
+ * match the approved deployment target. This is a failed deployment receipt,
+ * never retry authority: the approved/observed identities and restart lineage
+ * remain durable while unrelated DevSpace authority can return to normal.
+ */
+export interface CutoverFailedActivationReceipt {
+  schema: typeof CUTOVER_FAILED_ACTIVATION_SCHEMA;
+  cutoverId: string;
+  terminalReason: typeof CUTOVER_FAILED_ACTIVATION_REASON;
+  preRestartDrainObserved: true;
+  restartRequested: true;
+  restartScheduled: true;
+  restartConsumed: true;
+  retryAllowed: false;
+  successorRequired: true;
+  oldServerIdentity: CutoverServerIdentity;
+  approvedTarget: ExpectedCutoverIdentity;
   observedIdentity: CutoverServerIdentity;
   coordinationBinding: Readonly<CutoverCoordinationBinding>;
   recoveredBy: string;
@@ -307,8 +350,12 @@ export interface DurableCutoverRecord {
   capabilityExpectationMismatch?: CutoverCapabilityExpectationMismatchReceipt;
   /** Present only on a coordination-bound drained cutover closed after an unrequested replacement identity appeared. */
   unexpectedReplacement?: CutoverUnexpectedReplacementReceipt;
+  /** Present only after a scheduled restart was consumed by the wrong replacement generation. */
+  failedActivation?: CutoverFailedActivationReceipt;
   /** Present only on a record with a verified cross-domain digest repair. */
   bindingRepair?: CutoverBindingRepairReceipt;
+  /** Exact immutable release selected by the canonical launch pointer before restart. */
+  activationBinding?: CutoverActivationBinding;
 }
 
 export interface CutoverStateStoreOptions {
@@ -334,6 +381,7 @@ export class CutoverStateStore {
   private readonly createdPath: string;
   private readonly restartRequestedPath: string;
   private readonly restartScheduledPath: string;
+  private readonly activationBindingPath: string;
   private readonly recoveryIntentPath: string;
   private readonly now: () => number;
   private readonly newId: () => string;
@@ -344,6 +392,7 @@ export class CutoverStateStore {
     this.createdPath = join(this.activeDir, "created.json");
     this.restartRequestedPath = join(this.activeDir, "restart-requested.json");
     this.restartScheduledPath = join(this.activeDir, "restart-scheduled.json");
+    this.activationBindingPath = join(this.activeDir, "activation-binding.json");
     this.recoveryIntentPath = join(this.cutoverRoot, "recovery-intent.json");
     this.now = options.now ?? Date.now;
     this.newId = options.newId ?? randomUUID;
@@ -412,9 +461,12 @@ export class CutoverStateStore {
       : restartRequest;
     const bindingRepair = readBindingRepairMarker(markers.bindingRepair, record.cutoverId)
       ?? record.bindingRepair;
+    const activationBinding = readActivationBindingMarker(markers.activationBinding, record.cutoverId)
+      ?? record.activationBinding;
     return {
       ...record,
       ...(bindingRepair ? { bindingRepair } : {}),
+      ...(activationBinding ? { activationBinding } : {}),
       ...(mergedRestartRequest ? {
         restartRequest: mergedRestartRequest,
         updatedAt: mergedRestartRequest.requestedAt > record.updatedAt
@@ -612,19 +664,61 @@ export class CutoverStateStore {
     restartRequested: string;
     restartScheduled: string;
     bindingRepair: string;
+    activationBinding: string;
   } {
     if (record.supersedesCutoverId === undefined) {
       return {
         restartRequested: this.restartRequestedPath,
         restartScheduled: this.restartScheduledPath,
         bindingRepair: join(this.activeDir, "binding-repair.json"),
+        activationBinding: this.activationBindingPath,
       };
     }
     return {
       restartRequested: join(this.activeDir, `restart-requested-${record.cutoverId}.json`),
       restartScheduled: join(this.activeDir, `restart-scheduled-${record.cutoverId}.json`),
       bindingRepair: join(this.activeDir, `binding-repair-${record.cutoverId}.json`),
+      activationBinding: join(this.activeDir, `activation-binding-${record.cutoverId}.json`),
     };
+  }
+
+  recordActivationBinding(
+    cutoverId: string,
+    binding: CutoverActivationBinding,
+  ): { record: DurableCutoverRecord; newlyBound: boolean } {
+    const record = this.requireExact(cutoverId);
+    assertValidActivationBinding(binding, record);
+    const markers = this.markerPaths(record);
+    if (record.activationBinding) {
+      if (!isDeepStrictEqual(record.activationBinding, binding)) {
+        throw new CutoverStateError(
+          "Active cutover already has a different activation binding.",
+        );
+      }
+      return { record, newlyBound: false };
+    }
+    if (record.phase !== "drained" || record.restartRequest?.restartScheduledAt) {
+      throw new CutoverStateError(
+        "Activation binding requires a drained cutover before restart scheduling.",
+      );
+    }
+    try {
+      writeExclusiveDurable(
+        markers.activationBinding,
+        `${JSON.stringify(binding, null, 2)}\n`,
+      );
+      syncDirectory(this.activeDir);
+    } catch (error) {
+      if (!isErrno(error, "EEXIST")) throw error;
+      const current = this.requireExact(cutoverId);
+      if (!current.activationBinding || !isDeepStrictEqual(current.activationBinding, binding)) {
+        throw new CutoverStateError(
+          "Durable activation binding changed; reconciliation is required.",
+        );
+      }
+      return { record: current, newlyBound: false };
+    }
+    return { record: this.requireExact(cutoverId), newlyBound: true };
   }
 
   recordBindingRepair(
@@ -1129,6 +1223,115 @@ export class CutoverStateStore {
   }
 
   /**
+   * Terminally close one coordination-bound drained cutover after its restart
+   * was durably scheduled and a replacement runtime appeared on the wrong
+   * generation. The consumed restart stays permanently non-retryable and the
+   * approved target is preserved alongside the observed runtime.
+   */
+  recoverFailedActivation(input: {
+    cutoverId: string;
+    recoveredBy: string;
+    observedIdentity: CutoverServerIdentity;
+  }): { record: DurableCutoverRecord; newlyRecovered: boolean } {
+    const active = this.get();
+    if (!active) throw new CutoverStateError("No durable cutover record exists.");
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${active.cutoverId}.`);
+    }
+    if (!input.recoveredBy.trim()) {
+      throw new CutoverStateError("Failed activation recovery requires a non-empty recovery identity.");
+    }
+    if (active.phase === "closed" && active.failedActivation) {
+      const prior = active.failedActivation;
+      if (
+        prior.recoveredBy !== input.recoveredBy ||
+        !identitiesEqual(prior.observedIdentity, input.observedIdentity)
+      ) {
+        throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Failed activation recovery identity changed.");
+      }
+      return { record: active, newlyRecovered: false };
+    }
+    if (active.phase !== "drained" || !active.coordinationBinding || !active.drainEvidence) {
+      throw new CutoverStateError("Failed activation recovery requires one coordination-bound drained cutover.");
+    }
+    if (!active.restartRequest?.restartScheduledAt || !active.restartRequest.restartScheduledForServerInstanceId) {
+      throw new CutoverStateError("Failed activation recovery requires a durably scheduled restart.");
+    }
+    if (active.restartRequest.requestedByServerInstanceId !== active.oldServerIdentity.serverInstanceId ||
+        active.restartRequest.restartScheduledForServerInstanceId !== active.oldServerIdentity.serverInstanceId) {
+      throw new CutoverStateError("Failed activation recovery restart lineage does not match the original server.");
+    }
+    if (input.observedIdentity.serverInstanceId === active.oldServerIdentity.serverInstanceId) {
+      throw new CutoverStateError("Failed activation recovery requires a replacement server instance.");
+    }
+    const observedReleaseMatches = active.activationBinding === undefined || (
+      input.observedIdentity.releaseSha256 === active.activationBinding.releaseSha256 &&
+      input.observedIdentity.releasePath === active.activationBinding.releasePath &&
+      input.observedIdentity.activationCutoverId === active.cutoverId
+    );
+    const observedMatchesApproved = expectedIdentitiesEqual(active.expectedNewIdentity, {
+      sourceCommit: input.observedIdentity.sourceCommit,
+      buildId: input.observedIdentity.buildId,
+      capabilityManifestSha256: input.observedIdentity.capabilityManifestSha256,
+    }) && observedReleaseMatches;
+    if (observedMatchesApproved) {
+      throw new CutoverStateError("Failed activation recovery refuses an observed runtime that matches the approved target.");
+    }
+    if (
+      active.observedReplacement ||
+      active.expiredPreparedNoEffect ||
+      active.expiredDrainedNoRestart ||
+      active.capabilityExpectationMismatch ||
+      active.unexpectedReplacement ||
+      active.supersession ||
+      active.bindingRepair
+    ) {
+      throw new CutoverStateError("Failed activation recovery refuses conflicting terminal or repair evidence.");
+    }
+
+    const recoveredAt = new Date(this.now()).toISOString();
+    const reconciliationReceipt: CutoverReconciliationReceipt = {
+      closedByServerInstanceId: input.observedIdentity.serverInstanceId,
+      workspaceQueryable: false,
+      agentQueryable: false,
+      agentReconciled: false,
+      reconciledAt: recoveredAt,
+      terminalReason: CUTOVER_FAILED_ACTIVATION_REASON,
+      preRestartDrainObserved: true,
+      witnessKind: "failed-activation-after-restart",
+    };
+    const failedActivation: CutoverFailedActivationReceipt = {
+      schema: CUTOVER_FAILED_ACTIVATION_SCHEMA,
+      cutoverId: active.cutoverId,
+      terminalReason: CUTOVER_FAILED_ACTIVATION_REASON,
+      preRestartDrainObserved: true,
+      restartRequested: true,
+      restartScheduled: true,
+      restartConsumed: true,
+      retryAllowed: false,
+      successorRequired: true,
+      oldServerIdentity: active.oldServerIdentity,
+      approvedTarget: active.expectedNewIdentity,
+      observedIdentity: input.observedIdentity,
+      coordinationBinding: active.coordinationBinding,
+      recoveredBy: input.recoveredBy,
+      recoveredAt,
+      reconciliationReceipt,
+    };
+    const record = this.replace({
+      ...withoutDiagnostic(active),
+      phase: "closed",
+      reconciliationReceipt,
+      failedActivation,
+      updatedAt: recoveredAt,
+    });
+    if (!record.failedActivation || !isDeepStrictEqual(record.failedActivation, failedActivation)) {
+      throw new CutoverStateError("Failed activation recovery durable readback changed.");
+    }
+    return { record, newlyRecovered: true };
+  }
+
+  /**
    * Terminally close one coordination-bound drained cutover when a different replacement
    * server appears before this cutover requested or scheduled any restart. This records a
    * failed attempt only: it never accepts the observed replacement, rewrites the expected
@@ -1452,7 +1655,9 @@ function parseRecord(raw: string): DurableCutoverRecord {
     (value.expiredDrainedNoRestart !== undefined && !isExpiredDrainedNoRestartReceipt(value.expiredDrainedNoRestart)) ||
     (value.capabilityExpectationMismatch !== undefined && !isCapabilityExpectationMismatchReceipt(value.capabilityExpectationMismatch)) ||
     (value.unexpectedReplacement !== undefined && !isUnexpectedReplacementReceipt(value.unexpectedReplacement)) ||
-    (value.bindingRepair !== undefined && !isBindingRepairReceipt(value.bindingRepair))
+    (value.failedActivation !== undefined && !isFailedActivationReceipt(value.failedActivation)) ||
+    (value.bindingRepair !== undefined && !isBindingRepairReceipt(value.bindingRepair)) ||
+    (value.activationBinding !== undefined && !isActivationBinding(value.activationBinding))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
   }
@@ -1460,6 +1665,9 @@ function parseRecord(raw: string): DurableCutoverRecord {
   if (record.coordinationBinding !== undefined) record.coordinationBinding = validatedCoordinationBinding(record.coordinationBinding);
   if (record.bindingRepair) {
     assertValidBindingRepair(record.bindingRepair, record);
+  }
+  if (record.activationBinding) {
+    assertValidActivationBinding(record.activationBinding, record);
   }
   if (record.observedReplacement) {
     const receipt = record.observedReplacement;
@@ -1606,6 +1814,53 @@ function parseRecord(raw: string): DurableCutoverRecord {
       throw new CutoverStateError("Durable cutover record is malformed; unexpected replacement recovery binding is inconsistent.");
     }
   }
+  if (record.failedActivation) {
+    const receipt = record.failedActivation;
+    const observedReleaseMatches = record.activationBinding === undefined || (
+      receipt.observedIdentity.releaseSha256 === record.activationBinding.releaseSha256 &&
+      receipt.observedIdentity.releasePath === record.activationBinding.releasePath &&
+      receipt.observedIdentity.activationCutoverId === record.cutoverId
+    );
+    const observedMatchesExpected = expectedIdentitiesEqual(record.expectedNewIdentity, {
+      sourceCommit: receipt.observedIdentity.sourceCommit,
+      buildId: receipt.observedIdentity.buildId,
+      capabilityManifestSha256: receipt.observedIdentity.capabilityManifestSha256,
+    }) && observedReleaseMatches;
+    if (
+      receipt.cutoverId !== record.cutoverId ||
+      record.phase !== "closed" ||
+      !record.coordinationBinding ||
+      !record.drainEvidence ||
+      !record.restartRequest?.restartScheduledAt ||
+      !record.restartRequest.restartScheduledForServerInstanceId ||
+      record.observedReplacement !== undefined ||
+      record.expiredPreparedNoEffect !== undefined ||
+      record.expiredDrainedNoRestart !== undefined ||
+      record.capabilityExpectationMismatch !== undefined ||
+      record.unexpectedReplacement !== undefined ||
+      record.supersession !== undefined ||
+      record.bindingRepair !== undefined ||
+      !isDeepStrictEqual(receipt.coordinationBinding, record.coordinationBinding) ||
+      !identitiesEqual(receipt.oldServerIdentity, record.oldServerIdentity) ||
+      !expectedIdentitiesEqual(receipt.approvedTarget, record.expectedNewIdentity) ||
+      !isDeepStrictEqual(record.reconciliationReceipt, receipt.reconciliationReceipt) ||
+      receipt.observedIdentity.serverInstanceId === record.oldServerIdentity.serverInstanceId ||
+      observedMatchesExpected ||
+      record.restartRequest.requestedByServerInstanceId !== record.oldServerIdentity.serverInstanceId ||
+      record.restartRequest.restartScheduledForServerInstanceId !== record.oldServerIdentity.serverInstanceId ||
+      receipt.reconciliationReceipt.closedByServerInstanceId !== receipt.observedIdentity.serverInstanceId ||
+      receipt.reconciliationReceipt.terminalReason !== CUTOVER_FAILED_ACTIVATION_REASON ||
+      receipt.reconciliationReceipt.preRestartDrainObserved !== true ||
+      receipt.preRestartDrainObserved !== true ||
+      receipt.restartRequested !== true ||
+      receipt.restartScheduled !== true ||
+      receipt.restartConsumed !== true ||
+      receipt.retryAllowed !== false ||
+      receipt.successorRequired !== true
+    ) {
+      throw new CutoverStateError("Durable cutover record is malformed; failed activation recovery binding is inconsistent.");
+    }
+  }
   return record;
 }
 
@@ -1613,7 +1868,10 @@ function identitiesEqual(a: CutoverServerIdentity, b: CutoverServerIdentity): bo
   return a.serverInstanceId === b.serverInstanceId &&
     a.sourceCommit === b.sourceCommit &&
     a.buildId === b.buildId &&
-    a.capabilityManifestSha256 === b.capabilityManifestSha256;
+    a.capabilityManifestSha256 === b.capabilityManifestSha256 &&
+    a.releaseSha256 === b.releaseSha256 &&
+    a.releasePath === b.releasePath &&
+    a.activationCutoverId === b.activationCutoverId;
 }
 
 function expectedIdentitiesEqual(a: ExpectedCutoverIdentity, b: ExpectedCutoverIdentity): boolean {
@@ -1634,7 +1892,7 @@ function isReconciliationReceipt(value: unknown): value is CutoverReconciliation
     typeof receipt.reconciledAt === "string" &&
     Number.isFinite(Date.parse(receipt.reconciledAt)) &&
     (receipt.preRestartDrainObserved === undefined || typeof receipt.preRestartDrainObserved === "boolean") &&
-    (receipt.terminalReason === undefined || receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON || receipt.terminalReason === CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON || receipt.terminalReason === CUTOVER_EXPIRED_DRAINED_NO_RESTART_REASON || receipt.terminalReason === CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON || receipt.terminalReason === CUTOVER_UNEXPECTED_REPLACEMENT_REASON),
+    (receipt.terminalReason === undefined || receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON || receipt.terminalReason === CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON || receipt.terminalReason === CUTOVER_EXPIRED_DRAINED_NO_RESTART_REASON || receipt.terminalReason === CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON || receipt.terminalReason === CUTOVER_UNEXPECTED_REPLACEMENT_REASON || receipt.terminalReason === CUTOVER_FAILED_ACTIVATION_REASON),
   );
 }
 
@@ -1767,6 +2025,34 @@ function isUnexpectedReplacementReceipt(value: unknown): value is CutoverUnexpec
   );
 }
 
+function isFailedActivationReceipt(value: unknown): value is CutoverFailedActivationReceipt {
+  const receipt = value as Partial<CutoverFailedActivationReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    receipt.schema === CUTOVER_FAILED_ACTIVATION_SCHEMA &&
+    typeof receipt.cutoverId === "string" &&
+    receipt.cutoverId.length > 0 &&
+    receipt.terminalReason === CUTOVER_FAILED_ACTIVATION_REASON &&
+    receipt.preRestartDrainObserved === true &&
+    receipt.restartRequested === true &&
+    receipt.restartScheduled === true &&
+    receipt.restartConsumed === true &&
+    receipt.retryAllowed === false &&
+    receipt.successorRequired === true &&
+    isIdentity(receipt.oldServerIdentity) &&
+    isExpectedIdentity(receipt.approvedTarget) &&
+    isIdentity(receipt.observedIdentity) &&
+    receipt.coordinationBinding !== undefined &&
+    (() => { try { validatedCoordinationBinding(receipt.coordinationBinding); return true; } catch { return false; } })() &&
+    typeof receipt.recoveredBy === "string" &&
+    receipt.recoveredBy.length > 0 &&
+    typeof receipt.recoveredAt === "string" &&
+    Number.isFinite(Date.parse(receipt.recoveredAt)) &&
+    receipt.reconciliationReceipt !== undefined &&
+    isReconciliationReceipt(receipt.reconciliationReceipt)
+  );
+}
+
 function isBindingRepairReceipt(value: unknown): value is CutoverBindingRepairReceipt {
   const receipt = value as Partial<CutoverBindingRepairReceipt> | undefined;
   return Boolean(
@@ -1861,7 +2147,13 @@ function isIdentity(value: unknown): value is CutoverServerIdentity {
     identity &&
     typeof identity.serverInstanceId === "string" &&
     typeof identity.sourceCommit === "string" &&
-    typeof identity.buildId === "string",
+    typeof identity.buildId === "string" &&
+    (identity.releaseSha256 === undefined ||
+      (typeof identity.releaseSha256 === "string" && /^[0-9a-f]{64}$/.test(identity.releaseSha256))) &&
+    (identity.releasePath === undefined ||
+      (typeof identity.releasePath === "string" && identity.releasePath.startsWith("/"))) &&
+    (identity.activationCutoverId === undefined ||
+      (typeof identity.activationCutoverId === "string" && identity.activationCutoverId.length > 0)),
   );
 }
 
@@ -1891,6 +2183,74 @@ function isRestartRequest(value: unknown): value is CutoverRestartRequest {
       (typeof request.restartScheduledForServerInstanceId === "string" &&
         request.restartScheduledForServerInstanceId.length > 0)),
   );
+}
+
+function isActivationBinding(value: unknown): value is CutoverActivationBinding {
+  const binding = value as Partial<CutoverActivationBinding> | undefined;
+  return Boolean(
+    binding &&
+    binding.schema === CUTOVER_ACTIVATION_BINDING_SCHEMA &&
+    typeof binding.cutoverId === "string" &&
+    binding.cutoverId.length > 0 &&
+    typeof binding.sourceCommit === "string" &&
+    binding.sourceCommit.length > 0 &&
+    typeof binding.buildId === "string" &&
+    binding.buildId.length > 0 &&
+    typeof binding.releaseSha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(binding.releaseSha256) &&
+    typeof binding.releasePath === "string" &&
+    binding.releasePath.startsWith("/") &&
+    typeof binding.pointerPath === "string" &&
+    binding.pointerPath.startsWith("/") &&
+    (binding.previousReleasePath === undefined ||
+      (typeof binding.previousReleasePath === "string" && binding.previousReleasePath.startsWith("/"))) &&
+    typeof binding.boundAt === "string" &&
+    Number.isFinite(Date.parse(binding.boundAt))
+  );
+}
+
+function assertValidActivationBinding(
+  binding: CutoverActivationBinding,
+  record: DurableCutoverRecord,
+): void {
+  if (
+    !isActivationBinding(binding) ||
+    binding.cutoverId !== record.cutoverId ||
+    binding.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+    binding.buildId !== record.expectedNewIdentity.buildId ||
+    binding.releasePath === binding.pointerPath
+  ) {
+    throw new CutoverStateError(
+      "Durable cutover activation binding is inconsistent with the expected target.",
+    );
+  }
+}
+
+function readActivationBindingMarker(
+  path: string,
+  expectedCutoverId: string,
+): CutoverActivationBinding | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return undefined;
+    throw error;
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new CutoverStateError(
+      "Durable activation binding is malformed; reconciliation is required.",
+    );
+  }
+  if (!isActivationBinding(value) || value.cutoverId !== expectedCutoverId) {
+    throw new CutoverStateError(
+      "Durable activation binding does not match the active cutover; reconciliation is required.",
+    );
+  }
+  return value;
 }
 
 function isBuildReadyReceipt(value: unknown): value is BuildReadyReceipt {
