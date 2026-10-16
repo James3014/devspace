@@ -29,6 +29,7 @@ import {
   type LocalAgentDriver,
   type LocalAgentRunCallbacks,
   type LocalAgentRunInput,
+  LocalAgentProviderError,
   type LocalAgentRuntimeContext,
   type LocalAgentWriteMode,
 } from "./local-agent-runtime.js";
@@ -390,12 +391,22 @@ export class LocalAgentManager {
     const failureDetails = isAgentProviderError(error)
       ? describeAgentProviderError(error)
       : undefined;
+    const cause = "cause" in error ? error.cause : undefined;
+    const salvaged = cause instanceof LocalAgentProviderError ? cause : undefined;
     const persisted = this.store.updateResult(record.id, {
       status: "error",
       error: redactSensitiveText(error.message),
       errorCode: error.code,
       errorRetryable: error.retryable,
       ...(failureDetails ? { errorDetails: failureDetails } : {}),
+      // A provider that failed after producing terminal text must not lose it
+      // to the error projection (#381): preserve it durably, redacted.
+      ...(salvaged?.finalResponse === undefined
+        ? {}
+        : { latestResponse: redactSensitiveText(salvaged.finalResponse) }),
+      ...(salvaged?.providerSessionId === undefined
+        ? {}
+        : { providerSessionId: salvaged.providerSessionId }),
     });
     this.log("error", "agent_run_failed", {
       provider: record.provider,
