@@ -321,9 +321,17 @@ export interface CutoverCoordinationBinding {
   readonly ownerThread: string;
 }
 
+/** Correlation only: an OWNER_DIRECT cutover does not grant carrier authority. */
+export interface CutoverDirectOperationBinding {
+  readonly operationId: string;
+  readonly requestHash: string;
+}
+
 export interface DurableCutoverRecord {
   /** Trusted consumer correlation only; never issues authority. */
   coordinationBinding?: Readonly<CutoverCoordinationBinding>;
+  /** Exact durable intent of a new OWNER_DIRECT generation; not an authority grant. */
+  directOperation?: Readonly<CutoverDirectOperationBinding>;
   schema: typeof CUTOVER_STATE_SCHEMA;
   cutoverId: string;
   phase: "prepared" | "drained" | "closed" | "superseded";
@@ -484,8 +492,11 @@ export class CutoverStateStore {
     expectedNewIdentity: ExpectedCutoverIdentity;
     expiresAt?: string;
     coordinationBinding?: CutoverCoordinationBinding;
+    directOperation?: CutoverDirectOperationBinding;
   }): DurableCutoverRecord {
     const coordinationBinding = input.coordinationBinding === undefined ? undefined : validatedCoordinationBinding(input.coordinationBinding);
+    const directOperation = input.directOperation === undefined ? undefined : validatedDirectOperationBinding(input.directOperation);
+    if (coordinationBinding && directOperation) throw new CutoverStateError("Cutover cannot mix Carrier authority with OWNER_DIRECT intent.");
     mkdirSync(this.cutoverRoot, { recursive: true, mode: 0o700 });
     const now = new Date(this.now()).toISOString();
     const record: DurableCutoverRecord = {
@@ -493,6 +504,7 @@ export class CutoverStateStore {
       cutoverId: this.newId(),
       phase: "prepared",
       ...(coordinationBinding ? { coordinationBinding } : {}),
+      ...(directOperation ? { directOperation } : {}),
       oldServerIdentity: input.oldServerIdentity,
       expectedNewIdentity: input.expectedNewIdentity,
       createdAt: now,
@@ -1627,9 +1639,22 @@ function validatedCoordinationBinding(value: unknown): Readonly<CutoverCoordinat
   return Object.freeze({...binding}) as unknown as Readonly<CutoverCoordinationBinding>;
 }
 
+function validatedDirectOperationBinding(value: unknown): Readonly<CutoverDirectOperationBinding> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new CutoverStateError("Malformed direct cutover operation binding.");
+  const binding = value as Record<string, unknown>;
+  if (Object.keys(binding).length !== 2 ||
+      !/^op_[a-f0-9]{16}$/.test(String(binding.operationId)) ||
+      !/^[a-f0-9]{64}$/.test(String(binding.requestHash))) {
+    throw new CutoverStateError("Malformed direct cutover operation binding.");
+  }
+  return Object.freeze({operationId: binding.operationId as string, requestHash: binding.requestHash as string});
+}
+
 function assertSameCoordinationBinding(created: DurableCutoverRecord, event: DurableCutoverRecord): void {
-  if (created.cutoverId !== event.cutoverId || !isDeepStrictEqual(created.coordinationBinding, event.coordinationBinding)) {
-    throw new CutoverStateError("Cutover coordination binding changed within its generation.");
+  if (created.cutoverId !== event.cutoverId ||
+      !isDeepStrictEqual(created.coordinationBinding, event.coordinationBinding) ||
+      !isDeepStrictEqual(created.directOperation, event.directOperation)) {
+    throw new CutoverStateError("Cutover coordination binding or direct operation correlation changed within its generation.");
   }
 }
 
@@ -1663,6 +1688,8 @@ function parseRecord(raw: string): DurableCutoverRecord {
   }
   const record = value as DurableCutoverRecord;
   if (record.coordinationBinding !== undefined) record.coordinationBinding = validatedCoordinationBinding(record.coordinationBinding);
+  if (record.directOperation !== undefined) record.directOperation = validatedDirectOperationBinding(record.directOperation);
+  if (record.coordinationBinding && record.directOperation) throw new CutoverStateError("Cutover cannot mix Carrier authority with OWNER_DIRECT intent.");
   if (record.bindingRepair) {
     assertValidBindingRepair(record.bindingRepair, record);
   }
