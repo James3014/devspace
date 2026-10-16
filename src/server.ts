@@ -114,6 +114,7 @@ import type { WorkspaceSession } from "./workspace-store.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   DurableOperationManager,
+  DurableOperationStore,
   planCutoverStart,
   DurableOperationError,
   type DurableOperationRecord,
@@ -1032,7 +1033,6 @@ function registerCodexProcessTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
-  carrierBindings?: CarrierBindingStore,
 ): void {
   registerAppTool(
     server,
@@ -2142,9 +2142,8 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt, attemptKey }, extra) => {
-      const context = dependencyConsumerContext(extra);
-      if (!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host coordination");
+    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt, attemptKey }) => {
+      if (!durableOperations) throw new CutoverStateError("Durable cutover manager is unavailable.");
       if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
         const probe = await control.probeBuildReady({
           sourceCommit: expectedSourceCommit,
@@ -2167,7 +2166,7 @@ function registerCutoverMcpTools(
       };
       const currentIdentity = control.controller.currentIdentity;
       const defaultAttempt = createHash("sha256").update(JSON.stringify({currentIdentity,expectedIdentity,expiresAt})).digest("hex");
-      const operation = durableOperations.startCutover({attemptKey:attemptKey ?? defaultAttempt,currentIdentity,expectedIdentity,expiresAt},context);
+      const operation = durableOperations.startDirectCutover({attemptKey:attemptKey ?? defaultAttempt,currentIdentity,expectedIdentity,expiresAt});
       if (operation.status !== "succeeded") throw new CutoverStateError(`Cutover operation ${operation.operationId} requires exact operation_reconcile; no new start is authorized.`);
       const record = control.controller.record();
       if (!record || record.cutoverId !== operation.receipt?.cutoverId) throw new CutoverStateError(`Cutover operation ${operation.operationId} readback changed; reconciliation required.`);
@@ -3990,7 +3989,15 @@ export function createMcpServer(
           workspace.mode === "worktree" &&
           workspace.worktree?.managed === true &&
           safety.state === "ISOLATED_WORKTREE";
-        const consumerContext = ownerDirectIsolated ? undefined : dependencyConsumerContext(extra);
+        const ownerDirectExecution =
+          workspace.mode === "checkout" &&
+          safety.state === "SINGLE_CONVERSATION_CHECKOUT";
+        if (!ownerDirectIsolated && !ownerDirectExecution) {
+          throw new ControlPlaneOwnershipError(
+            "AUTHORITY_REQUIRED",
+            "An authenticated MCP client context is required for single-conversation checkout dependency sync; use an isolated managed worktree otherwise.",
+          );
+        }
         try {
           const operation = await durableOperations.dependencySync({
             workspaceId,
@@ -3998,7 +4005,8 @@ export function createMcpServer(
             attemptKey,
             recipe,
             ownerDirectIsolated,
-          }, consumerContext);
+            ownerDirectExecution,
+          });
           return operationResponse(operation);
         } catch (error) {
           if (error instanceof DurableOperationError && error.operation) {
@@ -4046,11 +4054,12 @@ export function createMcpServer(
       },
       async ({ operationId }, extra) => {
         const record = durableOperations.store.getByOperationId(operationId);
-        const context =
-          record?.kind === "cutover_start" ||
-          (record?.kind === "dependency_sync" && record.request.ownerDirectIsolated !== true)
-            ? dependencyConsumerContext(extra)
-            : undefined;
+        const historicalBoundOperation =
+          (record?.kind === "cutover_start" && record.request.ownerDirect !== true) ||
+          (record?.kind === "dependency_sync" &&
+            record.request.ownerDirectIsolated !== true &&
+            record.request.ownerDirectExecution !== true);
+        const context = historicalBoundOperation ? dependencyConsumerContext(extra) : undefined;
         return operationResponse(await durableOperations.reconcile(operationId, context));
       },
     );
@@ -6795,6 +6804,21 @@ function requireManifestBoundServerInstanceId(value: string | undefined): string
   return normalized;
 }
 
+/**
+ * Legacy Carrier authority is opened only for exact persisted bound effects.
+ * New cutovers and OWNER_DIRECT dependency operations never create Carrier
+ * governance, and historical records keep their original recovery reader.
+ */
+function requiresLegacyCarrierRecovery(stateDir: string): boolean {
+  if (new CutoverStateStore(stateDir).get()?.coordinationBinding) return true;
+  const operations = new DurableOperationStore(stateDir);
+  try {
+    return operations.hasLegacyBoundOperations();
+  } finally {
+    operations.close();
+  }
+}
+
 export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
@@ -6859,7 +6883,10 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   initializationCleanups.push(() => processSessions.shutdown());
-  const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir, options.carrierClock, options.completionBindings);
+  const carrierBindings = options.coordination ||
+    (!options.completionBindings?.length && !requiresLegacyCarrierRecovery(config.stateDir))
+      ? undefined
+      : new CarrierBindingStore(config.stateDir, options.carrierClock, options.completionBindings);
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
   const durableOperations = new DurableOperationManager(config, undefined, options.coordination ?? carrierBindings?.readers);
   initializationCleanups.push(() => durableOperations.close());
