@@ -72,7 +72,16 @@ export function recoveryFor(file, liveIsOld, liveIsTarget) {
  * Decide the sidecar mode from persisted state + live identity (read-only).
  * Returns "full" | "resume_drain" | "resume_restart" | "resume_finish"; throws Refuse otherwise.
  */
-export function selectMode({ file, contract, liveIsOld, liveIsTarget }) {
+export function selectMode({ file, contract, liveIsOld, liveIsTarget, closedLease }) {
+  // `closedLease` is the state-root lease row of a CLOSED cutover ({leaseId, version, terminalState}) or null/undefined
+  // when unknown/absent. The file and the SQLite lease are separate stores: a crash between file close and lease
+  // finalization leaves a closed file with a still-held lease, and a new attempt would only fail on overlap (#516).
+  if (file && file.phase === "closed" && closedLease && !closedLease.terminalState) {
+    const id = file.cutoverId;
+    throw new Refuse(`cutover ${id} is closed but its state-root lease ${closedLease.leaseId} is not terminal; a new attempt would fail with an overlapping resource scope`,
+      `finish lease replay, do NOT start a new attempt: ${RUNBOOK_CLI} cutover release-terminal-lease --cutover-id ${id} --lease-id ${closedLease.leaseId} --lease-version ${closedLease.version} --carrier <revoked-root-carrier-id> --carrier-version <revoked-version> --terminal-record-hash <cutoverTerminalRecordHash> --confirm ${id}`,
+      { activePhase: "closed", leaseId: closedLease.leaseId });
+  }
   if (!file || file.phase === "closed") return "full"; // Branch a: brand-new attempt.
   const target = contract.cutover.expectedIdentity;
   const ours = sameDeep(file.oldServerIdentity, contract.cutover.currentIdentity)

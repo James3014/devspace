@@ -483,3 +483,23 @@ test("non-expired missing physical lease still fails closed for unrelated acquis
     assert.throws(()=>store.acquire(context("two"),request(b,"second")),(error:unknown)=>error instanceof ControlPlaneOwnershipError&&error.code==="INVALID_INPUT"&&/resource identity cannot be resolved/.test(error.message));
   } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
 });
+
+test("expired stale lease with a removed path that overlaps a request blocks with a bounded stale-physical-lease code naming the lease and hygiene command (#415)", () => {
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"devspace-stale-overlap-"))).replaceAll("\\","/");
+  const a=join(root,"a"),b=join(root,"b");mkdirSync(a);mkdirSync(b);
+  const sqlite=db();let now=Date.now();
+  const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:options.verifyGrantEvidence,now:()=>now});
+  const request=(path:string,key:string)=>({...input([path]),resourceKind:"filesystem",resourceId:path,resource:path,idempotencyKey:key,expiresAt:new Date(now+60_000).toISOString()});
+  try {
+    const stale=store.acquire(context("one"),{...request(a,"first"),expiresAt:new Date(now+1_000).toISOString()});
+    now+=2_000;
+    rmSync(a,{recursive:true});
+    const before=sqlite.prepare("select * from control_plane_resource_leases").all();
+    // The parent directory covers the removed path: the stale lease may overlap and must block, not be ignored.
+    assert.throws(()=>store.acquire(context("two"),request(root,"parent")),(error:unknown)=>error instanceof ControlPlaneOwnershipError&&error.code==="STALE_PHYSICAL_LEASE"&&error.message.includes(stale.leaseId)&&/release-revoked-idle-cutover-lease/.test(error.message)&&error.message.length<400);
+    assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases").all(),before);
+    // A disjoint request is still unaffected, and the stale lease is neither released nor altered.
+    assert.equal(store.acquire(context("three"),request(b,"disjoint")).resource,b);
+    assert.equal(store.get(stale.leaseId)?.terminalState,undefined);
+  } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
+});
