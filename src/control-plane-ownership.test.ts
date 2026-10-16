@@ -496,7 +496,7 @@ test("expired stale lease with a removed path that overlaps a request blocks wit
     rmSync(a,{recursive:true});
     const before=sqlite.prepare("select * from control_plane_resource_leases").all();
     // The parent directory covers the removed path: the stale lease may overlap and must block, not be ignored.
-    assert.throws(()=>store.acquire(context("two"),request(root,"parent")),(error:unknown)=>error instanceof ControlPlaneOwnershipError&&error.code==="STALE_PHYSICAL_LEASE"&&error.message.includes(stale.leaseId)&&/release-revoked-idle-cutover-lease/.test(error.message)&&error.message.length<600);
+    assert.throws(()=>store.acquire(context("two"),request(root,"parent")),(error:unknown)=>error instanceof ControlPlaneOwnershipError&&error.code==="STALE_PHYSICAL_LEASE"&&error.message.includes(stale.leaseId)&&new RegExp(`carrier release-revoked-idle-cutover-lease ${stale.leaseId} --lease-version .* --confirm ${stale.leaseId}$`).test(error.message)&&error.message.length<600);
     assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases").all(),before);
     // A disjoint request is still unaffected, and the stale lease is neither released nor altered.
     assert.equal(store.acquire(context("three"),request(b,"disjoint")).resource,b);

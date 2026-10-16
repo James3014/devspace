@@ -59,7 +59,7 @@ test("closed file whose state-root lease is still held is refused with a release
   const held = { leaseId: "lease_held", version: 3, terminalState: null };
   const run = () => selectMode({ file: closed, contract, liveIsOld: false, liveIsTarget: true, closedLease: held });
   assert.throws(run, (error) => error instanceof Refuse
-    && /release-terminal-lease/.test(error.recovery) && /lease_held/.test(error.recovery) && /cut_1/.test(error.recovery)
+    && /cutover release-terminal-lease --cutover-id cut_1 --lease-id lease_held --lease-version 3 .* --confirm cut_1$/.test(error.recovery) && error.extra.cutoverId === "cut_1"
     && error.extra.activePhase === "closed" && error.extra.leaseId === "lease_held");
   // Liveness only: a terminal lease, an absent lease row, or no lease info keep the brand-new-attempt path.
   for (const closedLease of [{ leaseId: "lease_held", version: 4, terminalState: "released" }, null, undefined]) {

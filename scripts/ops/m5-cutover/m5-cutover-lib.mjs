@@ -80,7 +80,7 @@ export function selectMode({ file, contract, liveIsOld, liveIsTarget, closedLeas
     const id = file.cutoverId;
     throw new Refuse(`cutover ${id} is closed but its state-root lease ${closedLease.leaseId} is not terminal; a new attempt would fail with an overlapping resource scope`,
       `finish lease replay, do NOT start a new attempt: ${RUNBOOK_CLI} cutover release-terminal-lease --cutover-id ${id} --lease-id ${closedLease.leaseId} --lease-version ${closedLease.version} --carrier <revoked-root-carrier-id> --carrier-version <revoked-version> --terminal-record-hash <cutoverTerminalRecordHash> --confirm ${id}`,
-      { activePhase: "closed", leaseId: closedLease.leaseId });
+      { activePhase: "closed", cutoverId: id, leaseId: closedLease.leaseId });
   }
   if (!file || file.phase === "closed") return "full"; // Branch a: brand-new attempt.
   const target = contract.cutover.expectedIdentity;
